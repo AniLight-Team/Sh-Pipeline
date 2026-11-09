@@ -155,6 +155,7 @@ export interface PipelineEpisodeResult {
   subtitles: PipelineSubtitleTrack[];
   metadata?: Record<string, any>;
   completedAt: string;
+  allTrackPayloads?: PipelineEpisodeResult[];
 }
 
 export interface EnqueueRequest {
@@ -236,6 +237,7 @@ export interface PipelineStats {
     isPaused: boolean;
     uptimeSeconds: number;
     lastWatchdogRun: string | null;
+    pendingCallbacks?: number;
   };
 }
 

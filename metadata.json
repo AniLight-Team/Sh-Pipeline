@@ -1,0 +1,5 @@
+{
+  "name": "AniLight • Kira Pipeline Operations Center",
+  "description": "Standalone self-hosted anime video processing, torrent staging, subtitle extraction, and concurrent Kaggle dual-T4 GPU batch encoding pipeline service.",
+  "requestFramePermissions": []
+}

@@ -1,15 +1,12 @@
 import { inngest } from "../client.js";
 import { PipelineEngineService } from "../../engine/service.js";
-import {
-  KIRA_BATCH_SAFE_MAX_BYTES,
-  KIRA_BATCH_MAX_ITEMS,
-  KIRA_BATCH_WINDOW_MS,
-} from "../../config.js";
+import { KIRA_BATCH_WINDOW_MS, KIRA_QUEUE_IDLE_SETTLE_MS } from "../../config.js";
+import { log } from "../../utils/logger.js";
 
 export const batchCoordinatorFn = inngest.createFunction(
   {
     id: "pipeline-batch-coordinator",
-    name: "Pipeline Stage 2: 30-Minute Timer & Batch Sealer",
+    name: "Pipeline Stage 2: Smart Window & Queue-Drain Batch Sealer",
     concurrency: {
       limit: 1,
     },
@@ -24,18 +21,27 @@ export const batchCoordinatorFn = inngest.createFunction(
 
     if (!isForceFlush) {
       const waitInfo = await step.run("inspect-staged-window", async () => {
-        const stats = await PipelineEngineService.getStagedWindowStats();
+        const readiness = await PipelineEngineService.evaluateBatchSealReadiness(false);
+        const { stats } = readiness;
 
         if (stats.stagedCount === 0 || !stats.oldestStagedAt) {
-          return { shouldSkip: true, shouldWait: false, waitSeconds: 0 };
+          return { shouldSkip: true, shouldWait: false, waitSeconds: 0, reason: "no_staged_items" };
         }
 
-        // Limit cap reached: 10 files or 10 GB safe cap -> flush immediately, do not wait
-        if (
-          stats.totalBytes >= KIRA_BATCH_SAFE_MAX_BYTES ||
-          stats.stagedCount >= KIRA_BATCH_MAX_ITEMS
-        ) {
-          return { shouldSkip: false, shouldWait: false, waitSeconds: 0 };
+        if (readiness.shouldSeal) {
+          return { shouldSkip: false, shouldWait: false, waitSeconds: 0, reason: readiness.reason };
+        }
+
+        // If all downloads have finished (0 queued, 0 downloading), only wait for the brief idle settle window (e.g. 30s)
+        if (stats.activeDownloadsOrQueued === 0 && stats.newestStagedAt) {
+          const idleElapsedMs = Date.now() - stats.newestStagedAt.getTime();
+          const idleRemainingMs = Math.max(5000, KIRA_QUEUE_IDLE_SETTLE_MS - idleElapsedMs + 2000);
+          return {
+            shouldSkip: false,
+            shouldWait: true,
+            waitSeconds: Math.ceil(idleRemainingMs / 1000),
+            reason: "queue_drained",
+          };
         }
 
         const elapsedMs = Date.now() - stats.oldestStagedAt.getTime();
@@ -44,6 +50,7 @@ export const batchCoordinatorFn = inngest.createFunction(
           shouldSkip: false,
           shouldWait: remainingMs > 5000,
           waitSeconds: Math.ceil(remainingMs / 1000),
+          reason: "window_30m",
         };
       });
 
@@ -51,8 +58,8 @@ export const batchCoordinatorFn = inngest.createFunction(
         return { status: "skipped", reason: "no_staged_items" };
       }
 
-      if (waitInfo.shouldWait && waitInfo.waitSeconds > 5) {
-        await step.waitForEvent("wait-30m-or-early-flush", {
+      if (waitInfo.shouldWait && waitInfo.waitSeconds > 0) {
+        await step.waitForEvent("wait-window-or-early-flush", {
           event: "pipeline/batch.force-flush",
           timeout: `${waitInfo.waitSeconds}s`,
         });
@@ -62,16 +69,17 @@ export const batchCoordinatorFn = inngest.createFunction(
     const sealedBatchIds = await step.run("seal-available-batches", async () => {
       return await PipelineEngineService.sealAvailableBatches({
         forceFlush: isForceFlush,
-        triggerReason: isForceFlush ? "manual" : "window_30m",
+        triggerReason: isForceFlush ? "manual_flush" : undefined,
       });
     });
 
     for (const bId of sealedBatchIds) {
       await step.sendEvent(`dispatch-batch-${bId}`, {
         name: "pipeline/batch.execute",
-        id: `pipeline-batch-${bId}-${Date.now()}`,
+        id: `pipeline-batch-${bId}-exec`,
         data: { batchId: bId },
       });
+      log.info("BatchCoordinatorFn", `Dispatched Batch #${bId} to Kaggle GPU executor`);
     }
 
     return { sealedBatchIds, count: sealedBatchIds.length };

@@ -1,6 +1,7 @@
 import { FastifyInstance, FastifyPluginAsync } from "fastify";
+import fs from "fs";
 import { db, schema } from "../db/index.js";
-import { eq, desc, sql, inArray, and } from "drizzle-orm";
+import { eq, desc, sql, and } from "drizzle-orm";
 import { PipelineEngineService } from "../engine/service.js";
 import { AnimeMetadataResolver } from "../engine/metadata-resolver.js";
 import { inngest } from "../inngest/client.js";
@@ -34,8 +35,15 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
 
   app.post("/pipeline/enqueue", async (req, reply) => {
     const body = req.body as EnqueueRequest;
-    if ((!body?.anilistId && !body?.anidbId) || !Array.isArray(body?.episodeNumbers) || body.episodeNumbers.length === 0) {
-      return reply.status(400).send({ error: "anilistId (or anidbId) and episodeNumbers are required" });
+    const hasId = Boolean(
+      body?.anilistId ||
+      body?.anidbId ||
+      body?.animeId ||
+      body?.metadata?.anilistId ||
+      body?.metadata?.animeId,
+    );
+    if (!hasId || !Array.isArray(body?.episodeNumbers) || body.episodeNumbers.length === 0) {
+      return reply.status(400).send({ error: "anilistId (or anidbId/animeId) and episodeNumbers are required" });
     }
 
     const res = await PipelineEngineService.enqueue(body);
@@ -44,7 +52,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     if (res.queuedJobs.length > 0) {
       const events = res.queuedJobs.map((j) => ({
         name: "pipeline/job.discover" as const,
-        id: `pipe-job-${j.id}-discover`,
+        id: `pipe-job-${j.id}-discover-${Date.now()}`,
         data: {
           jobId: j.id,
           anilistId: j.anilistId,
@@ -56,7 +64,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
         },
       }));
       await inngest.send(events).catch((e) => {
-        log.warn("API", `Failed to send inngest events: ${e?.message || e}`);
+        log.warn("API", `Inngest send warning (watchdog will auto-dispatch): ${e?.message || e}`);
       });
     }
 
@@ -119,10 +127,21 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     const { id } = req.params as { id: string };
     const jobId = parseInt(id, 10);
 
+    const existing = await db.query.pipelineJob.findFirst({
+      where: eq(schema.pipelineJob.id, jobId),
+    });
+
+    if (!existing) {
+      return reply.status(404).send({ error: "Job not found" });
+    }
+
+    const hasStagedFile = Boolean(existing.stagedFilePath && fs.existsSync(existing.stagedFilePath));
+
     const [updated] = await db
       .update(schema.pipelineJob)
       .set({
-        status: "queued",
+        status: hasStagedFile ? "staged" : "queued",
+        batchId: null,
         lastError: null,
         attempt: sql`${schema.pipelineJob.attempt} + 1`,
         heartbeatAt: new Date(),
@@ -131,31 +150,46 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
       .where(eq(schema.pipelineJob.id, jobId))
       .returning();
 
-    if (!updated) {
-      return reply.status(404).send({ error: "Job not found" });
+    if (hasStagedFile) {
+      log.info("API", `Job #${jobId} already has staged MKV on SSD; returned directly to 'staged' queue.`);
+      await inngest
+        .send({
+          name: "pipeline/batch.arm-timer",
+          data: { reason: "job_retried_staged", jobId: updated.id },
+        })
+        .catch(() => {});
+    } else {
+      await inngest
+        .send({
+          name: "pipeline/job.discover",
+          id: `pipe-job-${updated.id}-retry-${Date.now()}`,
+          data: {
+            jobId: updated.id,
+            anilistId: updated.anilistId,
+            animeId: updated.animeId,
+            anidbId: updated.anidbId,
+            episodeNumber: updated.episodeNumber,
+            types: updated.types,
+            knownTitles: updated.knownTitles || [],
+          },
+        })
+        .catch(() => {});
+      log.info("API", `Retried Job #${jobId} (dispatched torrent discovery)`);
     }
 
-    await inngest.send({
-      name: "pipeline/job.discover",
-      id: `pipe-job-${updated.id}-retry-${Date.now()}`,
-      data: {
-        jobId: updated.id,
-        anilistId: updated.anilistId,
-        animeId: updated.animeId,
-        anidbId: updated.anidbId,
-        episodeNumber: updated.episodeNumber,
-        types: updated.types,
-        knownTitles: updated.knownTitles || [],
-      },
-    });
-
-    log.info("API", `Retried Job #${jobId}`);
     return { ok: true, job: updated };
   });
 
-  app.post("/jobs/:id/delete", async (req, reply) => {
+  app.post("/jobs/:id/delete", async (req) => {
     const { id } = req.params as { id: string };
     const jobId = parseInt(id, 10);
+
+    const existing = await db.query.pipelineJob.findFirst({
+      where: eq(schema.pipelineJob.id, jobId),
+    });
+    if (existing?.stagedFilePath && fs.existsSync(existing.stagedFilePath)) {
+      await fs.promises.unlink(existing.stagedFilePath).catch(() => {});
+    }
 
     await db.delete(schema.pipelineJob).where(eq(schema.pipelineJob.id, jobId));
     log.info("API", `Deleted Job #${jobId}`);
@@ -175,7 +209,6 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
   app.post("/batches/flush", async () => {
     log.info("API", "Force-flush triggered manually");
 
-    // 1. Recover any batches stuck in "created" status
     const pendingBatches = await db
       .select({ id: schema.pipelineBatch.id })
       .from(schema.pipelineBatch)
@@ -183,7 +216,6 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
 
     const pendingIds = pendingBatches.map((b) => b.id);
 
-    // 2. Seal any available staged jobs
     const sealedBatchIds = await PipelineEngineService.sealAvailableBatches({
       forceFlush: true,
       triggerReason: "manual_api",
@@ -192,18 +224,22 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     const allDispatchIds = Array.from(new Set([...pendingIds, ...sealedBatchIds]));
 
     for (const bId of allDispatchIds) {
-      await inngest.send({
-        name: "pipeline/batch.execute",
-        id: `pipeline-batch-${bId}-${Date.now()}`,
-        data: { batchId: bId },
-      });
-      log.info("API", `Dispatched execution event for batch #${bId}`);
+      await inngest
+        .send({
+          name: "pipeline/batch.execute",
+          id: `pipeline-batch-${bId}-${Date.now()}`,
+          data: { batchId: bId },
+        })
+        .catch(() => {});
+      log.info("API", `Dispatched execution event for Batch #${bId}`);
     }
 
-    await inngest.send({
-      name: "pipeline/batch.force-flush",
-      data: { reason: "manual_api" },
-    });
+    await inngest
+      .send({
+        name: "pipeline/batch.force-flush",
+        data: { reason: "manual_api" },
+      })
+      .catch(() => {});
 
     return {
       ok: true,
@@ -224,6 +260,21 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
       return reply.status(404).send({ error: "Batch not found" });
     }
 
+    if (batch.status === "failed") {
+      await db
+        .update(schema.pipelineBatch)
+        .set({
+          status: "created",
+          lastError: null,
+          datasetSlug: null,
+          kernelSlug: null,
+          attempt: batch.attempt + 1,
+          heartbeatAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.pipelineBatch.id, batchId));
+    }
+
     await inngest.send({
       name: "pipeline/batch.execute",
       id: `pipeline-batch-${batchId}-${Date.now()}`,
@@ -231,16 +282,23 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     });
 
     log.info("API", `Direct execute triggered for Batch #${batchId}`);
-    return { ok: true, message: `Dispatched execution event for batch #${batchId}`, batch };
+    return { ok: true, message: `Dispatched execution event for Batch #${batchId}`, batch };
   });
 
   app.post("/system/recovery", async () => {
     log.info("API", "Recovery watchdog triggered manually");
-    await inngest.send({
-      name: "pipeline/recovery.run",
-      data: { reason: "manual_api" },
-    });
-    return { ok: true, message: "Recovery event sent" };
+    const redelivered = await PipelineEngineService.retryPendingCallbacks().catch(() => 0);
+    await inngest
+      .send({
+        name: "pipeline/recovery.run",
+        data: { reason: "manual_api" },
+      })
+      .catch(() => {});
+    return { ok: true, message: `Recovery event sent (synced ${redelivered} pending callback(s))` };
+  });
+
+  app.post("/system/sync-callbacks", async () => {
+    const redelivered = await PipelineEngineService.retryPendingCallbacks();
+    return { ok: true, redelivered };
   });
 };
-

@@ -2,12 +2,13 @@ import { inngest } from "../client.js";
 import { db, schema } from "../../db/index.js";
 import { eq, inArray, lt, and } from "drizzle-orm";
 import { PipelineEngineService } from "../../engine/service.js";
+import { MAX_JOB_ATTEMPTS, MAX_BATCH_ATTEMPTS } from "../../config.js";
 import { log } from "../../utils/logger.js";
 
 export const recoveryWatchdogFn = inngest.createFunction(
   {
     id: "pipeline-recovery-watchdog",
-    name: "Pipeline Stage 4: Self-Healing & Recovery Watchdog",
+    name: "Pipeline Stage 4: Self-Healing, Re-Attachment & Callback Watchdog",
     concurrency: {
       limit: 1,
     },
@@ -17,44 +18,107 @@ export const recoveryWatchdogFn = inngest.createFunction(
       { event: "pipeline/recovery.run" },
     ],
   },
-  async ({ event, step }: any) => {
+  async ({ step }: any) => {
     const plan = await step.run("reconcile-pipeline-state", async () => {
       await PipelineEngineService.ensureTables();
+      PipelineEngineService.markWatchdogRun();
 
-      // 1. Recover hung batches (no heartbeat in >15m while running or uploading)
-      const fifteenMinsAgo = new Date(Date.now() - 15 * 60 * 1000);
-      const hungBatches = await db
+      const now = Date.now();
+      const twoMinsAgo = new Date(now - 2 * 60 * 1000);
+      const fourMinsAgo = new Date(now - 4 * 60 * 1000);
+      const tenMinsAgo = new Date(now - 10 * 60 * 1000);
+      const sixHoursMs = 6 * 3600 * 1000;
+
+      // 1. Recover orphaned "queued" jobs that haven't transitioned to downloading after >2m
+      const orphanedQueuedJobs = await db
+        .select()
+        .from(schema.pipelineJob)
+        .where(
+          and(
+            eq(schema.pipelineJob.status, "queued"),
+            lt(schema.pipelineJob.updatedAt, twoMinsAgo),
+          ),
+        );
+
+      // 2. Recover hung "downloading" jobs (no heartbeat for >10m, e.g. after service restart)
+      const hungDownloadingJobs = await db
+        .select()
+        .from(schema.pipelineJob)
+        .where(
+          and(
+            eq(schema.pipelineJob.status, "downloading"),
+            lt(schema.pipelineJob.heartbeatAt, tenMinsAgo),
+          ),
+        );
+
+      const jobsToRediscover: typeof orphanedQueuedJobs = [...orphanedQueuedJobs];
+
+      for (const hj of hungDownloadingJobs) {
+        if (hj.attempt < MAX_JOB_ATTEMPTS) {
+          log.warn(
+            "Watchdog",
+            `Recovering hung downloading Job #${hj.id} (attempt ${hj.attempt + 1}/${MAX_JOB_ATTEMPTS})`,
+          );
+          const [resetJob] = await db
+            .update(schema.pipelineJob)
+            .set({
+              status: "queued",
+              attempt: hj.attempt + 1,
+              heartbeatAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.pipelineJob.id, hj.id))
+            .returning();
+          if (resetJob) jobsToRediscover.push(resetJob);
+        } else {
+          await db
+            .update(schema.pipelineJob)
+            .set({
+              status: "failed",
+              lastError: "Download timed out on watchdog after max attempts",
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.pipelineJob.id, hj.id));
+        }
+      }
+
+      // 3. Inspect active batches with stale heartbeats (>4m)
+      // Instead of blindly failing running Kaggle kernels after a restart, re-dispatch them so batchExecuteFn re-attaches!
+      const staleBatches = await db
         .select()
         .from(schema.pipelineBatch)
         .where(
           and(
             inArray(schema.pipelineBatch.status, ["uploading", "waiting_dataset", "kernel_running"]),
-            lt(schema.pipelineBatch.heartbeatAt, fifteenMinsAgo),
+            lt(schema.pipelineBatch.heartbeatAt, fourMinsAgo),
           ),
         );
 
-      for (const hb of hungBatches) {
-        log.warn("Watchdog", `Recovering hung batch #${hb.id} (status: ${hb.status}, last heartbeat > 15m)`);
-        await db
-          .update(schema.pipelineBatch)
-          .set({
-            status: "failed",
-            lastError: "Batch timed out: watchdog recovery detected hung heartbeat",
-            updatedAt: new Date(),
-          })
-          .where(eq(schema.pipelineBatch.id, hb.id));
+      const batchesToResume: number[] = [];
+      let expiredBatchCount = 0;
 
-        await db
-          .update(schema.pipelineJob)
-          .set({
-            status: "failed",
-            lastError: `Batch #${hb.id} timed out on watchdog`,
-            updatedAt: new Date(),
-          })
-          .where(eq(schema.pipelineJob.batchId, hb.id));
+      for (const sb of staleBatches) {
+        const runtimeMs = sb.startedAt ? now - sb.startedAt.getTime() : 0;
+        if (runtimeMs < sixHoursMs && sb.attempt <= MAX_BATCH_ATTEMPTS) {
+          log.info(
+            "Watchdog",
+            `Re-attaching stale Batch #${sb.id} (status: ${sb.status}, kernel: ${sb.kernelSlug || "none"})`,
+          );
+          await db
+            .update(schema.pipelineBatch)
+            .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+            .where(eq(schema.pipelineBatch.id, sb.id));
+          batchesToResume.push(sb.id);
+        } else {
+          expiredBatchCount++;
+          await PipelineEngineService.handleBatchFailure(
+            sb.id,
+            "Batch timed out (>6h max runtime) on watchdog reconciliation",
+          );
+        }
       }
 
-      // 2. Find any batches currently in "created" status that need to be dispatched
+      // 4. Find any batches in "created" status waiting for execution
       const pendingCreatedBatches = await db
         .select({ id: schema.pipelineBatch.id })
         .from(schema.pipelineBatch)
@@ -62,37 +126,66 @@ export const recoveryWatchdogFn = inngest.createFunction(
 
       const pendingBatchIds = pendingCreatedBatches.map((b) => b.id);
 
-      // 3. Check staged window and seal available batches if capacity permits
-      const windowStats = await PipelineEngineService.getStagedWindowStats();
-      let newlySealedIds: number[] = [];
-      if (windowStats.stagedCount > 0) {
-        newlySealedIds = await PipelineEngineService.sealAvailableBatches({
-          forceFlush: false,
-          triggerReason: "watchdog_drain",
-        });
-      }
+      // 5. Seal eligible staged jobs (respecting 10-item cap / 10GB cap / 30m window / queue-drain settle)
+      const newlySealedIds = await PipelineEngineService.sealAvailableBatches({
+        forceFlush: false,
+      });
 
-      // 4. Combine all un-executed batch IDs
-      const allBatchIdsToDispatch = Array.from(new Set([...pendingBatchIds, ...newlySealedIds]));
+      // 6. Retry any completed job callbacks that failed while Main Backend (localhost:4000) was restarting
+      const redeliveredCallbacks = await PipelineEngineService.retryPendingCallbacks();
+
+      const allBatchIdsToDispatch = Array.from(
+        new Set([...batchesToResume, ...pendingBatchIds, ...newlySealedIds]),
+      );
 
       return {
-        hungBatchCount: hungBatches.length,
-        stagedCount: windowStats.stagedCount,
+        rediscoveredJobs: jobsToRediscover.map((j) => ({
+          id: j.id,
+          anilistId: j.anilistId,
+          animeId: j.animeId,
+          anidbId: j.anidbId,
+          episodeNumber: j.episodeNumber,
+          types: j.types,
+          knownTitles: j.knownTitles || [],
+        })),
+        reattachedBatchCount: batchesToResume.length,
+        expiredBatchCount,
         dispatchedBatchIds: allBatchIdsToDispatch,
+        redeliveredCallbacks,
       };
     });
 
-    // 5. Reliably send pipeline/batch.execute events for all unstarted batches
+    // Dispatch rediscovered jobs
+    for (const j of plan.rediscoveredJobs) {
+      await step.sendEvent(`watchdog-discover-job-${j.id}`, {
+        name: "pipeline/job.discover",
+        id: `pipe-job-${j.id}-watchdog-${Date.now()}`,
+        data: {
+          jobId: j.id,
+          anilistId: j.anilistId,
+          animeId: j.animeId,
+          anidbId: j.anidbId,
+          episodeNumber: j.episodeNumber,
+          types: j.types,
+          knownTitles: j.knownTitles,
+        },
+      });
+    }
+
+    // Dispatch created / re-attached / newly sealed batches
     for (const bId of plan.dispatchedBatchIds) {
       await step.sendEvent(`dispatch-watchdog-batch-${bId}`, {
         name: "pipeline/batch.execute",
-        id: `pipeline-batch-${bId}-${Date.now()}`,
+        id: `pipeline-batch-${bId}-watchdog-${Date.now()}`,
         data: { batchId: bId },
       });
-      log.info("Watchdog", `Dispatched execution event for batch #${bId}`);
+      log.info("Watchdog", `Dispatched execution / re-attachment event for Batch #${bId}`);
     }
 
-    log.info("Watchdog", `Watchdog heartbeat check complete: ${JSON.stringify(plan)}`);
+    log.info(
+      "Watchdog",
+      `Reconciliation complete: jobs=${plan.rediscoveredJobs.length}, batches=${plan.dispatchedBatchIds.length}, callbacks=${plan.redeliveredCallbacks}`,
+    );
     return { status: "reconciled", plan };
   },
 );

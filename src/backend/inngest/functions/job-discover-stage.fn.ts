@@ -1,6 +1,6 @@
 import { inngest } from "../client.js";
 import { PipelineEngineService } from "../../engine/service.js";
-import { KIRA_BATCH_SAFE_MAX_BYTES, KIRA_BATCH_MAX_ITEMS } from "../../config.js";
+import { log } from "../../utils/logger.js";
 
 export const jobDiscoverStageFn = inngest.createFunction(
   {
@@ -8,7 +8,7 @@ export const jobDiscoverStageFn = inngest.createFunction(
     name: "Pipeline Stage 1: Torrent Discovery, Download & Staging",
     concurrency: [
       { limit: 6 },
-      { limit: 1, key: "event.data.anilistId || event.data.anidbId || event.data.jobId" },
+      { limit: 2, key: "event.data.anilistId || event.data.anidbId || event.data.jobId" },
     ],
     retries: 2,
     triggers: [{ event: "pipeline/job.discover" }],
@@ -21,23 +21,42 @@ export const jobDiscoverStageFn = inngest.createFunction(
     });
 
     if (res.status === "staged") {
-      const windowStats = await step.run("inspect-staged-stats", async () => {
-        return await PipelineEngineService.getStagedWindowStats();
+      const sealCheck = await step.run("evaluate-and-seal-ready-batches", async () => {
+        const readiness = await PipelineEngineService.evaluateBatchSealReadiness(false);
+        if (readiness.shouldSeal) {
+          const sealedBatchIds = await PipelineEngineService.sealAvailableBatches({
+            forceFlush: false,
+            triggerReason: readiness.reason,
+          });
+          return {
+            shouldSeal: true,
+            reason: readiness.reason,
+            sealedBatchIds,
+            stagedCount: readiness.stats.stagedCount,
+          };
+        }
+        return {
+          shouldSeal: false,
+          reason: readiness.reason,
+          sealedBatchIds: [] as number[],
+          stagedCount: readiness.stats.stagedCount,
+        };
       });
 
-      // If safe batch cap (10 GB) OR file limit (10 items) reached, immediately flush without waiting 30m
-      if (windowStats.totalBytes >= KIRA_BATCH_SAFE_MAX_BYTES || windowStats.stagedCount >= KIRA_BATCH_MAX_ITEMS) {
-        await step.sendEvent("flush-batch-on-limit-cap", {
-          name: "pipeline/batch.force-flush",
-          data: {
-            reason: windowStats.stagedCount >= KIRA_BATCH_MAX_ITEMS ? "file_limit_10" : "size_cap_10gb",
-          },
+      for (const bId of sealCheck.sealedBatchIds) {
+        await step.sendEvent(`dispatch-sealed-batch-${bId}`, {
+          name: "pipeline/batch.execute",
+          id: `pipeline-batch-${bId}-exec`,
+          data: { batchId: bId },
         });
-      } else {
-        // Arm the 30-minute coordinator timer
+        log.info("JobDiscoverStageFn", `Dispatched Batch #${bId} (${sealCheck.reason})`);
+      }
+
+      // Always arm the coordinator timer if any staged episodes remain waiting for a batch window or queue drain
+      if (sealCheck.stagedCount > 0) {
         await step.sendEvent("arm-batch-timer", {
           name: "pipeline/batch.arm-timer",
-          data: { reason: "new_staged_episode" },
+          data: { reason: "new_staged_episode", jobId: Number(jobId) },
         });
       }
     }
@@ -45,4 +64,3 @@ export const jobDiscoverStageFn = inngest.createFunction(
     return res;
   },
 );
-

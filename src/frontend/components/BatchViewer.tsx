@@ -10,6 +10,7 @@ interface Batch {
   kernelSlug?: string | null;
   totalBytes: number;
   jobCount: number;
+  lastError?: string | null;
   startedAt?: string | null;
   completedAt?: string | null;
   createdAt: string;
@@ -102,23 +103,29 @@ export function BatchViewer() {
                   >
                     {b.status === "created" ? "PREPARING" : b.status.toUpperCase()}
                   </span>
-                  {b.status === "created" && (
+                  {(b.status === "created" || b.status === "failed") && (
                     <button
                       onClick={() => handleExecuteBatch(b.id)}
                       disabled={executingId === b.id}
-                      title="Dispatch to Kaggle GPU"
-                      className="px-2 py-0.5 text-[10px] font-mono font-bold rounded-full bg-white text-black hover:bg-neutral-200 flex items-center gap-1 transition-all active:scale-95 disabled:opacity-50"
+                      title={b.status === "failed" ? "Retry Batch on Kaggle GPU" : "Dispatch to Kaggle GPU"}
+                      className="px-2 py-0.5 text-[10px] font-mono font-bold rounded-full bg-white text-black hover:bg-neutral-200 flex items-center gap-1 transition-all active:scale-95 disabled:opacity-50 cursor-pointer"
                     >
                       {executingId === b.id ? (
                         <Loader2 className="w-2.5 h-2.5 animate-spin" />
                       ) : (
                         <Play className="w-2.5 h-2.5 fill-black" />
                       )}
-                      <span>Run</span>
+                      <span>{b.status === "failed" ? "Retry" : "Run"}</span>
                     </button>
                   )}
                 </div>
               </div>
+
+              {b.lastError && b.status === "failed" && (
+                <div className="text-[10px] text-rose-400 font-mono truncate mb-1" title={b.lastError}>
+                  Error: {b.lastError}
+                </div>
+              )}
 
               <div className="text-[11px] text-neutral-400 font-mono truncate mb-1">
                 Kernel: <span className="text-neutral-200">{b.kernelSlug || "provisioning"}</span>

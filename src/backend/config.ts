@@ -26,6 +26,7 @@ export const HOST = process.env.HOST || "0.0.0.0";
 export const NODE_ENV = process.env.NODE_ENV || "development";
 export const IS_PROD = NODE_ENV === "production";
 export const MAIN_BACKEND_URL = (process.env.MAIN_BACKEND_URL || "http://127.0.0.1:4000").replace(/\/+$/, "");
+export const INNGEST_BASE_URL = (process.env.INNGEST_BASE_URL || "http://127.0.0.1:8288").replace(/\/+$/, "");
 export const INTERNAL_SECRET = process.env.INTERNAL_SECRET || "anilight-pipeline-internal-secret-2026";
 export const DATABASE_URL = process.env.DATABASE_URL || "";
 
@@ -48,10 +49,13 @@ export const DEFAULT_MIN_SEEDERS = parseInt(process.env.MIN_SEEDERS || "1", 10);
 export const TORRENT_DOWNLOAD_TIMEOUT_SEC = parseInt(process.env.TORRENT_DOWNLOAD_TIMEOUT_SEC || "1800", 10);
 export const ALLOW_CAM = (process.env.ALLOW_CAM || "true").toLowerCase() === "true";
 export const EAGER_VM_DELETE = (process.env.EAGER_VM_DELETE || "true").toLowerCase() === "true";
+export const MAX_JOB_ATTEMPTS = Math.max(1, parseInt(process.env.MAX_JOB_ATTEMPTS || "3", 10));
+export const MAX_BATCH_ATTEMPTS = Math.max(1, parseInt(process.env.MAX_BATCH_ATTEMPTS || "3", 10));
 
 // ── Batching, Queue & SSD Storage Guardrails ───────────────────
 export const KIRA_BATCH_WINDOW_MIN = Math.max(1, parseInt(process.env.KIRA_BATCH_WINDOW_MIN || "30", 10));
 export const KIRA_BATCH_WINDOW_MS = KIRA_BATCH_WINDOW_MIN * 60 * 1000;
+export const KIRA_QUEUE_IDLE_SETTLE_MS = Math.max(10_000, parseInt(process.env.KIRA_QUEUE_IDLE_SETTLE_MS || "30000", 10));
 export const KIRA_BATCH_MAX_GB = Math.max(1, parseInt(process.env.KIRA_BATCH_MAX_GB || "10", 10));
 export const KIRA_BATCH_MAX_BYTES = Math.floor(KIRA_BATCH_MAX_GB * 1_000_000_000);
 export const KIRA_BATCH_SAFE_MAX_BYTES = Math.min(98_000_000_000, KIRA_BATCH_MAX_BYTES);
@@ -60,12 +64,12 @@ export const KIRA_MAX_STAGING_GB = Math.max(KIRA_BATCH_MAX_GB, parseInt(process.
 export const KIRA_MAX_STAGING_BYTES = Math.floor(KIRA_MAX_STAGING_GB * 1_000_000_000);
 export const KIRA_MIN_FREE_SSD_BYTES = Math.floor(Math.max(5, parseInt(process.env.KIRA_MIN_FREE_SSD_GB || "12", 10)) * 1_000_000_000);
 export const KIRA_PER_DOWNLOAD_RESERVE_BYTES = 1_400_000_000; // 1.4 GB reserve per parallel download
-export const KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT = 2; // Kaggle allows 2 concurrent sessions per account
+export const KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT = 2; // Kaggle allows 2 concurrent GPU sessions per account
 
 export function getMaxConcurrentBatches(): number {
   const { kaggleAccounts } = loadAccountsFromEnv();
   // Total concurrent tasks limit = total number of kaggle accounts * 2
-  return Math.max(1, kaggleAccounts.length * KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT);
+  return Math.max(2, kaggleAccounts.length * KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT);
 }
 
 // Backward-compatible alias
@@ -118,15 +122,23 @@ export function loadAccountsFromEnv(): {
   let kaggleAccounts: KaggleAccount[] = [];
   if (process.env.KAGGLE_ACCOUNTS) {
     try {
-      kaggleAccounts = JSON.parse(process.env.KAGGLE_ACCOUNTS);
+      const parsed = JSON.parse(process.env.KAGGLE_ACCOUNTS);
+      if (Array.isArray(parsed)) {
+        kaggleAccounts = parsed
+          .filter((a) => a && typeof a.username === "string" && (a.key || a.token))
+          .map((a) => ({
+            username: a.username.trim(),
+            key: String(a.key || a.token).trim(),
+          }));
+      }
     } catch (e) {
       console.warn("[Config] Failed to parse KAGGLE_ACCOUNTS JSON from ENV:", e);
     }
   } else if (process.env.KAGGLE_USERNAME && (process.env.KAGGLE_KEY || process.env.KAGGLE_API_TOKEN)) {
     kaggleAccounts = [
       {
-        username: process.env.KAGGLE_USERNAME,
-        key: process.env.KAGGLE_KEY || process.env.KAGGLE_API_TOKEN || "",
+        username: process.env.KAGGLE_USERNAME.trim(),
+        key: (process.env.KAGGLE_KEY || process.env.KAGGLE_API_TOKEN || "").trim(),
       },
     ];
   }
@@ -134,20 +146,28 @@ export function loadAccountsFromEnv(): {
   let hfAccounts: HuggingFaceAccount[] = [];
   if (process.env.HF_ACCOUNTS) {
     try {
-      hfAccounts = JSON.parse(process.env.HF_ACCOUNTS);
+      const parsed = JSON.parse(process.env.HF_ACCOUNTS);
+      if (Array.isArray(parsed)) {
+        hfAccounts = parsed
+          .filter((a) => a && a.owner && (a.bucket || a.repo) && a.token)
+          .map((a) => ({
+            owner: String(a.owner).trim(),
+            bucket: String(a.bucket || a.repo).trim(),
+            token: String(a.token).trim(),
+          }));
+      }
     } catch (e) {
       console.warn("[Config] Failed to parse HF_ACCOUNTS JSON from ENV:", e);
     }
   } else if (process.env.HF_OWNER && process.env.HF_BUCKET && process.env.HF_TOKEN) {
     hfAccounts = [
       {
-        owner: process.env.HF_OWNER,
-        bucket: process.env.HF_BUCKET,
-        token: process.env.HF_TOKEN,
+        owner: process.env.HF_OWNER.trim(),
+        bucket: process.env.HF_BUCKET.trim(),
+        token: process.env.HF_TOKEN.trim(),
       },
     ];
   }
 
   return { kaggleAccounts, hfAccounts };
 }
-

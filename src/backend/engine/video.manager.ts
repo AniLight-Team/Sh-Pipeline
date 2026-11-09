@@ -1,38 +1,31 @@
 import fs from "fs";
-import path from "path";
 import https from "https";
-import crypto from "crypto";
-import { inspectMkvStreamsSync } from "./subtitles.manager.js";
 import type {
   KaggleAccount,
   HuggingFaceAccount,
-  HfStoreRecord,
   MkvStreamProbe,
   KiraBatchUploadItem,
   KiraBatchManifestItem,
   KiraBatchKernelOutput,
   KiraBatchHfRecord,
 } from "./types.js";
-import { loadAccountsFromEnv, EAGER_VM_DELETE } from "../config.js";
+import { loadAccountsFromEnv } from "../config.js";
+import { log } from "../utils/logger.js";
 
 export class VideoEncodingManager {
   private kaggleAccounts: KaggleAccount[];
   private hfAccounts: HuggingFaceAccount[];
-  private currentKaggleIdx = 0;
   private currentHfIdx = 0;
-  private eagerVmDelete: boolean;
 
   constructor(
     options: {
       kaggleAccounts?: KaggleAccount[];
       hfAccounts?: HuggingFaceAccount[];
-      eagerVmDelete?: boolean;
     } = {},
   ) {
     const envAccs = loadAccountsFromEnv();
     this.kaggleAccounts = options.kaggleAccounts || envAccs.kaggleAccounts;
     this.hfAccounts = options.hfAccounts || envAccs.hfAccounts;
-    this.eagerVmDelete = options.eagerVmDelete ?? EAGER_VM_DELETE;
   }
 
   public getKaggleAccounts(): KaggleAccount[] {
@@ -102,8 +95,9 @@ export class VideoEncodingManager {
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       if (!quietCodes.includes(res.status)) {
-        console.warn(
-          `[Kaggle:HTTP] HTTP ${res.status} on ${url}: ${text.slice(0, 300)}`,
+        log.warn(
+          "Kaggle:HTTP",
+          `HTTP ${res.status} on ${url}: ${text.slice(0, 300)}`,
         );
       }
       throw new Error(
@@ -166,8 +160,9 @@ export class VideoEncodingManager {
     const filesize = stats.size;
     const lastModified = Math.floor(stats.mtimeMs / 1000);
 
-    console.log(
-      `[Kaggle:REST] Requesting GCS upload URL for ${remoteFilename} (${(filesize / (1024 * 1024)).toFixed(1)} MB)...`,
+    log.info(
+      "Kaggle:REST",
+      `Requesting GCS upload URL for ${remoteFilename} (${(filesize / (1024 * 1024)).toFixed(1)} MB)...`,
     );
 
     const blobUrls = [
@@ -212,7 +207,7 @@ export class VideoEncodingManager {
       );
     }
 
-    for (let gcsAttempt = 1; gcsAttempt <= 2; gcsAttempt++) {
+    for (let gcsAttempt = 1; gcsAttempt <= 3; gcsAttempt++) {
       try {
         await new Promise<void>((resolve, reject) => {
           const parsed = new URL(uploadUrl);
@@ -266,11 +261,12 @@ export class VideoEncodingManager {
         });
         break;
       } catch (err) {
-        if (gcsAttempt >= 2) throw err;
-        console.warn(
-          `[Kaggle:REST] Retrying GCS upload for ${remoteFilename} after transient error...`,
+        if (gcsAttempt >= 3) throw err;
+        log.warn(
+          "Kaggle:REST",
+          `Retrying GCS upload (${gcsAttempt}/3) for ${remoteFilename} after transient error...`,
         );
-        await new Promise((r) => setTimeout(r, 3000));
+        await new Promise((r) => setTimeout(r, 3000 * gcsAttempt));
       }
     }
 
@@ -278,7 +274,7 @@ export class VideoEncodingManager {
   }
 
   /**
-   * Uploads multiple episode video files into ONE single Kaggle Dataset (up to 100GB).
+   * Uploads multiple episode video files into ONE single Kaggle Dataset.
    */
   public async uploadBatchDatasetRest(
     items: KiraBatchUploadItem[],
@@ -291,12 +287,16 @@ export class VideoEncodingManager {
       throw new Error("Cannot upload empty batch dataset to Kaggle");
     }
 
+    // Ensure any stale dataset with the same slug is removed before creating a fresh one
+    await this.deleteKaggleDataset(datasetSlug, username, key).catch(() => {});
+
     const totalGb = (
       items.reduce((acc, i) => acc + i.sizeBytes, 0) /
       (1024 * 1024 * 1024)
     ).toFixed(2);
-    console.log(
-      `[Kaggle:BatchDataset] Uploading ${items.length} file(s) (${totalGb} GiB) into dataset '${username}/${datasetSlug}'...`,
+    log.info(
+      "Kaggle:Dataset",
+      `Uploading ${items.length} file(s) (${totalGb} GiB) into dataset '${username}/${datasetSlug}'...`,
     );
 
     const tokens: { token: string }[] = new Array(items.length);
@@ -323,8 +323,9 @@ export class VideoEncodingManager {
 
     await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
-    console.log(
-      `[Kaggle:BatchDataset] All ${items.length} GCS blobs uploaded. Registering dataset '${username}/${datasetSlug}'...`,
+    log.info(
+      "Kaggle:Dataset",
+      `All ${items.length} GCS blobs uploaded. Registering dataset '${username}/${datasetSlug}'...`,
     );
 
     const createUrls = [
@@ -372,30 +373,8 @@ export class VideoEncodingManager {
       );
     }
 
+    log.success("Kaggle:Dataset", `Dataset '${username}/${datasetSlug}' registered on Kaggle; awaiting indexing...`);
     return true;
-  }
-
-  public async uploadDatasetRest(
-    mkvPath: string,
-    datasetSlug: string,
-    username: string,
-    key: string,
-  ): Promise<boolean> {
-    const ext = path.extname(mkvPath) || ".mkv";
-    const stats = await fs.promises.stat(mkvPath);
-    return await this.uploadBatchDatasetRest(
-      [
-        {
-          jobId: 1,
-          localFilePath: mkvPath,
-          remoteFilename: `input_video${ext}`,
-          sizeBytes: stats.size,
-        },
-      ],
-      datasetSlug,
-      username,
-      key,
-    );
   }
 
   public extractCleanStatus(rawStatus: any): string {
@@ -414,7 +393,8 @@ export class VideoEncodingManager {
   }
 
   /**
-   * Single non-blocking dataset readiness check (ideal for short durable Inngest polling steps).
+   * Single non-blocking dataset readiness check.
+   * Checks both /datasets/status and /datasets/view + /datasets/list to prevent "Dataset not found" when mounting into kernels.
    */
   public async checkDatasetStatusOnce(
     datasetSlug: string,
@@ -448,6 +428,27 @@ export class VideoEncodingManager {
       }
     }
 
+    // Secondary check: /datasets/view/${username}/${datasetSlug}
+    if (!cleanStatus || !["ready", "complete", "completed", "ok"].includes(cleanStatus)) {
+      try {
+        const viewUrl = `https://www.kaggle.com/api/v1/datasets/view/${datasetIdentifier}`;
+        const viewData = await this.makeKaggleRequest(viewUrl, username, key, {
+          method: "GET",
+          quietCodes: [403, 404],
+        });
+        if (viewData && (viewData.currentVersionNumber || viewData.id)) {
+          const vStatus = this.extractCleanStatus(viewData.status || viewData.datasetStatus || "");
+          if (["ready", "complete", "completed", "ok"].includes(vStatus)) {
+            cleanStatus = "ready";
+          } else if (["error", "failed"].includes(vStatus)) {
+            cleanStatus = "failed";
+          } else if (!cleanStatus && viewData.currentVersionNumber >= 1 && Number(viewData.totalBytes || 0) > 0) {
+            cleanStatus = "ready";
+          }
+        }
+      } catch {}
+    }
+
     if (!cleanStatus && allowListFallback) {
       try {
         const listUrl = `https://www.kaggle.com/api/v1/datasets/list?user=${encodeURIComponent(username)}&search=${encodeURIComponent(datasetSlug)}`;
@@ -459,9 +460,7 @@ export class VideoEncodingManager {
           for (const item of dsList) {
             const ref = item.ref || item.url || "";
             if (String(ref).includes(datasetSlug)) {
-              const itemStatus = this.extractCleanStatus(
-                item.status || "ready",
-              );
+              const itemStatus = this.extractCleanStatus(item.status || "");
               if (itemStatus) {
                 cleanStatus = itemStatus;
                 break;
@@ -486,46 +485,54 @@ export class VideoEncodingManager {
     username: string,
     key: string,
     timeoutSec = 600,
+    onHeartbeat?: () => Promise<void>,
   ): Promise<boolean> {
-    console.log(
-      `[Kaggle:Dataset] Waiting for Kaggle backend to index dataset '${datasetSlug}'...`,
+    log.info(
+      "Kaggle:Dataset",
+      `Waiting for Kaggle backend to index dataset '${username}/${datasetSlug}'...`,
     );
     const startTime = Date.now();
-    await new Promise((r) => setTimeout(r, 4000));
+    await new Promise((r) => setTimeout(r, 5000));
 
     while ((Date.now() - startTime) / 1000 < timeoutSec) {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      if (onHeartbeat) {
+        await onHeartbeat().catch(() => {});
+      }
+
       const res = await this.checkDatasetStatusOnce(
         datasetSlug,
         username,
         key,
-        elapsed >= 15,
+        elapsed >= 20,
       );
 
-      console.log(
-        `[Kaggle:Dataset] Dataset Status: '${res.rawStatus}' | Elapsed: ${elapsed}s`,
+      log.info(
+        "Kaggle:Dataset",
+        `Dataset '${datasetSlug}' status: '${res.rawStatus}' | Elapsed: ${elapsed}s`,
       );
 
       if (res.state === "ready") {
-        await new Promise((r) => setTimeout(r, 3000));
-        console.log(
-          `[Kaggle:Dataset] Dataset '${datasetSlug}' is ready on Kaggle!`,
+        // Extra 5s settle buffer so Kaggle NFS mounts propagate to GPU worker nodes
+        await new Promise((r) => setTimeout(r, 5000));
+        log.success(
+          "Kaggle:Dataset",
+          `Dataset '${username}/${datasetSlug}' is indexed and READY on Kaggle!`,
         );
         return true;
       }
       if (res.state === "failed") {
         throw new Error(
-          `Kaggle dataset processing failed on cloud with status: '${res.rawStatus}'`,
+          `Kaggle dataset '${username}/${datasetSlug}' failed cloud indexing with status: '${res.rawStatus}'`,
         );
       }
 
-      await new Promise((r) => setTimeout(r, 5000));
+      await new Promise((r) => setTimeout(r, 6000));
     }
 
-    console.warn(
-      `[Kaggle:Dataset] Dataset status check reached ${timeoutSec}s; proceeding to kernel push...`,
+    throw new Error(
+      `Timed out after ${timeoutSec}s waiting for Kaggle dataset '${username}/${datasetSlug}' to become ready`,
     );
-    return false;
   }
 
   public async deleteKaggleDataset(
@@ -541,10 +548,10 @@ export class VideoEncodingManager {
         {
           method: "POST",
           payload: { ownerSlug: username, datasetSlug },
-          quietCodes: [403, 404],
+          quietCodes: [400, 403, 404],
         },
       );
-      console.log(`[Kaggle:Cleanup] Cleaned up Kaggle Dataset '${datasetSlug}'.`);
+      log.info("Kaggle:Cleanup", `Cleaned up Kaggle Dataset '${datasetSlug}'.`);
     } catch {}
   }
 
@@ -604,12 +611,10 @@ export class VideoEncodingManager {
 
   /**
    * Generates a strictly GPU-ONLY (2x NvidiaTeslaT4 NVENC) Multi-Episode Batch Kernel script:
-   * - Installs BtbN FFmpeg 7.1 GPL static build (compatible with Kaggle's NVIDIA driver 560/580 NVENC API 12.2/13.0)
-   *   and verifies it with a 1-frame h264_nvenc smoke test (automatically falling back to /usr/bin/ffmpeg if driver mismatches).
-   * - Purges sys.modules before re-importing upgraded huggingface_hub so batch_bucket_files never hits a stale cache.
+   * - ALWAYS encodes all 3 qualities (1080p, 720p, 480p) via hardware h264_nvenc with the "AniLight" RGBA watermark burned in for the first 30s.
    * - Zero-desync A/V pipeline: setpts=PTS-STARTPTS + aresample=async=1000:min_hard_comp=0.100000:first_pts=0 + -fps_mode cfr + -avoid_negative_ts make_zero.
-   * - 1080p is remuxed (-c:v copy) directly to MP4 container without re-encoding (unless source is unplayable Hi10p/AV1 or BURN_WATERMARK_ON_1080P=True).
-   * - 720p and 480p are watermarked (crisp RGBA alpha overlay for first 30s) and hardware-encoded across the 2x Tesla T4 GPUs.
+   * - Parallel execution across both Tesla T4 GPUs (intra-episode GPU split for 1-job batch, or parallel worker queue for multi-episode batches).
+   * - Resilient /kaggle/input dataset file discovery (exact match, case-insensitive match, or jobId prefix match).
    */
   public generateBatchGpuKernelScript(
     manifestItems: KiraBatchManifestItem[],
@@ -620,31 +625,26 @@ export class VideoEncodingManager {
     ).toString("base64");
 
     return `
-import os, sys, json, base64, uuid, hashlib, subprocess, time, shutil, threading, concurrent.futures, importlib
+import os, sys, json, base64, uuid, hashlib, subprocess, time, shutil, threading, concurrent.futures, importlib, queue
 
-print("=== AniLight Kaggle Batch GPU Transcoder (Dual-T4 NVENC-Verified | Zero-Desync) ===", flush=True)
+print("=== AniLight Kaggle Batch GPU Transcoder (Dual-T4 NVENC | 1080p + 720p + 480p Watermarked) ===", flush=True)
 
-# Toggle: False = Do NOT re-encode 1080p (remux directly to .mp4 container; only encode 720p & 480p with watermark).
-#         True  = Re-encode 1080p via NVENC as well so the pixel watermark is burned into 1080p frames.
-BURN_WATERMARK_ON_1080P = False
-
-# Verified system FFmpeg with native Turing NVENC/NVDEC on Kaggle T4 nodes
 ffmpeg_ver = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True).stdout.splitlines()[0]
-print(f"[FFmpeg:System] Using built-in system FFmpeg: {ffmpeg_ver}", flush=True)
+print(f"[FFmpeg:System] {ffmpeg_ver}", flush=True)
 
 manifest = json.loads(base64.b64decode("${manifestB64}").decode("utf-8"))
-print(f"Batch Manifest loaded: {len(manifest)} episode job(s) to process.", flush=True)
+print(f"Batch Manifest loaded: {len(manifest)} episode job(s) to encode across all 3 qualities (1080p, 720p, 480p).", flush=True)
 
-# 1. STRICT GPU HARDWARE ASSERTION (CPU FALLBACK IS STRICTLY DISABLED)
+# 1. STRICT GPU HARDWARE ASSERTION (CPU FALLBACK IS DISABLED)
 smi = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
 gpu_lines = [line for line in smi.stdout.strip().splitlines() if "GPU " in line] if smi.returncode == 0 else []
 gpu_count = len(gpu_lines)
 if smi.returncode != 0 or gpu_count == 0:
-    raise RuntimeError("FATAL: No NVIDIA GPU detected on Kaggle worker! CPU fallback is strictly disabled.")
+    raise RuntimeError("FATAL: No NVIDIA GPU detected on Kaggle worker! CPU fallback is disabled.")
 
 enc_check = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True)
 if "h264_nvenc" not in enc_check.stdout:
-    raise RuntimeError("FATAL: h264_nvenc hardware encoder unavailable in FFmpeg! CPU fallback is strictly disabled.")
+    raise RuntimeError("FATAL: h264_nvenc hardware encoder unavailable in FFmpeg!")
 
 def check_ffmpeg_caps():
     dav1d, fdk_aac, has_fps_mode = False, False, False
@@ -687,7 +687,7 @@ print(
 for gl in gpu_lines:
     print(f"  -> {gl}", flush=True)
 
-# 2. Install Hugging Face & Pillow dependencies safely (invalidating sys.modules cache if upgraded)
+# 2. Ensure Pillow & huggingface_hub are installed and fresh
 try:
     from PIL import Image, ImageDraw, ImageFont
 except ImportError:
@@ -704,31 +704,61 @@ except ImportError:
     importlib.invalidate_caches()
     from huggingface_hub import batch_bucket_files
 
-# 3. Index mounted /kaggle/input files without copying to /tmp
+# 3. Discover mounted dataset files in /kaggle/input (with retry for slow NFS mounts)
 start_search = time.time()
 input_file_map = {}
 all_video_files = []
-while time.time() - start_search < 180:
+search_roots = ["/kaggle/input"]
+if os.path.exists("/root/.cache/kagglehub"):
+    search_roots.append("/root/.cache/kagglehub")
+
+while time.time() - start_search < 240:
     input_file_map.clear()
     all_video_files.clear()
-    for root, _, f_names in os.walk("/kaggle/input"):
-        for f in f_names:
-            full_p = os.path.join(root, f)
-            input_file_map[f] = full_p
-            if f.lower().endswith((".mkv", ".mp4", ".avi", ".webm")):
-                all_video_files.append(full_p)
+    for s_root in search_roots:
+        if not os.path.exists(s_root):
+            continue
+        for root, _, f_names in os.walk(s_root):
+            for f in f_names:
+                full_p = os.path.join(root, f)
+                input_file_map[f] = full_p
+                input_file_map[f.lower()] = full_p
+                if f.lower().endswith((".mkv", ".mp4", ".avi", ".webm")):
+                    all_video_files.append(full_p)
     if all_video_files:
-        if all(item["filename"] in input_file_map for item in manifest) or len(manifest) == 1:
+        if all((item["filename"] in input_file_map or item["filename"].lower() in input_file_map) for item in manifest) or len(all_video_files) >= len(manifest):
             break
     time.sleep(3)
 
+print(f"Discovered {len(all_video_files)} video file(s) in /kaggle/input: {all_video_files}", flush=True)
 if not all_video_files:
-    raise RuntimeError("No input video files found in /kaggle/input")
+    try:
+        diag = subprocess.run(["find", "/kaggle", "-maxdepth", "4"], capture_output=True, text=True).stdout
+        print(f"Diagnostic /kaggle tree:\\n{diag}", flush=True)
+    except Exception:
+        pass
+    raise RuntimeError("No input video files found in /kaggle/input! Ensure dataset was indexed before kernel push.")
+
+def resolve_input_file(item):
+    fname = item["filename"]
+    job_id = item["jobId"]
+    if fname in input_file_map and os.path.exists(input_file_map[fname]):
+        return input_file_map[fname]
+    if fname.lower() in input_file_map and os.path.exists(input_file_map[fname.lower()]):
+        return input_file_map[fname.lower()]
+    prefix = f"input_{job_id}".lower()
+    for vf in all_video_files:
+        if os.path.basename(vf).lower().startswith(prefix):
+            return vf
+    if len(manifest) == 1 and len(all_video_files) == 1:
+        return all_video_files[0]
+    raise RuntimeError(f"Input file '{fname}' for job {job_id} not found in /kaggle/input (available: {[os.path.basename(x) for x in all_video_files]})")
 
 BASE_WORK_DIR = "/tmp/anilight_batch_work"
 os.makedirs(BASE_WORK_DIR, exist_ok=True)
 os.makedirs("/kaggle/working", exist_ok=True)
 
+# 4. Generate Crisp "AniLight" RGBA Watermark PNGs for 1080p, 720p, and 480p
 def find_system_font():
     for f in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -744,17 +774,13 @@ def find_system_font():
     if os.path.exists("/usr/share/fonts"):
         for root, _, fs_list in os.walk("/usr/share/fonts"):
             for fn in fs_list:
-                if fn.lower().endswith(".ttf") and "bold" not in fn.lower():
-                    return os.path.join(root, fn)
-        for root, _, fs_list in os.walk("/usr/share/fonts"):
-            for fn in fs_list:
                 if fn.lower().endswith(".ttf"):
                     return os.path.join(root, fn)
     return ""
 
 sys_font = find_system_font()
 
-def generate_watermark_png(output_path, text="AniLight", fontsize=18, alpha=115, border_alpha=75):
+def generate_watermark_png(output_path, text="AniLight", fontsize=18, alpha=125, border_alpha=90):
     font = None
     if sys_font:
         try:
@@ -762,10 +788,7 @@ def generate_watermark_png(output_path, text="AniLight", fontsize=18, alpha=115,
         except Exception:
             pass
     if font is None:
-        try:
-            font = ImageFont.load_default()
-        except Exception:
-            pass
+        font = ImageFont.load_default()
 
     dummy = Image.new("RGBA", (400, 120), (0, 0, 0, 0))
     d = ImageDraw.Draw(dummy)
@@ -776,8 +799,8 @@ def generate_watermark_png(output_path, text="AniLight", fontsize=18, alpha=115,
     except Exception:
         tw, th = int(fontsize * len(text) * 0.6), int(fontsize * 1.2)
 
-    w = (tw + 12 + 1) & ~1
-    h = (th + 12 + 1) & ~1
+    w = (tw + 14 + 1) & ~1
+    h = (th + 14 + 1) & ~1
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
@@ -785,10 +808,10 @@ def generate_watermark_png(output_path, text="AniLight", fontsize=18, alpha=115,
     border_color = (0, 0, 0, border_alpha)
 
     try:
-        draw.text((3, 3), text, font=font, fill=text_color, stroke_width=1, stroke_fill=border_color)
-    except (TypeError, Exception):
-        draw.text((4, 4), text, font=font, fill=border_color)
-        draw.text((3, 3), text, font=font, fill=text_color)
+        draw.text((4, 4), text, font=font, fill=text_color, stroke_width=1, stroke_fill=border_color)
+    except Exception:
+        draw.text((5, 5), text, font=font, fill=border_color)
+        draw.text((4, 4), text, font=font, fill=text_color)
 
     img.save(output_path, format="PNG")
     return w, h
@@ -796,9 +819,9 @@ def generate_watermark_png(output_path, text="AniLight", fontsize=18, alpha=115,
 wm_1080_png = f"{BASE_WORK_DIR}/wm_1080.png"
 wm_720_png = f"{BASE_WORK_DIR}/wm_720.png"
 wm_480_png = f"{BASE_WORK_DIR}/wm_480.png"
-generate_watermark_png(wm_1080_png, "AniLight", fontsize=20, alpha=115, border_alpha=85)
-generate_watermark_png(wm_720_png, "AniLight", fontsize=14, alpha=115, border_alpha=85)
-generate_watermark_png(wm_480_png, "AniLight", fontsize=10, alpha=115, border_alpha=85)
+generate_watermark_png(wm_1080_png, "AniLight", fontsize=20, alpha=125, border_alpha=90)
+generate_watermark_png(wm_720_png, "AniLight", fontsize=14, alpha=125, border_alpha=90)
+generate_watermark_png(wm_480_png, "AniLight", fontsize=10, alpha=125, border_alpha=90)
 
 def probe_input_video(filepath):
     try:
@@ -814,8 +837,6 @@ def probe_input_video(filepath):
         v_codec = str(st.get("codec_name") or "").lower().strip()
         pix_fmt = str(st.get("pix_fmt") or "yuv420p").lower().strip()
 
-        # Safely parse avg_frame_rate and r_frame_rate (handling MKV "0/0" strings)
-        # Uses exact rational 24000/1001 instead of rounded 23.976 to prevent A/V and subtitle desync over long durations
         fps = "24000/1001"
         for cand in (st.get("r_frame_rate"), st.get("avg_frame_rate")):
             if not cand or not isinstance(cand, str):
@@ -825,7 +846,6 @@ def probe_input_video(filepath):
                 n_val, d_val = float(n_str or 0), float(d_str or 0)
                 if d_val > 0 and 1.0 <= (n_val / d_val) <= 120.0:
                     val = n_val / d_val
-                    # Standard anime 23.976 / 23.98 fps is mathematically 24000/1001
                     if abs(val - (24000.0 / 1001.0)) < 0.05 or abs(val - 23.976) < 0.05:
                         fps = "24000/1001"
                     elif abs(val - 24.0) < 0.01:
@@ -854,8 +874,6 @@ def probe_input_video(filepath):
         return 1920, 1080, "24000/1001", "h264", "yuv420p"
 
 def supports_t4_nvdec(v_codec, pix_fmt):
-    # Tesla T4 (Turing TU104) NVDEC decodes 8-bit H.264, 8/10/12-bit HEVC, VP8, VP9, MPEG-2, VC-1.
-    # It does NOT support AV1 or 10-bit H.264 (Hi10p).
     is_high_bit = ("10" in pix_fmt) or ("12" in pix_fmt)
     if v_codec == "av1":
         return False
@@ -863,20 +881,7 @@ def supports_t4_nvdec(v_codec, pix_fmt):
         return False
     return v_codec in ("h264", "hevc", "vp9", "vp8", "mpeg2video", "vc1")
 
-def can_stream_copy_1080p_to_mp4(v_codec, pix_fmt, in_height):
-    # Browser MP4 players cannot hardware-decode 10-bit H.264 (Hi10p), VP8/VP9-in-MP4, or non-1080p without scaling.
-    # Standard 8-bit H.264 and 8/10-bit HEVC at 1080p can be safely stream-copied (-c:v copy) into .mp4.
-    is_high_bit = ("10" in pix_fmt) or ("12" in pix_fmt)
-    if in_height != 1080:
-        return False
-    if v_codec == "h264" and not is_high_bit:
-        return True
-    if v_codec in ("hevc", "h265"):
-        return True
-    return False
-
-# Asynchronous Background Hugging Face Uploader
-import queue
+# 5. Asynchronous Background Hugging Face Uploader
 upload_lock = threading.Lock()
 completed_records = []
 completed_job_ids = []
@@ -906,10 +911,10 @@ def push_entries_to_hf(batch_to_push):
         for e in entries:
             combined_add.extend(e["add_items"])
 
-        print(f"[HF:AsyncUpload] Uploading {len(combined_add)} MP4 file(s) ({len(entries)} ep(s)) to {hf_owner}/{hf_bucket}...", flush=True)
+        print(f"[HF:Upload] Uploading {len(combined_add)} MP4 file(s) ({len(entries)} ep(s)) to {hf_owner}/{hf_bucket}...", flush=True)
         last_hf_err = None
         uploaded_ok = False
-        for attempt in range(1, 4):
+        for attempt in range(1, 5):
             try:
                 batch_bucket_files(
                     bucket_id=f"{hf_owner}/{hf_bucket}",
@@ -920,16 +925,17 @@ def push_entries_to_hf(batch_to_push):
                 break
             except Exception as exc:
                 last_hf_err = exc
-                print(f"[HF:Warn] Upload attempt {attempt}/3 failed: {exc}", flush=True)
-                time.sleep(4 * attempt)
+                print(f"[HF:Warn] Upload attempt {attempt}/4 failed: {exc}", flush=True)
+                time.sleep(5 * attempt)
 
         with upload_lock:
             if uploaded_ok:
                 for e in entries:
                     completed_records.extend(e["records"])
-                    completed_job_ids.append(e["job_id"])
+                    if e["job_id"] not in completed_job_ids:
+                        completed_job_ids.append(e["job_id"])
                     shutil.rmtree(e["work_dir"], ignore_errors=True)
-                print(f"[HF:Done] Uploaded & freed /tmp for job(s): {[e['job_id'] for e in entries]}", flush=True)
+                print(f"[HF:Done] Uploaded & cleaned /tmp for job(s): {[e['job_id'] for e in entries]}", flush=True)
             else:
                 for e in entries:
                     failed_jobs.append({"jobId": e["job_id"], "error": f"HF upload failed: {last_hf_err}"})
@@ -965,45 +971,45 @@ def hf_uploader_loop():
 uploader_thread = threading.Thread(target=hf_uploader_loop, daemon=True)
 uploader_thread.start()
 
+# 6. Core GPU Episode Transcoder (ALWAYS encodes 1080p, 720p, and 480p with AniLight Watermark)
 def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
     job_id = item["jobId"]
     anime_id = item["animeId"]
     ep_num = item["episodeNumber"]
-    tracks = item["tracks"]
+    raw_tracks = item.get("tracks") or [["sub", 0]]
     hf = item["hf"]
-    fname = item["filename"]
 
-    src_input = input_file_map.get(fname)
-    if not src_input and len(manifest) == 1 and all_video_files:
-        src_input = sorted(all_video_files, key=os.path.getsize, reverse=True)[0]
-    if not src_input or not os.path.exists(src_input):
-        raise RuntimeError(f"Input file '{fname}' for job {job_id} not found in /kaggle/input")
+    # Normalize tracks so we only ever encode valid audio track names ("sub" / "dub")
+    tracks = []
+    for t_entry in raw_tracks:
+        t_label = str(t_entry[0]).lower()
+        t_idx = int(t_entry[1] or 0)
+        if t_label in ("sub", "dub"):
+            tracks.append([t_label, t_idx])
+    if not tracks:
+        tracks = [["sub", 0]]
 
+    src_input = resolve_input_file(item)
     work_dir = f"{BASE_WORK_DIR}/job_{job_id}"
     os.makedirs(work_dir, exist_ok=True)
 
     t_ep_start = time.time()
     in_width, in_height, in_fps, v_codec, pix_fmt = probe_input_video(src_input)
     can_nvdec = supports_t4_nvdec(v_codec, pix_fmt)
-    remux_1080p_direct = (not BURN_WATERMARK_ON_1080P) and can_stream_copy_1080p_to_mp4(v_codec, pix_fmt, in_height)
 
     print(
-        f"\\n[Job {job_id}] Starting GPU pipeline for Anime {anime_id} Ep {ep_num} on GPU {assigned_gpu_id} "
-        f"(codec={v_codec}, pix_fmt={pix_fmt}, fps={in_fps}, nvdec={can_nvdec}, "
-        f"remux_1080p_direct={remux_1080p_direct}, intra_split={allow_intra_split})...",
+        f"\\n[Job {job_id}] Starting 3-Quality Watermarked GPU encode for Anime {anime_id} Ep {ep_num} on GPU {assigned_gpu_id} "
+        f"(codec={v_codec}, pix_fmt={pix_fmt}, fps={in_fps}, nvdec={can_nvdec}, tracks={tracks})...",
         flush=True,
     )
 
     primary_track_name, primary_a_idx = tracks[0]
-
     primary_files = {
         "1080p": f"{work_dir}/{primary_track_name}_1080p.mp4",
         "720p": f"{work_dir}/{primary_track_name}_720p.mp4",
         "480p": f"{work_dir}/{primary_track_name}_480p.mp4",
     }
 
-    # ZERO-DESYNC AUDIO EXTRACTION:
-    # Locks audio start timestamp to PTS=0 and dynamically compensates for packet gaps/drift
     aac_codec_args = (
         ["-c:a", "libfdk_aac", "-b:a", "256k", "-cutoff", "20000", "-ar", "48000", "-ac", "2"]
         if has_fdk_aac
@@ -1011,70 +1017,48 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
     )
     audio_sync_filter = "aresample=async=1000:min_hard_comp=0.100000:first_pts=0,asetpts=PTS-STARTPTS"
 
+    # Extract primary audio track (with fallback to 0:a:0 if specific index fails)
     primary_audio = f"{work_dir}/{primary_track_name}_audio.m4a"
-    subprocess.run(
-        [
-            "ffmpeg", "-hide_banner", "-y", "-v", "warning",
-            "-analyzeduration", "100M", "-probesize", "50M",
-            "-fflags", "+genpts+igndts+discardcorrupt",
-            "-vn", "-threads", "2", "-i", src_input,
-            "-map", f"0:a:{primary_a_idx}",
-            "-af", audio_sync_filter,
-        ] + aac_codec_args + [
-            "-avoid_negative_ts", "make_zero",
-            "-max_muxing_queue_size", "4096",
-            "-movflags", "+faststart",
-            primary_audio,
-        ],
-        check=True,
-    )
+    a_cmd = [
+        "ffmpeg", "-hide_banner", "-y", "-v", "warning",
+        "-analyzeduration", "100M", "-probesize", "50M",
+        "-fflags", "+genpts+igndts+discardcorrupt",
+        "-vn", "-threads", "2", "-i", src_input,
+        "-map", f"0:a:{primary_a_idx}",
+        "-af", audio_sync_filter,
+    ] + aac_codec_args + [
+        "-avoid_negative_ts", "make_zero",
+        "-max_muxing_queue_size", "4096",
+        "-movflags", "+faststart",
+        primary_audio,
+    ]
+    if subprocess.run(a_cmd).returncode != 0:
+        a_cmd[a_cmd.index(f"0:a:{primary_a_idx}")] = "0:a:0"
+        subprocess.run(a_cmd, check=True)
 
+    # Extract secondary audio tracks (e.g. Dual-Audio dub)
     if len(tracks) > 1:
         for extra_track_name, extra_a_idx in tracks[1:]:
             extra_audio = f"{work_dir}/{extra_track_name}_audio.m4a"
-            subprocess.run(
-                [
-                    "ffmpeg", "-hide_banner", "-y", "-v", "warning",
-                    "-analyzeduration", "100M", "-probesize", "50M",
-                    "-fflags", "+genpts+igndts+discardcorrupt",
-                    "-vn", "-threads", "2", "-i", src_input,
-                    "-map", f"0:a:{extra_a_idx}",
-                    "-af", audio_sync_filter,
-                ] + aac_codec_args + [
-                    "-avoid_negative_ts", "make_zero",
-                    "-max_muxing_queue_size", "4096",
-                    "-movflags", "+faststart",
-                    extra_audio,
-                ],
-                check=True,
-            )
+            ea_cmd = [
+                "ffmpeg", "-hide_banner", "-y", "-v", "warning",
+                "-analyzeduration", "100M", "-probesize", "50M",
+                "-fflags", "+genpts+igndts+discardcorrupt",
+                "-vn", "-threads", "2", "-i", src_input,
+                "-map", f"0:a:{extra_a_idx}",
+                "-af", audio_sync_filter,
+            ] + aac_codec_args + [
+                "-avoid_negative_ts", "make_zero",
+                "-max_muxing_queue_size", "4096",
+                "-movflags", "+faststart",
+                extra_audio,
+            ]
+            if subprocess.run(ea_cmd).returncode != 0:
+                ea_cmd[ea_cmd.index(f"0:a:{extra_a_idx}")] = "0:a:0"
+                subprocess.run(ea_cmd, check=True)
 
-    # STEP 1: 1080p DIRECT REMUX TO MP4 (No Re-encode)
-    if remux_1080p_direct:
-        remux_tag_args = ["-tag:v", "hvc1"] if v_codec in ("hevc", "h265") else []
-        remux_1080_cmd = [
-            "ffmpeg", "-hide_banner", "-y", "-v", "warning",
-            "-analyzeduration", "100M", "-probesize", "50M",
-            "-fflags", "+genpts+igndts+discardcorrupt",
-            "-i", src_input,
-            "-i", primary_audio,
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-c:v", "copy",
-        ] + remux_tag_args + [
-            "-c:a", "copy",
-            "-metadata", "title=AniLight",
-            "-metadata", "comment=AniLight",
-            "-avoid_negative_ts", "make_zero",
-            "-max_muxing_queue_size", "4096",
-            "-movflags", "+faststart",
-            primary_files["1080p"],
-        ]
-        subprocess.run(remux_1080_cmd, check=True)
-
-    def clean_encoded_partials():
-        targets = ("720p", "480p") if remux_1080p_direct else ("1080p", "720p", "480p")
-        for q_k in targets:
+    def clean_partials(qualities=("1080p", "720p", "480p")):
+        for q_k in qualities:
             pf = primary_files[q_k]
             if os.path.exists(pf):
                 try:
@@ -1105,7 +1089,6 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
         "-hwaccel", "cuda",
     ]
 
-    # Balanced Turing NVENC preset: p5 with high quality tuning and quarter-resolution multipass
     preset_flags = (
         ["-preset", selected_preset] +
         (["-tune", "hq"] if has_tune_hq else []) +
@@ -1121,7 +1104,9 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
          "-rc-lookahead", "24", "-bf", "3"] + bframe_extra +
         ["-g", "240", "-forced-idr", "1", "-pix_fmt", "yuv420p",
          "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-         "-c:a", "copy"] +
+         "-c:a", "copy",
+         "-metadata", "title=AniLight",
+         "-metadata", "comment=AniLight"] +
         fps_sync_flags +
         ["-r", str(in_fps),
          "-avoid_negative_ts", "make_zero",
@@ -1134,12 +1119,19 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
     nvenc_480 = ["-cq", "23", "-maxrate", "1600k", "-bufsize", "3200k"] + nvenc_common + [primary_files["480p"]]
 
     lanczos_flags = "lanczos+accurate_rnd+full_chroma_int"
+    v1080_scale = "format=yuv420p" if in_height == 1080 else f"scale=-2:1080:flags={lanczos_flags},format=yuv420p"
 
+    wm_input_1080 = ["-framerate", str(in_fps), "-loop", "1", "-t", "30", "-i", wm_1080_png]
     wm_input_720 = ["-framerate", str(in_fps), "-loop", "1", "-t", "30", "-i", wm_720_png]
     wm_input_480 = ["-framerate", str(in_fps), "-loop", "1", "-t", "30", "-i", wm_480_png]
+    wm_inputs_all = wm_input_1080 + wm_input_720 + wm_input_480
     wm_inputs_lower = wm_input_720 + wm_input_480
 
-    # Filtergraphs: setpts=PTS-STARTPTS locks start to 0.000s, RGBA overlay keeps text edges sharp, -fps_mode cfr enforces CFR
+    fc_1080_only = (
+        f"[0:v:0]setpts=PTS-STARTPTS,{v1080_scale}[b1080];"
+        "[1:v:0]format=rgba[wm1080];"
+        "[b1080][wm1080]overlay=x=20:y=18:eof_action=pass:format=auto,format=yuv420p[out1080]"
+    )
     fc_720_only = (
         f"[0:v:0]setpts=PTS-STARTPTS,scale=-2:720:flags={lanczos_flags},format=yuv420p[b720];"
         "[1:v:0]format=rgba[wm720];"
@@ -1158,98 +1150,51 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
         "[b720][wm720]overlay=x=14:y=12:eof_action=pass:format=auto,format=yuv420p[out720];"
         "[b480][wm480]overlay=x=10:y=8:eof_action=pass:format=auto,format=yuv420p[out480]"
     )
+    fc_all_3 = (
+        f"[0:v:0]setpts=PTS-STARTPTS,{v1080_scale},split=2[b1080][s1080];"
+        f"[s1080]scale=-2:720:flags={lanczos_flags},format=yuv420p,split=2[b720][s720];"
+        f"[s720]scale=-2:480:flags={lanczos_flags},format=yuv420p[b480];"
+        "[1:v:0]format=rgba[wm1080];"
+        "[2:v:0]format=rgba[wm720];"
+        "[3:v:0]format=rgba[wm480];"
+        "[b1080][wm1080]overlay=x=20:y=18:eof_action=pass:format=auto,format=yuv420p[out1080];"
+        "[b720][wm720]overlay=x=14:y=12:eof_action=pass:format=auto,format=yuv420p[out720];"
+        "[b480][wm480]overlay=x=10:y=8:eof_action=pass:format=auto,format=yuv420p[out480]"
+    )
 
     encode_ok = False
     gpu_env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(assigned_gpu_id))
     dec_prefix = hw_dec_args if can_nvdec else sw_dec_args
 
-    if remux_1080p_direct:
-        # ONLY 720p & 480p ARE ENCODED ON GPU (1080p was already remuxed via -c:v copy above!)
-        if allow_intra_split and gpu_count > 1:
-            # Single-episode batch mode across 2x Tesla T4: GPU 0 encodes 720p and GPU 1 encodes 480p simultaneously
-            def run_720_and_480_across_gpus(d_args):
-                c_720 = (
-                    ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + d_args +
-                    ["-i", src_input] + wm_input_720 + ["-i", primary_audio,
-                     "-filter_complex", fc_720_only,
-                     "-map", "[out720]", "-map", "2:a:0"] + nvenc_720
-                )
-                c_480 = (
-                    ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + d_args +
-                    ["-i", src_input] + wm_input_480 + ["-i", primary_audio,
-                     "-filter_complex", fc_480_only,
-                     "-map", "[out480]", "-map", "2:a:0"] + nvenc_480
-                )
-                def r0():
-                    return subprocess.run(c_720, env=dict(os.environ, CUDA_VISIBLE_DEVICES="0")).returncode == 0
-                def r1():
-                    return subprocess.run(c_480, env=dict(os.environ, CUDA_VISIBLE_DEVICES="1")).returncode == 0
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as sub_ex:
-                    f0 = sub_ex.submit(r0)
-                    f1 = sub_ex.submit(r1)
-                    return f0.result() and f1.result()
-
-            encode_ok = run_720_and_480_across_gpus(dec_prefix)
-            if not encode_ok and can_nvdec:
-                clean_encoded_partials()
-                encode_ok = run_720_and_480_across_gpus(sw_dec_args)
-        else:
-            # Multi-episode batch mode: Worker owns its dedicated T4 GPU and encodes 720p + 480p in a single decode pass
-            cmd_lower_nvenc = (
-                ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + dec_prefix +
+    # Mode A: Single-episode batch across 2x Tesla T4 GPUs -> GPU 0 encodes 1080p, GPU 1 encodes 720p + 480p simultaneously
+    if allow_intra_split and gpu_count > 1:
+        def run_split_across_2_gpus(d_args):
+            c_1080 = (
+                ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + d_args +
+                ["-i", src_input] + wm_input_1080 + ["-i", primary_audio,
+                 "-filter_complex", fc_1080_only,
+                 "-map", "[out1080]", "-map", "2:a:0"] + nvenc_1080
+            )
+            c_lower = (
+                ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + d_args +
                 ["-i", src_input] + wm_inputs_lower + ["-i", primary_audio,
                  "-filter_complex", fc_lower_2,
                  "-map", "[out720]", "-map", "3:a:0"] + nvenc_720 +
                 ["-map", "[out480]", "-map", "3:a:0"] + nvenc_480
             )
-            encode_ok = (subprocess.run(cmd_lower_nvenc, env=gpu_env).returncode == 0)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as sub_ex:
+                f0 = sub_ex.submit(lambda: subprocess.run(c_1080, env=dict(os.environ, CUDA_VISIBLE_DEVICES="0")).returncode == 0)
+                f1 = sub_ex.submit(lambda: subprocess.run(c_lower, env=dict(os.environ, CUDA_VISIBLE_DEVICES="1")).returncode == 0)
+                return f0.result() and f1.result()
 
-            if not encode_ok and can_nvdec:
-                clean_encoded_partials()
-                print(f"[Job {job_id}] Retrying SW decode -> 2x h264_nvenc (720p+480p) on GPU {assigned_gpu_id}...", flush=True)
-                cmd_lower_sw = (
-                    ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + sw_dec_args +
-                    ["-i", src_input] + wm_inputs_lower + ["-i", primary_audio,
-                     "-filter_complex", fc_lower_2,
-                     "-map", "[out720]", "-map", "3:a:0"] + nvenc_720 +
-                    ["-map", "[out480]", "-map", "3:a:0"] + nvenc_480
-                )
-                encode_ok = (subprocess.run(cmd_lower_sw, env=gpu_env).returncode == 0)
+        encode_ok = run_split_across_2_gpus(dec_prefix)
+        if not encode_ok and can_nvdec:
+            clean_partials()
+            encode_ok = run_split_across_2_gpus(sw_dec_args)
 
-            if not encode_ok:
-                clean_encoded_partials()
-                print(f"[Job {job_id}] Retrying sequential 720p then 480p h264_nvenc on GPU {assigned_gpu_id}...", flush=True)
-                c720 = (
-                    ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + sw_dec_args +
-                    ["-i", src_input] + wm_input_720 + ["-i", primary_audio,
-                     "-filter_complex", fc_720_only, "-map", "[out720]", "-map", "2:a:0"] + nvenc_720
-                )
-                c480 = (
-                    ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + sw_dec_args +
-                    ["-i", src_input] + wm_input_480 + ["-i", primary_audio,
-                     "-filter_complex", fc_480_only, "-map", "[out480]", "-map", "2:a:0"] + nvenc_480
-                )
-                encode_ok = (subprocess.run(c720, env=gpu_env).returncode == 0) and (subprocess.run(c480, env=gpu_env).returncode == 0)
-    else:
-        # Fallback if BURN_WATERMARK_ON_1080P is True OR if source was unplayable 10-bit H.264 (Hi10p) / AV1 / non-1080p
-        wm_input_1080 = ["-framerate", str(in_fps), "-loop", "1", "-t", "30", "-i", wm_1080_png]
-        wm_inputs_all = wm_input_1080 + wm_inputs_lower
-        v1080_scale = (
-            "format=yuv420p"
-            if in_height == 1080
-            else f"scale=-2:1080:flags={lanczos_flags},format=yuv420p"
-        )
-        fc_all_3 = (
-            f"[0:v:0]setpts=PTS-STARTPTS,{v1080_scale},split=2[b1080][s1080];"
-            f"[s1080]scale=-2:720:flags={lanczos_flags},format=yuv420p,split=2[b720][s720];"
-            f"[s720]scale=-2:480:flags={lanczos_flags},format=yuv420p[b480];"
-            "[1:v:0]format=rgba[wm1080];"
-            "[2:v:0]format=rgba[wm720];"
-            "[3:v:0]format=rgba[wm480];"
-            "[b1080][wm1080]overlay=x=20:y=18:eof_action=pass:format=auto,format=yuv420p[out1080];"
-            "[b720][wm720]overlay=x=14:y=12:eof_action=pass:format=auto,format=yuv420p[out720];"
-            "[b480][wm480]overlay=x=10:y=8:eof_action=pass:format=auto,format=yuv420p[out480]"
-        )
+    # Mode B: Multi-episode batch -> Worker encodes 1080p + 720p + 480p on its dedicated T4 GPU
+    if not encode_ok:
+        clean_partials()
         cmd_all = (
             ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + dec_prefix +
             ["-i", src_input] + wm_inputs_all + ["-i", primary_audio,
@@ -1259,8 +1204,10 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
             ["-map", "[out480]", "-map", "4:a:0"] + nvenc_480
         )
         encode_ok = (subprocess.run(cmd_all, env=gpu_env).returncode == 0)
+
         if not encode_ok and can_nvdec:
-            clean_encoded_partials()
+            clean_partials()
+            print(f"[Job {job_id}] Retrying SW decode -> 3x h264_nvenc (1080p+720p+480p) on GPU {assigned_gpu_id}...", flush=True)
             cmd_all_sw = (
                 ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + sw_dec_args +
                 ["-i", src_input] + wm_inputs_all + ["-i", primary_audio,
@@ -1271,30 +1218,54 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
             )
             encode_ok = (subprocess.run(cmd_all_sw, env=gpu_env).returncode == 0)
 
+        # Tier 3 fallback: Sequential per-quality h264_nvenc on GPU (if simultaneous 3-session NVENC hits VRAM limit)
+        if not encode_ok:
+            clean_partials()
+            print(f"[Job {job_id}] Retrying sequential 1080p -> 720p -> 480p h264_nvenc on GPU {assigned_gpu_id}...", flush=True)
+            c1080 = (
+                ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + sw_dec_args +
+                ["-i", src_input] + wm_input_1080 + ["-i", primary_audio,
+                 "-filter_complex", fc_1080_only, "-map", "[out1080]", "-map", "2:a:0"] + nvenc_1080
+            )
+            c720 = (
+                ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + sw_dec_args +
+                ["-i", src_input] + wm_input_720 + ["-i", primary_audio,
+                 "-filter_complex", fc_720_only, "-map", "[out720]", "-map", "2:a:0"] + nvenc_720
+            )
+            c480 = (
+                ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + sw_dec_args +
+                ["-i", src_input] + wm_input_480 + ["-i", primary_audio,
+                 "-filter_complex", fc_480_only, "-map", "[out480]", "-map", "2:a:0"] + nvenc_480
+            )
+            encode_ok = (
+                subprocess.run(c1080, env=gpu_env).returncode == 0 and
+                subprocess.run(c720, env=gpu_env).returncode == 0 and
+                subprocess.run(c480, env=gpu_env).returncode == 0
+            )
+
     if not encode_ok:
         shutil.rmtree(work_dir, ignore_errors=True)
-        raise RuntimeError(f"GPU h264_nvenc transcode failed across all GPU tiers for Job {job_id} (CPU fallback is disabled).")
+        raise RuntimeError(f"GPU h264_nvenc transcode failed across all tiers for Job {job_id}.")
 
-    # Remux additional audio tracks (e.g. Dual-Audio dub) with zero-desync flags
+    # Remux additional audio tracks (e.g. Dual-Audio dub) into the watermarked 1080p, 720p, 480p video streams
     if len(tracks) > 1:
         for extra_track_name, _ in tracks[1:]:
             extra_audio = f"{work_dir}/{extra_track_name}_audio.m4a"
             for q_name in ("1080p", "720p", "480p"):
                 out_mp4 = f"{work_dir}/{extra_track_name}_{q_name}.mp4"
-                remux_extra_tag = ["-tag:v", "hvc1"] if (q_name == "1080p" and remux_1080p_direct and v_codec in ("hevc", "h265")) else []
                 subprocess.run([
                     "ffmpeg", "-hide_banner", "-y", "-v", "warning",
                     "-i", primary_files[q_name], "-i", extra_audio,
                     "-map", "0:v:0", "-map", "1:a:0",
                     "-c:v", "copy", "-c:a", "copy",
-                ] + remux_extra_tag + [
                     "-metadata", "title=AniLight",
+                    "-metadata", "comment=AniLight",
                     "-avoid_negative_ts", "make_zero",
                     "-movflags", "+faststart",
                     out_mp4
                 ], check=True)
 
-    # Identical ID generation ({uuid1}/{uuid2}/{quality}.mp4) & SHA-256 hashing
+    # Verify all 3 qualities exist and build SHA-256 + HF upload manifest
     job_records = []
     job_add_items = []
     for t_name, _ in tracks:
@@ -1302,6 +1273,8 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
         f2 = uuid.uuid4().hex
         for q_name in ("1080p", "720p", "480p"):
             mp4_path = f"{work_dir}/{t_name}_{q_name}.mp4"
+            if not os.path.exists(mp4_path) or os.path.getsize(mp4_path) < 10240:
+                raise RuntimeError(f"Encoded output missing or empty for Job {job_id} ({t_name} {q_name})")
             h = hashlib.sha256()
             with open(mp4_path, "rb") as f:
                 while chunk := f.read(1024 * 1024):
@@ -1320,6 +1293,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
                 "metadata": {
                     "container": "mp4",
                     "size": os.path.getsize(mp4_path),
+                    "watermarked": True,
                 },
                 "huggingface": {
                     "owner": hf["owner"],
@@ -1331,7 +1305,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
             job_records.append(rec)
             job_add_items.append((mp4_path, remote_path))
 
-    print(f"[Job {job_id}] Completed (1080p remux={remux_1080p_direct} + 720p/480p NVENC) in {time.time() - t_ep_start:.1f}s! Queued for async HF upload.", flush=True)
+    print(f"[Job {job_id}] Encoded all 3 watermarked qualities (1080p, 720p, 480p) in {time.time() - t_ep_start:.1f}s! Queuing HF upload.", flush=True)
 
     upload_queue.put({
         "job_id": job_id,
@@ -1341,7 +1315,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
         "add_items": job_add_items,
     })
 
-# Execute across GPU workers
+# 7. Execute across Dual-T4 GPU workers
 if len(manifest) == 1:
     try:
         transcode_episode_on_gpu(manifest[0], 0, allow_intra_split=True)
@@ -1380,7 +1354,7 @@ else:
         for fut in futs:
             fut.result()
 
-# Signal background HF uploader thread to finish remaining uploads and wait cleanly
+# 8. Wait for HF background uploader thread to finish and write final result.json
 upload_queue.put(None)
 uploader_thread.join()
 shutil.rmtree(BASE_WORK_DIR, ignore_errors=True)
@@ -1402,7 +1376,8 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
   }
 
   /**
-   * Pushes a strictly GPU-enabled Kaggle batch notebook (no CPU fallback).
+   * Pushes a strictly GPU-enabled Kaggle batch notebook.
+   * Automatically handles dataset IAM propagation delays if Kaggle reports dataset not yet visible.
    */
   public async pushBatchGpuKernel(
     datasetSlug: string,
@@ -1414,14 +1389,15 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
     const acceleratorShape = "NvidiaTeslaT4";
     const kernelCode = this.generateBatchGpuKernelScript(manifestItems);
 
-    console.log(
-      `[Kaggle:Kernel] Pushing GPU-ONLY batch kernel '${username}/${kernelSlug}' (${manifestItems.length} episode(s), Shape: '${acceleratorShape}')...`,
+    log.info(
+      "Kaggle:Kernel",
+      `Pushing GPU-ONLY batch kernel '${username}/${kernelSlug}' (${manifestItems.length} episode(s), Shape: '${acceleratorShape}', Dataset: '${username}/${datasetSlug}')...`,
     );
 
     let pushed = false;
     let lastErr: any = null;
 
-    for (let pushAttempt = 1; pushAttempt <= 4; pushAttempt++) {
+    for (let pushAttempt = 1; pushAttempt <= 6; pushAttempt++) {
       try {
         const pushRes = await this.makeKaggleRequest(
           "https://www.kaggle.com/api/v1/kernels/push",
@@ -1452,22 +1428,28 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
           throw new Error(`REST kernels/push error: ${pushRes.error}`);
         }
         pushed = true;
+        log.success("Kaggle:Kernel", `Kernel '${username}/${kernelSlug}' pushed and queued on Kaggle GPU!`);
         break;
       } catch (err: any) {
         lastErr = err;
-        console.warn(
-          `[Kaggle:Kernel] Push attempt ${pushAttempt} failed:`,
-          err?.message || err,
+        const errMsg = String(err?.message || err);
+        log.warn(
+          "Kaggle:Kernel",
+          `Push attempt ${pushAttempt}/6 failed: ${errMsg}`,
         );
-        if (pushAttempt < 4) {
-          await new Promise((r) => setTimeout(r, 6000 * pushAttempt));
+        if (pushAttempt < 6) {
+          // If dataset was still propagating on Kaggle IAM, wait for it before next push attempt
+          if (errMsg.toLowerCase().includes("dataset") || errMsg.includes("404") || errMsg.includes("400")) {
+            await this.waitForDatasetReady(datasetSlug, username, key, 120).catch(() => {});
+          }
+          await new Promise((r) => setTimeout(r, 8000 * pushAttempt));
         }
       }
     }
 
     if (!pushed) {
       throw new Error(
-        `Failed to push Kaggle GPU kernel '${username}/${kernelSlug}' after 4 attempts: ${lastErr?.message || lastErr}`,
+        `Failed to push Kaggle GPU kernel '${username}/${kernelSlug}' after 6 attempts: ${lastErr?.message || lastErr}`,
       );
     }
   }
@@ -1482,6 +1464,7 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
   ): Promise<{
     state: "running" | "completed" | "failed" | "not_found";
     rawStatus: string;
+    failureMessage?: string;
   }> {
     try {
       const statusUrl = `https://www.kaggle.com/api/v1/kernels/status?userName=${encodeURIComponent(username)}&kernelSlug=${encodeURIComponent(kernelSlug)}`;
@@ -1490,6 +1473,7 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
         quietCodes: [403, 404],
       });
       const cleanStatus = this.extractCleanStatus(sData);
+      const failureMsg = sData?.failureMessage || sData?.failure_message || undefined;
 
       if (
         ["complete", "completed", "success", "finished"].includes(cleanStatus)
@@ -1501,7 +1485,7 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
           cleanStatus,
         )
       ) {
-        return { state: "failed", rawStatus: cleanStatus };
+        return { state: "failed", rawStatus: cleanStatus, failureMessage: failureMsg };
       }
       return { state: "running", rawStatus: cleanStatus || "running" };
     } catch (err: any) {
@@ -1511,6 +1495,29 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
       }
       return { state: "running", rawStatus: "polling_transient_err" };
     }
+  }
+
+  /**
+   * Retrieves the tail of the Kaggle kernel log when a kernel fails so the exact Python/FFmpeg error is surfaced.
+   */
+  public async fetchKernelErrorSnippet(
+    kernelSlug: string,
+    username: string,
+    key: string,
+  ): Promise<string> {
+    try {
+      const outData = await this.makeKaggleRequest(
+        `https://www.kaggle.com/api/v1/kernels/output?userName=${encodeURIComponent(username)}&kernelSlug=${encodeURIComponent(kernelSlug)}`,
+        username,
+        key,
+        { method: "GET", quietCodes: [403, 404] },
+      );
+      if (outData?.log && typeof outData.log === "string") {
+        const lines = outData.log.trim().splitlines ? outData.log.trim().split("\n") : outData.log.trim().split(/\r?\n/);
+        return lines.slice(-15).join(" | ").slice(-600);
+      }
+    } catch {}
+    return "";
   }
 
   private normalizeKernelOutput(parsed: any): KiraBatchKernelOutput | null {
@@ -1587,8 +1594,8 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
       }
 
       if (outData?.log) {
-        const log = outData.log as string;
-        const match = log.match(/__TASK_RESULT__=(.*)/);
+        const logStr = outData.log as string;
+        const match = logStr.match(/__TASK_RESULT__=(.*)/);
         if (match) {
           try {
             const parsed = JSON.parse(match[1]);
@@ -1600,146 +1607,14 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
         }
       }
     } catch (e: any) {
-      console.warn(
-        `[Kaggle:Output] Could not fetch kernel output for '${kernelSlug}':`,
-        e?.message || e,
+      log.warn(
+        "Kaggle:Output",
+        `Could not fetch kernel output for '${kernelSlug}': ${e?.message || e}`,
       );
     }
 
     throw new Error(
       `Kaggle kernel '${kernelSlug}' completed but output result.json was not found`,
-    );
-  }
-
-  /**
-   * Single-episode GPU-only encode helper (retained for direct orchestrator usage; strictly GPU-only, zero CPU fallback).
-   */
-  public async encodeAndUpload(
-    localVideoFile: string,
-    animeId: number,
-    epNum: number,
-    langType: string,
-    _tempDir: string,
-    options: {
-      onCleanupFn?: () => void;
-    } = {},
-  ): Promise<HfStoreRecord[]> {
-    const probe = await inspectMkvStreamsSync(localVideoFile);
-    const tracks = this.determineTracksToEncode(probe, langType);
-    const hfAccount = this.getNextHfAccount();
-
-    if (this.kaggleAccounts.length === 0) {
-      throw new Error(
-        "No Kaggle accounts configured in KAGGLE_ACCOUNTS / KAGGLE_USERNAME",
-      );
-    }
-
-    let lastError: any = null;
-    const ext = path.extname(localVideoFile) || ".mkv";
-    const remoteFilename = `job_1${ext}`;
-    const stats = await fs.promises.stat(localVideoFile);
-
-    for (let attempt = 0; attempt < this.kaggleAccounts.length; attempt++) {
-      const kAcc =
-        this.kaggleAccounts[
-          (this.currentKaggleIdx + attempt) % this.kaggleAccounts.length
-        ];
-      if (!kAcc) continue;
-
-      const runId = crypto.randomUUID().slice(0, 8);
-      const datasetSlug = `anilight-${animeId}-ep${epNum}-${runId}`
-        .toLowerCase()
-        .replace(/[^a-z0-9-]/g, "-");
-      const kernelSlug = `enc-${animeId}-ep${epNum}-${runId}`
-        .toLowerCase()
-        .replace(/[^a-z0-9-]/g, "-");
-
-      try {
-        console.log(
-          `[Kaggle:GPUOnly] Launching GPU encode on '${kAcc.username}' (Anime ${animeId} Ep ${epNum})...`,
-        );
-
-        await this.uploadBatchDatasetRest(
-          [
-            {
-              jobId: 1,
-              localFilePath: localVideoFile,
-              remoteFilename,
-              sizeBytes: stats.size,
-            },
-          ],
-          datasetSlug,
-          kAcc.username,
-          kAcc.key,
-        );
-        await this.waitForDatasetReady(datasetSlug, kAcc.username, kAcc.key);
-
-        if (this.eagerVmDelete && options.onCleanupFn) {
-          options.onCleanupFn();
-        }
-
-        await this.pushBatchGpuKernel(
-          datasetSlug,
-          kernelSlug,
-          [
-            {
-              jobId: 1,
-              filename: remoteFilename,
-              animeId,
-              episodeNumber: epNum,
-              tracks,
-              hf: hfAccount,
-            },
-          ],
-          kAcc.username,
-          kAcc.key,
-        );
-
-        const startTime = Date.now();
-        while ((Date.now() - startTime) / 1000 < 3600) {
-          await new Promise((r) => setTimeout(r, 60000));
-          const st = await this.checkKernelStatusOnce(
-            kernelSlug,
-            kAcc.username,
-            kAcc.key,
-          );
-          if (st.state === "completed") break;
-          if (st.state === "failed" || st.state === "not_found") {
-            throw new Error(
-              `Kaggle GPU kernel '${kernelSlug}' failed with status: ${st.rawStatus}`,
-            );
-          }
-        }
-
-        const out = await this.fetchBatchKernelOutput(
-          kernelSlug,
-          kAcc.username,
-          kAcc.key,
-        );
-        await this.deleteKaggleKernel(kernelSlug, kAcc.username, kAcc.key);
-        await this.deleteKaggleDataset(datasetSlug, kAcc.username, kAcc.key);
-        this.currentKaggleIdx =
-          (this.currentKaggleIdx + attempt + 1) % this.kaggleAccounts.length;
-        return out.records;
-      } catch (err: any) {
-        lastError = err;
-        console.warn(
-          `[Kaggle:GPUAccountFail] GPU encode failed on '${kAcc.username}' (CPU fallback disabled, trying next GPU account if any):`,
-          err?.message || err,
-        );
-        await this.deleteKaggleKernel(kernelSlug, kAcc.username, kAcc.key).catch(
-          () => {},
-        );
-        await this.deleteKaggleDataset(
-          datasetSlug,
-          kAcc.username,
-          kAcc.key,
-        ).catch(() => {});
-      }
-    }
-
-    throw new Error(
-      `All Kaggle GPU accounts failed to encode Anime ${animeId} Ep ${epNum} (CPU fallback is disabled): ${lastError?.message || lastError}`,
     );
   }
 }

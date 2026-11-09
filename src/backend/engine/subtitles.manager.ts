@@ -5,6 +5,7 @@ import { promisify } from "util";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import type {
   R2SubtitleRecord,
+  PipelineSubtitleTrack,
 } from "./types.js";
 import {
   CAPTIONS_R2_ACCOUNT_ID,
@@ -338,6 +339,9 @@ export class SubtitleManager {
 
     for (const sub of subtitles) {
       const key = `captions/${animeId}/${epNum}/${effectiveBucketType}/${sub.language}.vtt`;
+      const publicUrl = DEFAULT_SUBTITLE_PUBLIC_BASE
+        ? `${DEFAULT_SUBTITLE_PUBLIC_BASE}/${key}`
+        : key;
       try {
         const fileBuffer = await fs.promises.readFile(sub.filePath);
         await this.s3Client.send(
@@ -355,6 +359,11 @@ export class SubtitleManager {
           type: effectiveBucketType,
           language: sub.language,
           path: key,
+          role: sub.role,
+          label: sub.label,
+          url: publicUrl,
+          default_sub: sub.isDefaultSub,
+          default_dub: sub.isDefaultDub,
         });
 
         log.success("Subtitles", `Subtitle uploaded to R2: ${key} (${sub.label})`);
@@ -366,21 +375,21 @@ export class SubtitleManager {
     return uploadedRecords;
   }
 
-  public static buildTracksPayloadForStream(
+  public static formatForCallback(
     r2SubRecords: R2SubtitleRecord[],
-    streamType: string,
-  ) {
-    return r2SubRecords.map((r: any) => {
-      const isDef = streamType === "dub" ? r.default_dub : r.default_sub;
+    streamType: "sub" | "dub",
+  ): PipelineSubtitleTrack[] {
+    return (r2SubRecords || []).map((r) => {
+      const isDefault = Boolean(streamType === "dub" ? r.default_dub : r.default_sub);
+      const url = r.url || (DEFAULT_SUBTITLE_PUBLIC_BASE ? `${DEFAULT_SUBTITLE_PUBLIC_BASE}/${r.path}` : r.path);
       return {
-        id: r.path,
-        url: r.url || `${DEFAULT_SUBTITLE_PUBLIC_BASE}/${r.path}`,
-        lang: r.language,
+        language: r.language,
         label: r.label || r.language.toUpperCase(),
-        kind: "captions",
-        default: Boolean(isDef),
+        role: (r.role as "dialogue" | "signs" | "sdh") || "dialogue",
+        path: r.path,
+        url,
+        isDefault,
       };
     });
   }
 }
-
