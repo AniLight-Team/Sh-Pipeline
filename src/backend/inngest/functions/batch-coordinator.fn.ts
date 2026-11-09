@@ -2,6 +2,7 @@ import { inngest } from "../client.js";
 import { PipelineEngineService } from "../../engine/service.js";
 import {
   KIRA_BATCH_SAFE_MAX_BYTES,
+  KIRA_BATCH_MAX_ITEMS,
   KIRA_BATCH_WINDOW_MS,
 } from "../../config.js";
 
@@ -29,7 +30,7 @@ export const batchCoordinatorFn = inngest.createFunction(
           return { shouldWait: false, waitSeconds: 0 };
         }
 
-        if (stats.totalBytes >= KIRA_BATCH_SAFE_MAX_BYTES) {
+        if (stats.totalBytes >= KIRA_BATCH_SAFE_MAX_BYTES || stats.stagedCount >= KIRA_BATCH_MAX_ITEMS) {
           return { shouldWait: false, waitSeconds: 0 };
         }
 
@@ -53,22 +54,22 @@ export const batchCoordinatorFn = inngest.createFunction(
       }
     }
 
-    const sealResult = await step.run("seal-batch", async () => {
-      return await PipelineEngineService.sealStagedBatch({
+    const sealedBatchIds = await step.run("seal-available-batches", async () => {
+      return await PipelineEngineService.sealAvailableBatches({
         forceFlush: isForceFlush,
         triggerReason: isForceFlush ? "manual" : "window_30m",
       });
     });
 
-    if (sealResult.batchId) {
-      await step.sendEvent("dispatch-batch-execute", {
+    for (const bId of sealedBatchIds) {
+      await step.sendEvent(`dispatch-batch-${bId}`, {
         name: "pipeline/batch.execute",
-        id: `pipeline-batch-${sealResult.batchId}`,
-        data: { batchId: sealResult.batchId },
+        id: `pipeline-batch-${bId}`,
+        data: { batchId: bId },
       });
     }
 
-    return sealResult;
+    return { sealedBatchIds, count: sealedBatchIds.length };
   },
 );
 

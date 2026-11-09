@@ -55,12 +55,22 @@ export const KIRA_BATCH_WINDOW_MS = KIRA_BATCH_WINDOW_MIN * 60 * 1000;
 export const KIRA_BATCH_MAX_GB = Math.max(1, parseInt(process.env.KIRA_BATCH_MAX_GB || "10", 10));
 export const KIRA_BATCH_MAX_BYTES = Math.floor(KIRA_BATCH_MAX_GB * 1_000_000_000);
 export const KIRA_BATCH_SAFE_MAX_BYTES = Math.min(98_000_000_000, KIRA_BATCH_MAX_BYTES);
+export const KIRA_BATCH_MAX_ITEMS = Math.max(1, parseInt(process.env.KIRA_BATCH_MAX_ITEMS || "10", 10)); // Maximum 10 files per batch
 export const KIRA_MAX_STAGING_GB = Math.max(KIRA_BATCH_MAX_GB, parseInt(process.env.KIRA_MAX_STAGING_GB || "60", 10));
 export const KIRA_MAX_STAGING_BYTES = Math.floor(KIRA_MAX_STAGING_GB * 1_000_000_000);
 export const KIRA_MIN_FREE_SSD_BYTES = Math.floor(Math.max(5, parseInt(process.env.KIRA_MIN_FREE_SSD_GB || "12", 10)) * 1_000_000_000);
 export const KIRA_PER_DOWNLOAD_RESERVE_BYTES = 1_400_000_000; // 1.4 GB reserve per parallel download
-export const KIRA_MAX_CONCURRENT_BATCHES = 1; // Strictly 1 active batch
-export const KIRA_MAX_TOTAL_BATCHES = 1; // Strictly 1 batch exists across the system
+export const KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT = 2; // Kaggle allows 2 concurrent sessions per account
+
+export function getMaxConcurrentBatches(): number {
+  const { kaggleAccounts } = loadAccountsFromEnv();
+  // Total concurrent tasks limit = total number of kaggle accounts * 2
+  return Math.max(1, kaggleAccounts.length * KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT);
+}
+
+// Backward-compatible alias
+export const KIRA_MAX_CONCURRENT_BATCHES = getMaxConcurrentBatches();
+export const KIRA_MAX_TOTAL_BATCHES = getMaxConcurrentBatches();
 
 let cachedStagingDir: string | null = null;
 

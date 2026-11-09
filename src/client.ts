@@ -3,6 +3,7 @@ import type {
   EnqueueResponse,
   PipelineStats,
   PipelineEpisodeResult,
+  AnimeResolvedMetadata,
 } from "./backend/engine/types.js";
 
 export class KiraPipelineClient {
@@ -51,18 +52,24 @@ export class KiraPipelineClient {
     });
   }
 
+  public async resolveMetadata(anilistId: number): Promise<{ ok: boolean; metadata: AnimeResolvedMetadata }> {
+    return await this.request<{ ok: boolean; metadata: AnimeResolvedMetadata }>(
+      `/api/anime/resolve?anilistId=${anilistId}`,
+    );
+  }
+
   public async getStats(): Promise<PipelineStats> {
     return await this.request<PipelineStats>("/api/stats");
   }
 
-  public async forceFlush(): Promise<{ batchId: number | null }> {
-    return await this.request<{ batchId: number | null }>("/api/batches/flush", {
+  public async forceFlush(): Promise<{ ok: boolean; message: string }> {
+    return await this.request<{ ok: boolean; message: string }>("/api/batches/flush", {
       method: "POST",
     });
   }
 
-  public async triggerRecovery(): Promise<{ ok: boolean }> {
-    return await this.request<{ ok: boolean }>("/api/system/recovery", {
+  public async triggerRecovery(): Promise<{ ok: boolean; message: string }> {
+    return await this.request<{ ok: boolean; message: string }>("/api/system/recovery", {
       method: "POST",
     });
   }
@@ -74,5 +81,6 @@ export type {
   EnqueueResponse,
   PipelineStats,
   PipelineEpisodeResult,
+  AnimeResolvedMetadata,
 };
 

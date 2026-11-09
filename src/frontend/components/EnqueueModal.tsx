@@ -1,5 +1,14 @@
-import React, { useState } from "react";
-import { X, Plus, AlertCircle } from "lucide-react";
+import React, { useState, useEffect } from "react";
+import {
+  X,
+  Plus,
+  AlertCircle,
+  Sparkles,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
+  Image,
+} from "lucide-react";
 
 interface EnqueueModalProps {
   isOpen: boolean;
@@ -7,28 +16,105 @@ interface EnqueueModalProps {
   onSuccess: () => void;
 }
 
+interface ResolvedPreview {
+  anilistId: number;
+  animeId?: number;
+  anidbId?: number;
+  primaryTitle: string;
+  titleEnglish?: string;
+  titleRomaji?: string;
+  totalEpisodes?: number;
+  coverImage?: string;
+  synonyms: string[];
+  source: string;
+}
+
 export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) {
-  const [anidbId, setAnidbId] = useState("");
-  const [episodes, setEpisodes] = useState("");
+  const [anilistInput, setAnilistInput] = useState("");
+  const [episodes, setEpisodes] = useState("1");
   const [isSub, setIsSub] = useState(true);
   const [isDub, setIsDub] = useState(false);
-  const [knownTitles, setKnownTitles] = useState("");
   const [loading, setLoading] = useState(false);
+  const [resolving, setResolving] = useState(false);
+  const [preview, setPreview] = useState<ResolvedPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Advanced fields
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [overrideAnidbId, setOverrideAnidbId] = useState("");
+  const [overrideAnimeId, setOverrideAnimeId] = useState("");
+  const [knownTitles, setKnownTitles] = useState("");
+  const [callbackUrl, setCallbackUrl] = useState("");
+
+  useEffect(() => {
+    if (!isOpen) {
+      setError(null);
+      setPreview(null);
+      setResolving(false);
+    }
+  }, [isOpen]);
+
   if (!isOpen) return null;
+
+  // Extract clean AniList ID if a full URL was pasted
+  const extractAnilistId = (raw: string): number | null => {
+    const trimmed = raw.trim();
+    const urlMatch = trimmed.match(/anilist\.co\/anime\/(\d+)/i);
+    if (urlMatch) return parseInt(urlMatch[1], 10);
+    const num = parseInt(trimmed, 10);
+    return !isNaN(num) && num > 0 ? num : null;
+  };
+
+  // Fetch anime metadata preview when user inputs AniList ID
+  const handleResolve = async (idNum: number) => {
+    setResolving(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/anime/resolve?anilistId=${idNum}`);
+      if (res.ok) {
+        const json = await res.json();
+        if (json.metadata) {
+          setPreview(json.metadata);
+          if (json.metadata.anidbId && !overrideAnidbId) {
+            setOverrideAnidbId(String(json.metadata.anidbId));
+          }
+          if (json.metadata.animeId && !overrideAnimeId) {
+            setOverrideAnimeId(String(json.metadata.animeId));
+          }
+          if (json.metadata.synonyms?.length > 0 && !knownTitles) {
+            setKnownTitles(json.metadata.synonyms.join(", "));
+          }
+        }
+      }
+    } catch {} finally {
+      setResolving(false);
+    }
+  };
+
+  const handleAnilistChange = (val: string) => {
+    setAnilistInput(val);
+    const parsed = extractAnilistId(val);
+    if (parsed) {
+      handleResolve(parsed);
+    } else {
+      setPreview(null);
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
 
-    const parsedAnidb = parseInt(anidbId.trim(), 10);
-    if (isNaN(parsedAnidb) || parsedAnidb <= 0) {
-      setError("Please provide a valid AniDB ID (number)");
+    const parsedAnilist = extractAnilistId(anilistInput);
+    const parsedAnidb = overrideAnidbId ? parseInt(overrideAnidbId.trim(), 10) : preview?.anidbId;
+    const parsedAnime = overrideAnimeId ? parseInt(overrideAnimeId.trim(), 10) : preview?.animeId;
+
+    if (!parsedAnilist && !parsedAnidb) {
+      setError("Please provide a valid AniList ID (or AniDB ID)");
       return;
     }
 
-    // Parse episodes list e.g. "1, 2, 3" or "1-4"
+    // Parse episode numbers (supports "1", "1-12", "1, 2, 3")
     const epNums: number[] = [];
     for (const part of episodes.split(",")) {
       const trimmed = part.trim();
@@ -44,7 +130,7 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
     }
 
     if (epNums.length === 0) {
-      setError("Please specify at least one episode number (e.g. 1 or 1-4)");
+      setError("Please specify at least one episode number (e.g. 1 or 1-12)");
       return;
     }
 
@@ -52,26 +138,31 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
     if (isSub) types.push("sub");
     if (isDub) types.push("dub");
     if (types.length === 0) {
-      setError("Please select at least Sub or Dub");
+      setError("Please select at least one release audio type (Sub or Dub)");
       return;
     }
 
     setLoading(true);
     try {
+      const payload: any = {
+        anilistId: parsedAnilist || undefined,
+        anidbId: parsedAnidb || undefined,
+        animeId: parsedAnime || undefined,
+        episodeNumbers: epNums,
+        types,
+        knownTitles: knownTitles.split(",").map((t) => t.trim()).filter(Boolean),
+        callbackUrl: callbackUrl.trim() || undefined,
+      };
+
       const res = await fetch("/api/pipeline/enqueue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          anidbId: parsedAnidb,
-          episodeNumbers: epNums,
-          types,
-          knownTitles: knownTitles.split(",").map((t) => t.trim()).filter(Boolean),
-        }),
+        body: JSON.stringify(payload),
       });
 
       if (!res.ok) {
         const err = await res.json();
-        throw new Error(err.error || "Failed to enqueue");
+        throw new Error(err.error || "Failed to enqueue jobs");
       }
 
       onSuccess();
@@ -84,101 +175,290 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
-      <div className="bg-zinc-900 border border-zinc-800 rounded-xl max-w-md w-full p-6 shadow-2xl relative">
+    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+      <div className="bg-[#161724] border border-white/[0.1] rounded-3xl max-w-lg w-full p-6 shadow-2xl relative max-h-[92vh] overflow-y-auto">
+        {/* AniLight Liquid Glass Close Button */}
         <button
           onClick={onClose}
-          className="absolute right-4 top-4 text-zinc-400 hover:text-white transition"
+          className="button-liquid-glass absolute right-4 top-4 text-neutral-400 hover:text-white transition-colors w-8 h-8 rounded-full flex items-center justify-center cursor-pointer"
         >
-          <X className="w-5 h-5" />
+          <X className="w-4 h-4" />
         </button>
 
-        <h3 className="text-base font-bold text-white mb-1">Enqueue AniDB Episode(s)</h3>
-        <p className="text-xs text-zinc-400 mb-4">
-          Manually dispatch episode downloads, MKV staging, and Kaggle GPU batch encoding.
-        </p>
+        <div className="mb-5">
+          <div className="flex items-center gap-2.5">
+            <h3 className="text-base font-bold text-white tracking-tight">
+              Enqueue Anime Episode(s)
+            </h3>
+            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold bg-white/[0.08] text-white border border-white/10">
+              AniList Trigger
+            </span>
+          </div>
+          <p className="text-xs text-neutral-400 mt-1">
+            Trigger automated torrent discovery, audio extraction, and Kaggle GPU batch encoding.
+          </p>
+        </div>
 
         {error && (
-          <div className="mb-4 p-2.5 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-center gap-2">
+          <div className="mb-4 p-3 rounded-2xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-center gap-2">
             <AlertCircle className="w-4 h-4 shrink-0" />
             <span>{error}</span>
           </div>
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4 text-xs">
+          {/* Hero Input: AniList ID */}
           <div>
-            <label className="block text-zinc-300 font-semibold mb-1">AniDB ID</label>
-            <input
-              type="number"
-              placeholder="e.g. 18456"
-              value={anidbId}
-              onChange={(e) => setAnidbId(e.target.value)}
-              className="w-full px-3 py-2 rounded-lg bg-zinc-950 border border-zinc-800 text-white placeholder-zinc-500 focus:outline-none focus:border-indigo-500 font-mono"
-              required
-            />
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-neutral-200 font-semibold flex items-center gap-1.5">
+                AniList ID or URL <span className="text-white">*</span>
+              </label>
+              {preview?.anilistId && (
+                <a
+                  href={`https://anilist.co/anime/${preview.anilistId}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[11px] font-mono text-neutral-300 hover:text-white hover:underline inline-flex items-center gap-1"
+                >
+                  View on AniList <ExternalLink className="w-2.5 h-2.5" />
+                </a>
+              )}
+            </div>
+            <div className="relative">
+              <input
+                type="text"
+                placeholder="e.g. 16498 or https://anilist.co/anime/16498"
+                value={anilistInput}
+                onChange={(e) => handleAnilistChange(e.target.value)}
+                className="w-full px-3.5 py-2.5 rounded-2xl bg-[#10111a] border border-white/[0.1] text-white placeholder-neutral-500 focus:outline-none focus:border-white/40 focus:ring-1 focus:ring-white/20 font-mono transition-all text-sm"
+                required
+              />
+              {resolving && (
+                <div className="absolute right-3.5 top-3 text-neutral-400 flex items-center gap-1 text-[11px] animate-pulse">
+                  <Sparkles className="w-3.5 h-3.5 text-white animate-spin" />
+                  Resolving...
+                </div>
+              )}
+            </div>
           </div>
 
+          {/* Metadata Preview Card */}
+          {preview && (
+            <div className="p-3.5 rounded-2xl bg-[#10111a] border border-white/[0.08] flex items-center gap-3.5">
+              {preview.coverImage ? (
+                <img
+                  src={preview.coverImage}
+                  alt={preview.primaryTitle}
+                  className="w-12 h-16 object-cover rounded-xl shrink-0 border border-white/[0.08]"
+                />
+              ) : (
+                <div className="w-12 h-16 rounded-xl bg-neutral-800 flex items-center justify-center shrink-0">
+                  <Image className="w-5 h-5 text-neutral-500" />
+                </div>
+              )}
+              <div className="flex-1 min-w-0">
+                <h4 className="text-xs font-bold text-white truncate">
+                  {preview.primaryTitle}
+                </h4>
+                <div className="flex flex-wrap items-center gap-1.5 mt-1.5 text-[10px] font-mono">
+                  {preview.anidbId && (
+                    <span className="px-2 py-0.5 rounded-full bg-white/[0.05] text-neutral-300 border border-white/[0.06]">
+                      AniDB #{preview.anidbId}
+                    </span>
+                  )}
+                  {preview.animeId && (
+                    <span className="px-2 py-0.5 rounded-full bg-white/[0.05] text-neutral-300 border border-white/[0.06]">
+                      AnimeId #{preview.animeId}
+                    </span>
+                  )}
+                  {preview.totalEpisodes && (
+                    <span className="px-2 py-0.5 rounded-full bg-white/[0.08] text-white border border-white/10">
+                      {preview.totalEpisodes} Episodes Total
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Episode Range with Quick Presets */}
           <div>
-            <label className="block text-zinc-300 font-semibold mb-1">Episode(s)</label>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-neutral-200 font-semibold">
+                Episodes to Encode <span className="text-white">*</span>
+              </label>
+              {/* Presets */}
+              <div className="flex items-center gap-1.5 text-[11px] font-mono">
+                <button
+                  type="button"
+                  onClick={() => setEpisodes("1")}
+                  className="px-2.5 py-0.5 rounded-full bg-white/[0.06] text-neutral-300 hover:text-white hover:bg-white/[0.12] border border-white/[0.08] transition-colors"
+                >
+                  Ep 1
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setEpisodes("1-12")}
+                  className="px-2.5 py-0.5 rounded-full bg-white/[0.06] text-neutral-300 hover:text-white hover:bg-white/[0.12] border border-white/[0.08] transition-colors"
+                >
+                  1-12
+                </button>
+                {preview?.totalEpisodes && (
+                  <button
+                    type="button"
+                    onClick={() => setEpisodes(`1-${preview.totalEpisodes}`)}
+                    className="px-2.5 py-0.5 rounded-full bg-white/[0.1] text-white hover:bg-white/[0.18] border border-white/15 transition-colors font-bold"
+                  >
+                    All ({preview.totalEpisodes})
+                  </button>
+                )}
+              </div>
+            </div>
             <input
               type="text"
-              placeholder="e.g. 1 or 1-4 or 1, 2, 3"
+              placeholder="e.g. 1 or 1-12 or 1, 2, 3"
               value={episodes}
               onChange={(e) => setEpisodes(e.target.value)}
-              className="w-full px-3 py-2 rounded-lg bg-zinc-950 border border-zinc-800 text-white placeholder-zinc-500 focus:outline-none focus:border-indigo-500 font-mono"
+              className="w-full px-3.5 py-2.5 rounded-2xl bg-[#10111a] border border-white/[0.1] text-white placeholder-neutral-500 focus:outline-none focus:border-white/40 focus:ring-1 focus:ring-white/20 font-mono transition-all"
               required
             />
           </div>
 
+          {/* Audio Types */}
           <div>
-            <label className="block text-zinc-300 font-semibold mb-1">Release Types</label>
-            <div className="flex items-center gap-4 mt-1">
-              <label className="flex items-center gap-2 text-zinc-300 cursor-pointer">
+            <label className="block text-neutral-200 font-semibold mb-1.5">
+              Audio / Release Formats
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <label
+                className={`flex items-center gap-2.5 p-3 rounded-2xl border cursor-pointer transition-all ${
+                  isSub
+                    ? "bg-white/[0.08] border-white/20 text-white"
+                    : "bg-[#10111a] border-white/[0.06] text-neutral-400 hover:text-neutral-200"
+                }`}
+              >
                 <input
                   type="checkbox"
                   checked={isSub}
                   onChange={(e) => setIsSub(e.target.checked)}
-                  className="rounded border-zinc-700 text-indigo-600 focus:ring-0"
+                  className="rounded border-neutral-700 text-white focus:ring-0"
                 />
-                <span>Sub (Japanese + Subs)</span>
+                <div>
+                  <div className="font-semibold text-xs">Sub (Japanese)</div>
+                  <div className="text-[10px] text-neutral-500">Includes English subtitles</div>
+                </div>
               </label>
-              <label className="flex items-center gap-2 text-zinc-300 cursor-pointer">
+
+              <label
+                className={`flex items-center gap-2.5 p-3 rounded-2xl border cursor-pointer transition-all ${
+                  isDub
+                    ? "bg-white/[0.08] border-white/20 text-white"
+                    : "bg-[#10111a] border-white/[0.06] text-neutral-400 hover:text-neutral-200"
+                }`}
+              >
                 <input
                   type="checkbox"
                   checked={isDub}
                   onChange={(e) => setIsDub(e.target.checked)}
-                  className="rounded border-zinc-700 text-indigo-600 focus:ring-0"
+                  className="rounded border-neutral-700 text-white focus:ring-0"
                 />
-                <span>Dub (Dual Audio / Dub)</span>
+                <div>
+                  <div className="font-semibold text-xs">Dub (Dual Audio)</div>
+                  <div className="text-[10px] text-neutral-500">English audio track</div>
+                </div>
               </label>
             </div>
           </div>
 
-          <div>
-            <label className="block text-zinc-300 font-semibold mb-1">Known Titles (Optional)</label>
-            <input
-              type="text"
-              placeholder="e.g. Bleach, Sennen Kessen-hen (comma-separated)"
-              value={knownTitles}
-              onChange={(e) => setKnownTitles(e.target.value)}
-              className="w-full px-3 py-2 rounded-lg bg-zinc-950 border border-zinc-800 text-white placeholder-zinc-500 focus:outline-none focus:border-indigo-500"
-            />
+          {/* Advanced Accordion Toggle */}
+          <div className="pt-1">
+            <button
+              type="button"
+              onClick={() => setShowAdvanced(!showAdvanced)}
+              className="flex items-center gap-1.5 text-neutral-400 hover:text-white text-xs font-medium cursor-pointer"
+            >
+              {showAdvanced ? (
+                <ChevronUp className="w-3.5 h-3.5" />
+              ) : (
+                <ChevronDown className="w-3.5 h-3.5" />
+              )}
+              <span>{showAdvanced ? "Hide Advanced Settings" : "Show Advanced Options"}</span>
+            </button>
           </div>
 
-          <div className="pt-2 flex items-center justify-end gap-2">
+          {showAdvanced && (
+            <div className="space-y-3 pt-2 border-t border-white/[0.06]">
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-neutral-400 text-[11px] mb-1">
+                    AniDB ID (Internal Override)
+                  </label>
+                  <input
+                    type="number"
+                    placeholder="e.g. 18131"
+                    value={overrideAnidbId}
+                    onChange={(e) => setOverrideAnidbId(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl bg-[#10111a] border border-white/[0.08] text-white font-mono text-xs focus:border-white/30"
+                  />
+                </div>
+                <div>
+                  <label className="block text-neutral-400 text-[11px] mb-1">
+                    Main Anime ID (Optional)
+                  </label>
+                  <input
+                    type="number"
+                    placeholder="e.g. 502"
+                    value={overrideAnimeId}
+                    onChange={(e) => setOverrideAnimeId(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl bg-[#10111a] border border-white/[0.08] text-white font-mono text-xs focus:border-white/30"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-neutral-400 text-[11px] mb-1">
+                  Known Search Titles (Comma-separated)
+                </label>
+                <input
+                  type="text"
+                  placeholder="e.g. Bleach: Thousand-Year Blood War, Sennen Kessen-hen"
+                  value={knownTitles}
+                  onChange={(e) => setKnownTitles(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-[#10111a] border border-white/[0.08] text-white text-xs focus:border-white/30"
+                />
+              </div>
+
+              <div>
+                <label className="block text-neutral-400 text-[11px] mb-1">
+                  Webhook Callback URL
+                </label>
+                <input
+                  type="url"
+                  placeholder="http://127.0.0.1:4000/internal/pipeline/completed"
+                  value={callbackUrl}
+                  onChange={(e) => setCallbackUrl(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-[#10111a] border border-white/[0.08] text-white font-mono text-xs focus:border-white/30"
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Action Buttons */}
+          <div className="pt-3 border-t border-white/[0.08] flex items-center justify-end gap-2.5">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2 rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 transition"
+              className="button-liquid-glass px-4 py-2 rounded-full text-neutral-300 hover:text-white transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
               type="submit"
               disabled={loading}
-              className="px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-500 font-semibold shadow-md shadow-indigo-600/30 transition flex items-center gap-1.5"
+              className="button-glow px-6 py-2.5 rounded-full font-bold shadow-md transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
             >
-              {loading ? "Enqueuing..." : "Enqueue Jobs"}
+              <Plus className="w-4 h-4 text-neutral-950" />
+              <span>{loading ? "Enqueuing..." : "Enqueue Jobs"}</span>
             </button>
           </div>
         </form>
@@ -186,4 +466,3 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
     </div>
   );
 }
-

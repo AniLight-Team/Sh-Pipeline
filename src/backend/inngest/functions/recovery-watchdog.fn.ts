@@ -36,9 +36,19 @@ export const recoveryWatchdogFn = inngest.createFunction(
       // Check if staged batch is ready to seal
       const windowStats = await PipelineEngineService.getStagedWindowStats();
 
+      let sealedCount = 0;
+      if (windowStats.stagedCount > 0) {
+        const sealed = await PipelineEngineService.sealAvailableBatches({
+          forceFlush: false,
+          triggerReason: "watchdog_drain",
+        });
+        sealedCount = sealed.length;
+      }
+
       return {
         hungBatchCount: hungBatches.length,
         stagedCount: windowStats.stagedCount,
+        sealedBatchesCount: sealedCount,
       };
     });
 

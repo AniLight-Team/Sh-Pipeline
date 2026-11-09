@@ -1,5 +1,6 @@
 import { inngest } from "../client.js";
 import { PipelineEngineService } from "../../engine/service.js";
+import { getMaxConcurrentBatches } from "../../config.js";
 
 export const batchExecuteFn = inngest.createFunction(
   {
@@ -7,7 +8,8 @@ export const batchExecuteFn = inngest.createFunction(
     name: "Pipeline Stage 3: Kaggle GPU Batch Executor",
     idempotency: "event.data.batchId",
     concurrency: {
-      limit: 1,
+      // Dynamic concurrency limit = total number of kaggle accounts * 2
+      limit: Math.max(2, getMaxConcurrentBatches()),
     },
     retries: 2,
     triggers: [{ event: "pipeline/batch.execute" }],
@@ -19,23 +21,23 @@ export const batchExecuteFn = inngest.createFunction(
       await PipelineEngineService.executeBatch(batchId);
     });
 
-    // Check if next batch can be sealed
-    const nextBatch = await step.run("check-next-batch-slot", async () => {
-      return await PipelineEngineService.sealStagedBatch({
+    // Check if next available batch(es) can be sealed and dispatched to newly freed slot(s)
+    const nextBatches = await step.run("check-next-batch-slots", async () => {
+      return await PipelineEngineService.sealAvailableBatches({
         forceFlush: false,
         triggerReason: "drain",
       });
     });
 
-    if (nextBatch.batchId) {
-      await step.sendEvent("dispatch-next-batch", {
+    for (const nextId of nextBatches) {
+      await step.sendEvent(`dispatch-next-batch-${nextId}`, {
         name: "pipeline/batch.execute",
-        id: `pipeline-batch-${nextBatch.batchId}`,
-        data: { batchId: nextBatch.batchId },
+        id: `pipeline-batch-${nextId}`,
+        data: { batchId: nextId },
       });
     }
 
-    return { status: "completed", batchId };
+    return { status: "completed", batchId, triggeredNextCount: nextBatches.length };
   },
 );
 

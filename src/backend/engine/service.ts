@@ -8,20 +8,25 @@ import { SubtitleManager } from "./subtitles.manager.js";
 import { VideoEncodingManager } from "./video.manager.js";
 import { AnimeToshoClient, type FetchTorrentsOptions } from "./animetosho.client.js";
 import { ReleaseFilter } from "./release-filter.js";
+import { AnimeMetadataResolver } from "./metadata-resolver.js";
 import {
   DEFAULT_DOWNLOAD_DIR,
   KIRA_BATCH_WINDOW_MS,
   KIRA_BATCH_SAFE_MAX_BYTES,
+  KIRA_BATCH_MAX_ITEMS,
   KIRA_MAX_STAGING_BYTES,
   KIRA_MIN_FREE_SSD_BYTES,
   KIRA_PER_DOWNLOAD_RESERVE_BYTES,
   KIRA_MAX_CONCURRENT_BATCHES,
   KIRA_MAX_TOTAL_BATCHES,
+  KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT,
+  getMaxConcurrentBatches,
   TorrentEntryNotFoundException,
   TorrentDownloadTooSlowException,
   getKiraStagingDir,
   loadAccountsFromEnv,
 } from "../config.js";
+import { notifyMainBackendRevalidate } from "../utils/notifier.js";
 import type {
   AnimeToshoItem,
   EnqueueRequest,
@@ -63,7 +68,9 @@ export class PipelineEngineService {
       await db.execute(sql`
         CREATE TABLE IF NOT EXISTS "pipeline_encoding_job" (
           "id" bigserial PRIMARY KEY NOT NULL,
-          "anidb_id" integer NOT NULL,
+          "anilist_id" integer,
+          "anime_id" integer,
+          "anidb_id" integer,
           "episode_number" integer NOT NULL,
           "types" jsonb NOT NULL,
           "status" text DEFAULT 'queued' NOT NULL,
@@ -89,11 +96,20 @@ export class PipelineEngineService {
         );
       `);
 
+      // Idempotently add anilist_id and anime_id columns if table already existed
+      await db.execute(sql`
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "anilist_id" integer;
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "anime_id" integer;
+        ALTER TABLE "pipeline_encoding_job" ALTER COLUMN "anidb_id" DROP NOT NULL;
+      `);
+
       await db.execute(sql`
         CREATE INDEX IF NOT EXISTS "sh_pipeline_batch_status_idx" ON "pipeline_encoding_batch" ("status");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_batch_user_idx" ON "pipeline_encoding_batch" ("kaggle_username", "status");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_batch_heartbeat_idx" ON "pipeline_encoding_batch" ("status", "heartbeat_at");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_job_status_idx" ON "pipeline_encoding_job" ("status");
+        CREATE INDEX IF NOT EXISTS "sh_pipeline_job_anilist_idx" ON "pipeline_encoding_job" ("anilist_id", "episode_number");
+        CREATE INDEX IF NOT EXISTS "sh_pipeline_job_anime_idx" ON "pipeline_encoding_job" ("anime_id");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_job_anidb_idx" ON "pipeline_encoding_job" ("anidb_id", "episode_number");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_job_batch_idx" ON "pipeline_encoding_job" ("batch_id");
       `);
@@ -108,7 +124,9 @@ export class PipelineEngineService {
   public static async enqueue(req: EnqueueRequest): Promise<EnqueueResponse> {
     await this.ensureTables();
 
-    const {
+    let {
+      anilistId,
+      animeId,
       anidbId,
       episodeNumbers,
       types = ["sub", "dub"],
@@ -117,17 +135,55 @@ export class PipelineEngineService {
       callbackUrl,
     } = req;
 
+    // Auto-resolve metadata, anidbId, animeId, and titles if anilistId is given
+    if (anilistId) {
+      try {
+        const resolved = await AnimeMetadataResolver.resolve(anilistId);
+        if (resolved) {
+          if (!anidbId && resolved.anidbId) {
+            anidbId = resolved.anidbId;
+          }
+          if (!animeId && resolved.animeId) {
+            animeId = resolved.animeId;
+          }
+          if (resolved.synonyms && resolved.synonyms.length > 0) {
+            knownTitles = Array.from(new Set([...knownTitles, ...resolved.synonyms]));
+          }
+          metadata = {
+            ...metadata,
+            primaryTitle: resolved.primaryTitle,
+            coverImage: resolved.coverImage,
+            totalEpisodes: resolved.totalEpisodes,
+            source: resolved.source,
+          };
+          log.info(
+            "PipelineEngine",
+            `Resolved AniList #${anilistId} -> AniDB: ${anidbId || "n/a"}, AnimeId: ${animeId || "n/a"}, Title: "${resolved.primaryTitle}"`,
+          );
+        }
+      } catch (err: any) {
+        log.warn("PipelineEngine", `Metadata resolution error for AniList #${anilistId}: ${err?.message || err}`);
+      }
+    }
+
     const queuedJobs: EnqueueResponse["queuedJobs"] = [];
     let skippedExisting = 0;
 
     for (const ep of episodeNumbers) {
       // Check if already queued or running
+      const conditions = [
+        eq(schema.pipelineJob.episodeNumber, ep),
+        inArray(schema.pipelineJob.status, ["queued", "downloading", "staged", "encoding"]),
+      ];
+
+      if (anilistId) {
+        conditions.push(eq(schema.pipelineJob.anilistId, anilistId));
+      } else if (anidbId) {
+        conditions.push(eq(schema.pipelineJob.anidbId, anidbId));
+      }
+
       const existing = await db.query.pipelineJob.findFirst({
-        where: and(
-          eq(schema.pipelineJob.anidbId, anidbId),
-          eq(schema.pipelineJob.episodeNumber, ep),
-          inArray(schema.pipelineJob.status, ["queued", "downloading", "staged", "encoding"]),
-        ),
+        where: and(...conditions),
       });
 
       if (existing) {
@@ -138,7 +194,9 @@ export class PipelineEngineService {
       const [inserted] = await db
         .insert(schema.pipelineJob)
         .values({
-          anidbId,
+          anilistId: anilistId || null,
+          animeId: animeId || null,
+          anidbId: anidbId || null,
           episodeNumber: ep,
           types,
           status: "queued",
@@ -151,6 +209,8 @@ export class PipelineEngineService {
 
       queuedJobs.push({
         id: inserted.id,
+        anilistId: inserted.anilistId,
+        animeId: inserted.animeId,
         anidbId: inserted.anidbId,
         episodeNumber: inserted.episodeNumber,
         types: inserted.types,
@@ -158,7 +218,7 @@ export class PipelineEngineService {
 
       log.info(
         "PipelineEngine",
-        `Enqueued Job #${inserted.id} -> AniDB ${anidbId} Ep ${ep} (${types.join("/")})`,
+        `Enqueued Job #${inserted.id} -> AniList: ${anilistId || "n/a"} | AniDB: ${anidbId || "n/a"} Ep ${ep} (${types.join("/")})`,
       );
     }
 
@@ -199,7 +259,10 @@ export class PipelineEngineService {
     let localFile: string | null = null;
 
     try {
-      log.info("PipelineEngine", `Searching AnimeTosho for AniDB ${job.anidbId} Ep ${job.episodeNumber}...`);
+      log.info(
+        "PipelineEngine",
+        `Searching AnimeTosho for AniList ${job.anilistId || "n/a"} | AniDB ${job.anidbId || "n/a"} Ep ${job.episodeNumber}...`,
+      );
       const isDub = job.types.includes("dub") && !job.types.includes("sub");
       const langQuery = isDub ? "dual-audio 1080p" : "1080p";
 
@@ -210,13 +273,32 @@ export class PipelineEngineService {
         maxPages: 5,
       };
 
-      let torrents = await AnimeToshoClient.fetchTorrents(job.anidbId, langQuery, opts);
+      let torrents: AnimeToshoItem[] = [];
 
-      if (torrents.length === 0 && isDub) {
-        torrents = await AnimeToshoClient.fetchTorrents(job.anidbId, "dub 1080p", opts);
+      // 1. First attempt: search via AniDB ID if present
+      if (job.anidbId) {
+        torrents = await AnimeToshoClient.fetchTorrents(job.anidbId, langQuery, opts);
+
+        if (torrents.length === 0 && isDub) {
+          torrents = await AnimeToshoClient.fetchTorrents(job.anidbId, "dub 1080p", opts);
+        }
+        if (torrents.length === 0) {
+          torrents = await AnimeToshoClient.fetchTorrents(job.anidbId, "", opts);
+        }
       }
-      if (torrents.length === 0) {
-        torrents = await AnimeToshoClient.fetchTorrents(job.anidbId, "", opts);
+
+      // 2. Second attempt: search via known titles if AniDB ID was missing or gave 0 results
+      if (torrents.length === 0 && Array.isArray(job.knownTitles) && job.knownTitles.length > 0) {
+        for (const title of job.knownTitles) {
+          if (!title || !title.trim()) continue;
+          log.info("PipelineEngine", `Searching AnimeTosho by title "${title.trim()}" Ep ${job.episodeNumber}...`);
+          torrents = await AnimeToshoClient.fetchTorrentsByTitle(title.trim(), langQuery, opts);
+          if (torrents.length > 0) break;
+          if (isDub) {
+            torrents = await AnimeToshoClient.fetchTorrentsByTitle(title.trim(), "dub 1080p", opts);
+            if (torrents.length > 0) break;
+          }
+        }
       }
 
       const topCandidates = ReleaseFilter.selectTopCandidates(
@@ -231,7 +313,7 @@ export class PipelineEngineService {
 
       if (topCandidates.length === 0) {
         throw new TorrentEntryNotFoundException(
-          `No viable candidate releases found for AniDB ${job.anidbId} Ep ${job.episodeNumber}`,
+          `No viable candidate releases found for AniList ${job.anilistId || "n/a"} / AniDB ${job.anidbId || "n/a"} Ep ${job.episodeNumber}`,
         );
       }
 
@@ -292,7 +374,7 @@ export class PipelineEngineService {
       try {
         const extractedSubs = await subtitles.extractSubtitlesFromMkv(fullPath, tempSubsDir);
         if (extractedSubs.length > 0) {
-          const animeIdForPath = job.metadata?.animeId || job.anidbId;
+          const animeIdForPath = job.animeId || job.anilistId || job.anidbId || job.id;
           r2SubRecords = await subtitles.uploadSubtitles(
             extractedSubs,
             animeIdForPath,
@@ -398,40 +480,89 @@ export class PipelineEngineService {
     batchId: number | null;
     jobCount: number;
     totalBytes: number;
+    kaggleUsername?: string | null;
   }> {
     await this.ensureTables();
 
-    // Check if an active batch is already running (max 1 active batch)
-    const active = await db.query.pipelineBatch.findFirst({
-      where: inArray(schema.pipelineBatch.status, [
-        "created",
-        "uploading",
-        "waiting_dataset",
-        "kernel_running",
-      ]),
-    });
-
-    if (active) {
+    const { kaggleAccounts } = loadAccountsFromEnv();
+    if (kaggleAccounts.length === 0) {
+      log.warn("PipelineEngine", "No Kaggle accounts configured; cannot seal GPU batch");
       return { batchId: null, jobCount: 0, totalBytes: 0 };
     }
 
+    // Dynamic concurrency limit = total number of kaggle accounts * 2
+    const maxConcurrentBatches = kaggleAccounts.length * KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT;
+
+    // Check currently active batches across the system
+    const activeBatches = await db
+      .select({
+        id: schema.pipelineBatch.id,
+        status: schema.pipelineBatch.status,
+        kaggleUsername: schema.pipelineBatch.kaggleUsername,
+      })
+      .from(schema.pipelineBatch)
+      .where(
+        inArray(schema.pipelineBatch.status, [
+          "created",
+          "uploading",
+          "waiting_dataset",
+          "kernel_running",
+        ]),
+      );
+
+    if (activeBatches.length >= maxConcurrentBatches) {
+      log.info(
+        "PipelineEngine",
+        `Kaggle capacity reached: ${activeBatches.length}/${maxConcurrentBatches} active notebooks. Waiting for a slot to free.`,
+      );
+      return { batchId: null, jobCount: 0, totalBytes: 0 };
+    }
+
+    // Count active notebooks per Kaggle username
+    const usageMap: Record<string, number> = {};
+    for (const b of activeBatches) {
+      if (b.kaggleUsername) {
+        usageMap[b.kaggleUsername] = (usageMap[b.kaggleUsername] || 0) + 1;
+      }
+    }
+
+    // Find accounts that have < 2 concurrent tasks, sorted by least loaded
+    const eligibleAccounts = kaggleAccounts
+      .map((acc) => ({
+        account: acc,
+        activeCount: usageMap[acc.username] || 0,
+      }))
+      .filter((item) => item.activeCount < KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT)
+      .sort((a, b) => a.activeCount - b.activeCount);
+
+    if (eligibleAccounts.length === 0) {
+      log.info("PipelineEngine", "All Kaggle accounts currently running at their 2-notebook limit.");
+      return { batchId: null, jobCount: 0, totalBytes: 0 };
+    }
+
+    const selectedAccount = eligibleAccounts[0].account;
+
+    // Find staged jobs not assigned to any batch
     const stagedJobs = await db
       .select()
       .from(schema.pipelineJob)
-      .where(eq(schema.pipelineJob.status, "staged"))
+      .where(and(eq(schema.pipelineJob.status, "staged"), isNull(schema.pipelineJob.batchId)))
       .orderBy(asc(schema.pipelineJob.stagedAt));
 
     if (stagedJobs.length === 0) {
       return { batchId: null, jobCount: 0, totalBytes: 0 };
     }
 
-    // Pack up to 10 GB safe cap
+    // Pack up to 10 GB safe cap OR max 10 files (whichever limit is reached first)
     const packedJobs: typeof stagedJobs = [];
     let accBytes = 0;
 
     for (const job of stagedJobs) {
       const sz = Number(job.sizeBytes || 0);
-      if (accBytes + sz > KIRA_BATCH_SAFE_MAX_BYTES && packedJobs.length > 0) {
+      if (
+        (accBytes + sz > KIRA_BATCH_SAFE_MAX_BYTES || packedJobs.length >= KIRA_BATCH_MAX_ITEMS) &&
+        packedJobs.length > 0
+      ) {
         break;
       }
       packedJobs.push(job);
@@ -447,6 +578,7 @@ export class PipelineEngineService {
       .values({
         status: "created",
         triggerReason: options.triggerReason || (options.forceFlush ? "manual" : "window_30m"),
+        kaggleUsername: selectedAccount.username,
         jobCount: packedJobs.length,
         totalBytes: accBytes,
         heartbeatAt: new Date(),
@@ -466,14 +598,31 @@ export class PipelineEngineService {
 
     log.success(
       "PipelineEngine",
-      `Sealed Batch #${batch.id}: ${packedJobs.length} jobs, ${(accBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`,
+      `Sealed Batch #${batch.id} assigned to ${selectedAccount.username} (${eligibleAccounts[0].activeCount + 1}/${KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT} tasks): ${packedJobs.length} jobs, ${(accBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`,
     );
 
     return {
       batchId: batch.id,
       jobCount: packedJobs.length,
       totalBytes: accBytes,
+      kaggleUsername: selectedAccount.username,
     };
+  }
+
+  /**
+   * Seals as many batches as there are available Kaggle slots and staged jobs ready.
+   */
+  public static async sealAvailableBatches(options: {
+    forceFlush?: boolean;
+    triggerReason?: string;
+  } = {}): Promise<number[]> {
+    const sealedBatchIds: number[] = [];
+    while (true) {
+      const res = await this.sealStagedBatch(options);
+      if (!res.batchId) break;
+      sealedBatchIds.push(res.batchId);
+    }
+    return sealedBatchIds;
   }
 
   public static async executeBatch(batchId: number): Promise<void> {
@@ -505,9 +654,18 @@ export class PipelineEngineService {
       throw new Error("No Kaggle accounts available for GPU encoding");
     }
 
+    // Look up the pre-assigned Kaggle account or fall back
+    let account = batch.kaggleUsername
+      ? kaggleAccounts.find((a) => a.username === batch.kaggleUsername)
+      : null;
+
+    if (!account) {
+      account = kaggleAccounts[0];
+    }
+
     log.info(
       "PipelineEngine",
-      `Executing Batch #${batchId} on Kaggle GPU (${jobs.length} jobs)...`,
+      `Executing Batch #${batchId} on Kaggle GPU (${account.username}) with ${jobs.length} jobs...`,
     );
 
     // Build batch manifest & upload items
@@ -532,14 +690,15 @@ export class PipelineEngineService {
       manifestItems.push({
         jobId: job.id,
         filename: safeRel,
-        animeId: job.anidbId,
+        animeId: job.animeId || job.anilistId || job.anidbId || 0,
+        anilistId: job.anilistId || undefined,
+        anidbId: job.anidbId || undefined,
         episodeNumber: job.episodeNumber,
         tracks: [["1080p", 0], ["720p", 0], ["480p", 0], ["360p", 0]],
         hf: hfAccounts[0],
       });
     }
 
-    const account = kaggleAccounts[0];
     const datasetSlug = `kira-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
     const kernelSlug = `enc-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
 
@@ -570,7 +729,7 @@ export class PipelineEngineService {
       .set({ status: "kernel_running", heartbeatAt: new Date() })
       .where(eq(schema.pipelineBatch.id, batchId));
 
-    log.info("PipelineEngine", `Pushing GPU kernel ${kernelSlug} to Kaggle...`);
+    log.info("PipelineEngine", `Pushing GPU kernel ${kernelSlug} to Kaggle (${account.username})...`);
     await videoManager.pushBatchGpuKernel(
       datasetSlug,
       kernelSlug,
@@ -593,7 +752,7 @@ export class PipelineEngineService {
         .set({ heartbeatAt: new Date() })
         .where(eq(schema.pipelineBatch.id, batchId));
 
-      log.info("PipelineEngine", `Kernel ${kernelSlug} status: ${st} (${kStatus.rawStatus})`);
+      log.info("PipelineEngine", `Kernel ${kernelSlug} [${account.username}] status: ${st} (${kStatus.rawStatus})`);
 
       if (st === "completed") {
         isComplete = true;
@@ -619,11 +778,16 @@ export class PipelineEngineService {
     const records = output.records || [];
     log.success("PipelineEngine", `Received ${records.length} encoded files. Uploading to Hugging Face...`);
 
-    // Group outputs by job (anidbId + epNum)
+    // Group outputs by job
     for (const job of jobs) {
-      const jobOutputs = records.filter(
-        (o) => o.anime_id === job.anidbId && o.episode_number === job.episodeNumber,
-      );
+      const jobOutputs = records.filter((o) => {
+        if (o.job_id && o.job_id === job.id) return true;
+        const matchesAnime =
+          (job.anidbId && o.anime_id === job.anidbId) ||
+          (job.anilistId && o.anime_id === job.anilistId) ||
+          (job.animeId && o.anime_id === job.animeId);
+        return matchesAnime && o.episode_number === job.episodeNumber;
+      });
 
       const sources = jobOutputs.map((o) => ({
         quality: o.quality,
@@ -636,6 +800,8 @@ export class PipelineEngineService {
 
       const resultPayload: PipelineEpisodeResult = {
         jobId: job.id,
+        anilistId: job.anilistId,
+        animeId: job.animeId,
         anidbId: job.anidbId,
         episodeNumber: job.episodeNumber,
         type: job.types.includes("dub") ? "dub" : "sub",
@@ -678,6 +844,16 @@ export class PipelineEngineService {
         }
       }
 
+      // Revalidate cache on Main Backend if animeId or anilistId is known
+      const targetAnimeId = job.animeId || job.anilistId;
+      if (targetAnimeId) {
+        notifyMainBackendRevalidate({
+          animeId: targetAnimeId,
+          episodeNumber: job.episodeNumber,
+          airType: job.types.includes("dub") ? "dub" : "sub",
+        }).catch(() => {});
+      }
+
       await db
         .update(schema.pipelineJob)
         .set({
@@ -707,17 +883,31 @@ export class PipelineEngineService {
       })
       .where(eq(schema.pipelineBatch.id, batchId));
 
-    log.success("PipelineEngine", `Batch #${batchId} completed successfully!`);
+    log.success("PipelineEngine", `Batch #${batchId} completed successfully on Kaggle (${account.username})!`);
   }
 
   public static async getStats(): Promise<PipelineStats> {
     await this.ensureTables();
 
-    const [activeBatchRow] = await db
+    const activeBatchRows = await db
       .select()
       .from(schema.pipelineBatch)
       .where(inArray(schema.pipelineBatch.status, ["created", "uploading", "waiting_dataset", "kernel_running"]))
-      .limit(1);
+      .orderBy(asc(schema.pipelineBatch.id));
+
+    const activeBatches = activeBatchRows.map((row) => ({
+      id: row.id,
+      status: row.status,
+      kaggleUsername: row.kaggleUsername,
+      datasetSlug: row.datasetSlug,
+      kernelSlug: row.kernelSlug,
+      jobCount: row.jobCount,
+      totalBytes: Number(row.totalBytes || 0),
+      elapsedSeconds: row.startedAt
+        ? Math.floor((Date.now() - row.startedAt.getTime()) / 1000)
+        : 0,
+      heartbeatAt: row.heartbeatAt.toISOString(),
+    }));
 
     const counts = await db
       .select({
@@ -738,22 +928,28 @@ export class PipelineEngineService {
     const windowStats = await this.getStagedWindowStats();
     const { kaggleAccounts, hfAccounts } = loadAccountsFromEnv();
 
+    const kaggleAccountStatus = kaggleAccounts.map((a) => {
+      const activeTasks = activeBatchRows.filter((b) => b.kaggleUsername === a.username).length;
+      return {
+        username: a.username,
+        activeTasks,
+        maxTasks: KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT,
+        isBusy: activeTasks >= KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT,
+        slots: [activeTasks >= 1, activeTasks >= 2] as [boolean, boolean],
+      };
+    });
+
+    const maxConcurrentBatches = Math.max(1, kaggleAccounts.length * KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT);
+
     return {
-      activeBatch: activeBatchRow
-        ? {
-            id: activeBatchRow.id,
-            status: activeBatchRow.status,
-            kaggleUsername: activeBatchRow.kaggleUsername,
-            datasetSlug: activeBatchRow.datasetSlug,
-            kernelSlug: activeBatchRow.kernelSlug,
-            jobCount: activeBatchRow.jobCount,
-            totalBytes: Number(activeBatchRow.totalBytes || 0),
-            elapsedSeconds: activeBatchRow.startedAt
-              ? Math.floor((Date.now() - activeBatchRow.startedAt.getTime()) / 1000)
-              : 0,
-            heartbeatAt: activeBatchRow.heartbeatAt.toISOString(),
-          }
-        : null,
+      activeBatch: activeBatches[0] || null,
+      activeBatches,
+      concurrency: {
+        active: activeBatches.length,
+        max: maxConcurrentBatches,
+        accountsCount: kaggleAccounts.length,
+        maxPerAccount: KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT,
+      },
       queue: {
         queued: queueMap["queued"] || 0,
         downloading: queueMap["downloading"] || 0,
@@ -767,15 +963,13 @@ export class PipelineEngineService {
       storage: {
         stagedBytes: windowStats.totalBytes,
         stagedCount: windowStats.stagedCount,
+        maxBatchItems: KIRA_BATCH_MAX_ITEMS,
         maxStagingBytes: KIRA_MAX_STAGING_BYTES,
         minFreeBytes: KIRA_MIN_FREE_SSD_BYTES,
         stagingDir: getKiraStagingDir(),
       },
       accounts: {
-        kaggle: kaggleAccounts.map((a) => ({
-          username: a.username,
-          isBusy: activeBatchRow?.kaggleUsername === a.username,
-        })),
+        kaggle: kaggleAccountStatus,
         huggingFace: hfAccounts.map((h) => ({
           owner: h.owner,
           bucket: h.bucket,

@@ -1,81 +1,96 @@
 import React from "react";
-import { Activity, Flame, RotateCw, Plus, Cpu } from "lucide-react";
+import { Zap, Sparkles, Flame, RotateCw, Plus } from "lucide-react";
+import type { PipelineStats } from "../../backend/engine/types.js";
 
 interface NavbarProps {
   connected: boolean;
+  stats: PipelineStats | null;
   onOpenEnqueue: () => void;
   onForceFlush: () => void;
   onRunRecovery: () => void;
+  sidebarCollapsed: boolean;
 }
 
 export function Navbar({
   connected,
+  stats,
   onOpenEnqueue,
   onForceFlush,
   onRunRecovery,
+  sidebarCollapsed,
 }: NavbarProps) {
+  const activeSlots = stats?.concurrency?.active ?? 0;
+  const maxSlots = stats?.concurrency?.max ?? 2;
+  const slotPct = Math.round((activeSlots / maxSlots) * 100);
+
   return (
-    <header className="border-b border-zinc-800 bg-zinc-950/80 backdrop-blur sticky top-0 z-50 px-6 py-3.5">
-      <div className="max-w-7xl mx-auto flex items-center justify-between">
-        {/* Logo and Status */}
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-cyan-600 via-indigo-600 to-violet-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
-            <Cpu className="w-5 h-5 text-white" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-extrabold text-lg text-white tracking-tight">
-                AniLight
-              </span>
-              <span className="px-2 py-0.5 text-xs font-semibold rounded-md bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-                SH Pipeline
-              </span>
-            </div>
-            <p className="text-xs text-zinc-400">Kira Self-Hosted Operations & GPU Batch Manager</p>
+    <header className="sticky top-0 z-20 border-b border-white/[0.07] bg-[#12131c]/90 backdrop-blur-xl px-4 sm:px-6 py-3">
+      <div className="flex items-center justify-between">
+        {/* Left Status Bar */}
+        <div className="flex items-center gap-2.5">
+          {/* Connection Status Indicator */}
+          <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-white/[0.04] border border-white/[0.08] text-[11px] font-mono">
+            <span className="relative flex h-2 w-2">
+              {connected && (
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+              )}
+              <span
+                className={`relative inline-flex rounded-full h-2 w-2 ${
+                  connected ? "bg-emerald-400" : "bg-rose-400"
+                }`}
+              />
+            </span>
+            <span className={connected ? "text-neutral-300" : "text-rose-400"}>
+              {connected ? "SSE Stream Active" : "Reconnecting..."}
+            </span>
           </div>
 
-          <div className="ml-4 flex items-center gap-2 px-2.5 py-1 rounded-full bg-zinc-900 border border-zinc-800 text-xs font-medium">
-            <span
-              className={`w-2 h-2 rounded-full ${
-                connected ? "bg-emerald-400 animate-pulse" : "bg-rose-400"
-              }`}
-            />
-            <span className={connected ? "text-zinc-300" : "text-rose-400"}>
-              {connected ? "Live Stream Connected" : "Reconnecting..."}
+          {/* 10 Files / 10 GB Limit Chip */}
+          <div className="hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/[0.05] border border-white/10 text-[11px] font-mono text-white">
+            <Sparkles className="w-3 h-3 text-neutral-300" />
+            <span>Dual Trigger: 10 Files or 10 GB</span>
+          </div>
+
+          {/* GPU Cluster Capacity Meter */}
+          <div className="hidden lg:flex items-center gap-2 px-3 py-1 rounded-full bg-white/[0.04] border border-white/[0.08] text-[11px] font-mono text-neutral-400">
+            <Zap className={`w-3 h-3 ${activeSlots > 0 ? "text-white" : "text-neutral-500"}`} />
+            <span>GPU Load:</span>
+            <span className={`font-semibold ${activeSlots > 0 ? "text-white" : "text-neutral-400"}`}>
+              {activeSlots}/{maxSlots} Slots
             </span>
+            <span className="text-[10px] text-neutral-500 font-sans">({slotPct}%)</span>
           </div>
         </div>
 
-        {/* Action Controls */}
-        <div className="flex items-center gap-2.5">
+        {/* Right Actions Bar */}
+        <div className="flex items-center gap-2">
           <button
             onClick={onForceFlush}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 border border-amber-500/30 transition-all cursor-pointer"
-            title="Immediately pack and seal staged episodes into a GPU batch"
+            className="button-liquid-glass flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold text-neutral-300 hover:text-white transition-all cursor-pointer"
+            title="Immediately package staged episodes into GPU batch"
           >
-            <Flame className="w-3.5 h-3.5 text-amber-400" />
-            Force Flush Batch
+            <Flame className="w-3.5 h-3.5 text-neutral-300" />
+            <span className="hidden sm:inline">Force Flush</span>
           </button>
 
           <button
             onClick={onRunRecovery}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-zinc-900 text-zinc-300 hover:bg-zinc-800 border border-zinc-700/60 transition-all cursor-pointer"
-            title="Run crash recovery watchdog to reconcile queues and heartbeats"
+            className="button-liquid-glass flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold text-neutral-300 hover:text-white transition-all cursor-pointer"
+            title="Reconcile pipeline heartbeats and watchdog state"
           >
-            <RotateCw className="w-3.5 h-3.5 text-zinc-400" />
-            Watchdog Reconcile
+            <RotateCw className="w-3.5 h-3.5 text-neutral-400" />
+            <span className="hidden sm:inline">Reconcile</span>
           </button>
 
           <button
             onClick={onOpenEnqueue}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-500 shadow-md shadow-indigo-600/30 transition-all cursor-pointer"
+            className="button-glow hidden sm:flex items-center gap-1.5 px-4 py-1.5 rounded-full text-xs font-bold shadow-md cursor-pointer"
           >
-            <Plus className="w-3.5 h-3.5" />
-            Enqueue AniDB Job
+            <Plus className="w-3.5 h-3.5 text-neutral-950" />
+            <span>Enqueue Anime</span>
           </button>
         </div>
       </div>
     </header>
   );
 }
-

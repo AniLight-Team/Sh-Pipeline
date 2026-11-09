@@ -50,7 +50,9 @@ export const pipelineJob = pgTable(
   "pipeline_encoding_job",
   {
     id: bigserial("id", { mode: "number" }).primaryKey(),
-    anidbId: integer("anidb_id").notNull(),
+    anilistId: integer("anilist_id"),
+    animeId: integer("anime_id"),
+    anidbId: integer("anidb_id"),
     episodeNumber: integer("episode_number").notNull(),
     types: jsonb("types").$type<("sub" | "dub")[]>().notNull(),
     status: text("status").notNull().default("queued"), // queued | downloading | staged | encoding | completed | failed | paused
@@ -85,6 +87,8 @@ export const pipelineJob = pgTable(
   },
   (table) => [
     index("sh_pipeline_job_status_idx").on(table.status),
+    index("sh_pipeline_job_anilist_idx").on(table.anilistId, table.episodeNumber),
+    index("sh_pipeline_job_anime_idx").on(table.animeId),
     index("sh_pipeline_job_anidb_idx").on(table.anidbId, table.episodeNumber),
     index("sh_pipeline_job_batch_idx").on(table.batchId),
   ],

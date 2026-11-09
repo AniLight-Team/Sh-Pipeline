@@ -110,6 +110,8 @@ export interface KiraBatchManifestItem {
   jobId: number;
   filename: string;
   animeId: number;
+  anilistId?: number;
+  anidbId?: number;
   episodeNumber: number;
   tracks: [string, number][];
   hf: HuggingFaceAccount;
@@ -144,7 +146,9 @@ export interface PipelineSubtitleTrack {
 
 export interface PipelineEpisodeResult {
   jobId: number;
-  anidbId: number;
+  anilistId?: number | null;
+  animeId?: number | null;
+  anidbId?: number | null;
   episodeNumber: number;
   type: "sub" | "dub";
   sources: PipelineEncodedSource[];
@@ -154,7 +158,9 @@ export interface PipelineEpisodeResult {
 }
 
 export interface EnqueueRequest {
-  anidbId: number;
+  anilistId?: number;
+  animeId?: number;
+  anidbId?: number;
   episodeNumbers: number[];
   types?: ("sub" | "dub")[];
   knownTitles?: string[];
@@ -165,25 +171,44 @@ export interface EnqueueRequest {
 export interface EnqueueResponse {
   queuedJobs: {
     id: number;
-    anidbId: number;
+    anilistId?: number | null;
+    animeId?: number | null;
+    anidbId?: number | null;
     episodeNumber: number;
     types: ("sub" | "dub")[];
   }[];
   skippedExisting: number;
 }
 
+export interface ActiveBatchSummary {
+  id: number;
+  status: string;
+  kaggleUsername: string | null;
+  datasetSlug: string | null;
+  kernelSlug: string | null;
+  jobCount: number;
+  totalBytes: number;
+  elapsedSeconds: number;
+  heartbeatAt: string;
+}
+
+export interface KaggleAccountStatus {
+  username: string;
+  activeTasks: number; // 0, 1, or 2
+  maxTasks: number; // strictly 2
+  isBusy: boolean; // activeTasks >= 2
+  slots: [boolean, boolean]; // [slot1Occupied, slot2Occupied]
+}
+
 export interface PipelineStats {
-  activeBatch: {
-    id: number;
-    status: string;
-    kaggleUsername: string | null;
-    datasetSlug: string | null;
-    kernelSlug: string | null;
-    jobCount: number;
-    totalBytes: number;
-    elapsedSeconds: number;
-    heartbeatAt: string;
-  } | null;
+  activeBatch: ActiveBatchSummary | null;
+  activeBatches: ActiveBatchSummary[];
+  concurrency: {
+    active: number;
+    max: number; // total kaggle accounts * 2
+    accountsCount: number;
+    maxPerAccount: number; // 2
+  };
   queue: {
     queued: number;
     downloading: number;
@@ -197,12 +222,13 @@ export interface PipelineStats {
   storage: {
     stagedBytes: number;
     stagedCount: number;
+    maxBatchItems: number;
     maxStagingBytes: number;
     minFreeBytes: number;
     stagingDir: string;
   };
   accounts: {
-    kaggle: { username: string; isBusy: boolean }[];
+    kaggle: KaggleAccountStatus[];
     huggingFace: { owner: string; bucket: string }[];
   };
   engine: {
@@ -211,4 +237,19 @@ export interface PipelineStats {
     uptimeSeconds: number;
     lastWatchdogRun: string | null;
   };
+}
+
+export interface AnimeResolvedMetadata {
+  anilistId: number;
+  animeId?: number;
+  anidbId?: number;
+  titleRomaji?: string;
+  titleEnglish?: string;
+  titleNative?: string;
+  primaryTitle: string;
+  synonyms: string[];
+  totalEpisodes?: number;
+  coverImage?: string;
+  status?: string;
+  source: string;
 }
