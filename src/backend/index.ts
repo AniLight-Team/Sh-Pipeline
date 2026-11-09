@@ -1,3 +1,4 @@
+import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
@@ -30,6 +31,9 @@ await app.register(cors, {
 await app.register(inngestFastify, {
   client: inngest,
   functions: pipelineInngestFunctions,
+  options: {
+    servePath: "/api/inngest",
+  },
 });
 
 // ── REST API & Realtime SSE Routes ───────────────────────────
@@ -39,8 +43,8 @@ await app.register(sseRoutes, { prefix: "/api/sse" });
 // ── Static Frontend Serving (Vite Build) ─────────────────────
 // Look for dist/client in project root
 const clientDistCandidates = [
-  path.resolve(__dirname, "../../client"), // When running from dist/backend/
-  path.resolve(__dirname, "../../../dist/client"), // Alternative dist layout
+  path.resolve(__dirname, "../client"), // When running from dist/backend/
+  path.resolve(__dirname, "../../client"), // When running from dist/backend/ to root client
   path.resolve(process.cwd(), "dist/client"), // From cwd
 ];
 
