@@ -1,0 +1,51 @@
+{
+  "name": "sh-pipeline",
+  "version": "1.0.0",
+  "description": "AniLight Standalone Kira Self-Hosted Pipeline & Management Service",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n \"API,UI\" -c \"cyan,magenta\" \"tsx watch src/backend/index.ts\" \"vite\"",
+    "dev:backend": "tsx watch src/backend/index.ts",
+    "dev:frontend": "vite",
+    "build": "vite build && tsc -p tsconfig.server.json",
+    "build:ui": "vite build",
+    "build:server": "tsc -p tsconfig.server.json",
+    "start": "node dist/backend/index.js",
+    "start:tsx": "tsx src/backend/index.ts",
+    "test:kaggle": "tsx src/backend/scripts/test-kaggle.ts",
+    "reset:queue": "tsx src/backend/scripts/reset-queue.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1053.0",
+    "@fastify/cors": "^11.2.0",
+    "@fastify/static": "^9.0.0",
+    "clsx": "^2.1.1",
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "fastify": "^5.8.5",
+    "got-scraping": "^4.2.2",
+    "inngest": "^4.26.2",
+    "lucide-react": "^1.16.0",
+    "p-queue": "^9.2.0",
+    "postgres": "^3.4.9",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwind-merge": "^3.5.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/node": "^25.7.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "autoprefixer": "^10.4.20",
+    "concurrently": "^9.1.2",
+    "postcss": "^8.5.3",
+    "tailwindcss": "^4.1.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3",
+    "vite": "^6.3.0"
+  }
+}
