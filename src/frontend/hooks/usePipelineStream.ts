@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
-import type { PipelineStats } from "../backend/engine/types.js";
-import type { LogEntry } from "../backend/utils/logger.js";
+import type { PipelineStats } from "../../backend/engine/types.js";
+import type { LogEntry } from "../../backend/utils/logger.js";
 
 export function usePipelineStream() {
   const [stats, setStats] = useState<PipelineStats | null>(null);
