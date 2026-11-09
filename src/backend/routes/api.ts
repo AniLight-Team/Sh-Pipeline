@@ -174,17 +174,30 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
 
   app.post("/batches/flush", async () => {
     log.info("API", "Force-flush triggered manually");
+
+    // 1. Recover any batches stuck in "created" status
+    const pendingBatches = await db
+      .select({ id: schema.pipelineBatch.id })
+      .from(schema.pipelineBatch)
+      .where(eq(schema.pipelineBatch.status, "created"));
+
+    const pendingIds = pendingBatches.map((b) => b.id);
+
+    // 2. Seal any available staged jobs
     const sealedBatchIds = await PipelineEngineService.sealAvailableBatches({
       forceFlush: true,
       triggerReason: "manual_api",
     });
 
-    for (const bId of sealedBatchIds) {
+    const allDispatchIds = Array.from(new Set([...pendingIds, ...sealedBatchIds]));
+
+    for (const bId of allDispatchIds) {
       await inngest.send({
         name: "pipeline/batch.execute",
-        id: `pipeline-batch-${bId}`,
+        id: `pipeline-batch-${bId}-${Date.now()}`,
         data: { batchId: bId },
       });
+      log.info("API", `Dispatched execution event for batch #${bId}`);
     }
 
     await inngest.send({
@@ -192,7 +205,33 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
       data: { reason: "manual_api" },
     });
 
-    return { ok: true, message: `Force flush processed: sealed ${sealedBatchIds.length} batch(es)` };
+    return {
+      ok: true,
+      message: `Force flush processed: dispatched ${allDispatchIds.length} batch(es) (${pendingIds.length} resumed, ${sealedBatchIds.length} new)`,
+      dispatchedBatchIds: allDispatchIds,
+    };
+  });
+
+  app.post("/batches/:id/execute", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const batchId = parseInt(id, 10);
+
+    const batch = await db.query.pipelineBatch.findFirst({
+      where: eq(schema.pipelineBatch.id, batchId),
+    });
+
+    if (!batch) {
+      return reply.status(404).send({ error: "Batch not found" });
+    }
+
+    await inngest.send({
+      name: "pipeline/batch.execute",
+      id: `pipeline-batch-${batchId}-${Date.now()}`,
+      data: { batchId },
+    });
+
+    log.info("API", `Direct execute triggered for Batch #${batchId}`);
+    return { ok: true, message: `Dispatched execution event for batch #${batchId}`, batch };
   });
 
   app.post("/system/recovery", async () => {

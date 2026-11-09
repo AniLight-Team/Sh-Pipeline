@@ -41,7 +41,7 @@ export function Sidebar({
 
   return (
     <aside
-      className={`fixed top-0 left-0 bottom-0 z-30 hidden md:flex flex-col bg-[#12131c] border-r border-white/[0.08] transition-all duration-300 ease-in-out select-none ${
+      className={`fixed top-0 left-0 bottom-0 z-30 hidden md:flex flex-col bg-[#12131c] border-r border-white/8 transition-all duration-300 ease-in-out select-none ${
         collapsed ? "w-16" : "w-64"
       }`}
     >
@@ -67,7 +67,7 @@ export function Sidebar({
               <span className="text-[15px] font-extrabold text-white tracking-tight truncate">
                 AniLight
               </span>
-              <span className="text-[9px] font-mono font-bold uppercase tracking-wider text-neutral-300 bg-white/[0.08] px-1.5 py-0.5 rounded border border-white/10 align-sub shrink-0">
+              <span className="text-[9px] font-mono font-bold uppercase tracking-wider text-neutral-300 bg-white/8 px-1.5 py-0.5 rounded border border-white/10 align-sub shrink-0">
                 Pipeline
               </span>
             </div>
@@ -161,7 +161,7 @@ export function Sidebar({
                 {!collapsed && <span className="truncate">Jobs Queue</span>}
               </div>
               {!collapsed && queuedCount > 0 && (
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-white/[0.08] text-neutral-300 border border-white/[0.06]">
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-white/8 text-neutral-300 border border-white/[0.06]">
                   {queuedCount}
                 </span>
               )}

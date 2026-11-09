@@ -27,26 +27,31 @@ export const batchCoordinatorFn = inngest.createFunction(
         const stats = await PipelineEngineService.getStagedWindowStats();
 
         if (stats.stagedCount === 0 || !stats.oldestStagedAt) {
-          return { shouldWait: false, waitSeconds: 0 };
+          return { shouldSkip: true, shouldWait: false, waitSeconds: 0 };
         }
 
-        if (stats.totalBytes >= KIRA_BATCH_SAFE_MAX_BYTES || stats.stagedCount >= KIRA_BATCH_MAX_ITEMS) {
-          return { shouldWait: false, waitSeconds: 0 };
+        // Limit cap reached: 10 files or 10 GB safe cap -> flush immediately, do not wait
+        if (
+          stats.totalBytes >= KIRA_BATCH_SAFE_MAX_BYTES ||
+          stats.stagedCount >= KIRA_BATCH_MAX_ITEMS
+        ) {
+          return { shouldSkip: false, shouldWait: false, waitSeconds: 0 };
         }
 
         const elapsedMs = Date.now() - stats.oldestStagedAt.getTime();
         const remainingMs = Math.max(0, KIRA_BATCH_WINDOW_MS - elapsedMs);
         return {
-          shouldWait: true,
+          shouldSkip: false,
+          shouldWait: remainingMs > 5000,
           waitSeconds: Math.ceil(remainingMs / 1000),
         };
       });
 
-      if (!waitInfo.shouldWait) {
-        return { status: "skipped" };
+      if (waitInfo.shouldSkip) {
+        return { status: "skipped", reason: "no_staged_items" };
       }
 
-      if (waitInfo.waitSeconds > 5) {
+      if (waitInfo.shouldWait && waitInfo.waitSeconds > 5) {
         await step.waitForEvent("wait-30m-or-early-flush", {
           event: "pipeline/batch.force-flush",
           timeout: `${waitInfo.waitSeconds}s`,
@@ -64,7 +69,7 @@ export const batchCoordinatorFn = inngest.createFunction(
     for (const bId of sealedBatchIds) {
       await step.sendEvent(`dispatch-batch-${bId}`, {
         name: "pipeline/batch.execute",
-        id: `pipeline-batch-${bId}`,
+        id: `pipeline-batch-${bId}-${Date.now()}`,
         data: { batchId: bId },
       });
     }
@@ -72,4 +77,3 @@ export const batchCoordinatorFn = inngest.createFunction(
     return { sealedBatchIds, count: sealedBatchIds.length };
   },
 );
-

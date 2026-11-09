@@ -82,6 +82,9 @@ if (clientDistPath) {
   });
 }
 
+import { db, schema } from "./db/index.js";
+import { eq, lt, and } from "drizzle-orm";
+
 const start = async () => {
   try {
     await PipelineEngineService.ensureTables();
@@ -89,6 +92,33 @@ const start = async () => {
     await app.listen({ port: PORT, host: HOST });
     log.success("Server", `🚀 Pipeline Service running at http://${HOST}:${PORT}`);
     log.info("Server", `📡 Inngest App 'sh-pipeline' ready at http://${HOST}:${PORT}/api/inngest`);
+
+    // ── Autonomous Self-Healing Background Loop (Every 60s) ───
+    setInterval(async () => {
+      try {
+        const thirtySecsAgo = new Date(Date.now() - 30 * 1000);
+        const stuckBatches = await db
+          .select({ id: schema.pipelineBatch.id })
+          .from(schema.pipelineBatch)
+          .where(
+            and(
+              eq(schema.pipelineBatch.status, "created"),
+              lt(schema.pipelineBatch.createdAt, thirtySecsAgo),
+            ),
+          );
+
+        for (const b of stuckBatches) {
+          log.info("Server", `Autonomous Heartbeat: Auto-dispatching unstarted Batch #${b.id}`);
+          await inngest.send({
+            name: "pipeline/batch.execute",
+            id: `pipeline-batch-${b.id}-${Date.now()}`,
+            data: { batchId: b.id },
+          });
+        }
+      } catch (err: any) {
+        log.warn("Server", `Autonomous background heartbeat warning: ${err?.message || err}`);
+      }
+    }, 60 * 1000);
   } catch (err: any) {
     log.error("Server", `Startup failed: ${err?.message || err}`);
     process.exit(1);

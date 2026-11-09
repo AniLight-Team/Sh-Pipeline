@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { Zap } from "lucide-react";
+import { Zap, Play, Loader2 } from "lucide-react";
 
 interface Batch {
   id: number;
@@ -17,6 +17,7 @@ interface Batch {
 
 export function BatchViewer() {
   const [batches, setBatches] = useState<Batch[]>([]);
+  const [executingId, setExecutingId] = useState<number | null>(null);
 
   const fetchBatches = async () => {
     try {
@@ -24,6 +25,16 @@ export function BatchViewer() {
       const data = await res.json();
       setBatches(data.batches || []);
     } catch {}
+  };
+
+  const handleExecuteBatch = async (batchId: number) => {
+    setExecutingId(batchId);
+    try {
+      await fetch(`/api/batches/${batchId}/execute`, { method: "POST" });
+      await fetchBatches();
+    } catch {} finally {
+      setExecutingId(null);
+    }
   };
 
   useEffect(() => {
@@ -75,19 +86,38 @@ export function BatchViewer() {
                     • {b.triggerReason.replace("_", " ")}
                   </span>
                 </div>
-                <span
-                  className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-full border ${
-                    b.status === "completed"
-                      ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/20"
-                      : b.status === "kernel_running"
-                      ? "bg-sky-500/20 text-sky-300 border-sky-500/30 animate-pulse"
-                      : b.status === "failed"
-                      ? "bg-rose-500/10 text-rose-300 border-rose-500/20"
-                      : "bg-white/[0.08] text-white border-white/10"
-                  }`}
-                >
-                  {b.status.toUpperCase()}
-                </span>
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded-full border ${
+                      b.status === "completed"
+                        ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/20"
+                        : b.status === "kernel_running"
+                        ? "bg-sky-500/20 text-sky-300 border-sky-500/30 animate-pulse"
+                        : b.status === "created"
+                        ? "bg-amber-500/10 text-amber-300 border-amber-500/20"
+                        : b.status === "failed"
+                        ? "bg-rose-500/10 text-rose-300 border-rose-500/20"
+                        : "bg-white/[0.08] text-white border-white/10"
+                    }`}
+                  >
+                    {b.status === "created" ? "PREPARING" : b.status.toUpperCase()}
+                  </span>
+                  {b.status === "created" && (
+                    <button
+                      onClick={() => handleExecuteBatch(b.id)}
+                      disabled={executingId === b.id}
+                      title="Dispatch to Kaggle GPU"
+                      className="px-2 py-0.5 text-[10px] font-mono font-bold rounded-full bg-white text-black hover:bg-neutral-200 flex items-center gap-1 transition-all active:scale-95 disabled:opacity-50"
+                    >
+                      {executingId === b.id ? (
+                        <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                      ) : (
+                        <Play className="w-2.5 h-2.5 fill-black" />
+                      )}
+                      <span>Run</span>
+                    </button>
+                  )}
+                </div>
               </div>
 
               <div className="text-[11px] text-neutral-400 font-mono truncate mb-1">

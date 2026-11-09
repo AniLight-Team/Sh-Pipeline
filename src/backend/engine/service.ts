@@ -632,7 +632,15 @@ export class PipelineEngineService {
       where: eq(schema.pipelineBatch.id, batchId),
     });
 
-    if (!batch) return;
+    if (!batch) {
+      log.warn("PipelineEngine", `Batch #${batchId} not found`);
+      return;
+    }
+
+    if (batch.status === "completed") {
+      log.info("PipelineEngine", `Batch #${batchId} already completed; skipping.`);
+      return;
+    }
 
     const jobs = await db
       .select()
@@ -642,7 +650,7 @@ export class PipelineEngineService {
     if (jobs.length === 0) {
       await db
         .update(schema.pipelineBatch)
-        .set({ status: "completed", completedAt: new Date() })
+        .set({ status: "completed", completedAt: new Date(), updatedAt: new Date() })
         .where(eq(schema.pipelineBatch.id, batchId));
       return;
     }
@@ -651,7 +659,12 @@ export class PipelineEngineService {
     const { kaggleAccounts, hfAccounts } = loadAccountsFromEnv();
 
     if (kaggleAccounts.length === 0) {
-      throw new Error("No Kaggle accounts available for GPU encoding");
+      const errMsg = "No Kaggle accounts available for GPU encoding";
+      await db
+        .update(schema.pipelineBatch)
+        .set({ status: "failed", lastError: errMsg, updatedAt: new Date() })
+        .where(eq(schema.pipelineBatch.id, batchId));
+      throw new Error(errMsg);
     }
 
     // Look up the pre-assigned Kaggle account or fall back
@@ -663,227 +676,260 @@ export class PipelineEngineService {
       account = kaggleAccounts[0];
     }
 
-    log.info(
-      "PipelineEngine",
-      `Executing Batch #${batchId} on Kaggle GPU (${account.username}) with ${jobs.length} jobs...`,
-    );
+    let datasetSlug = batch.datasetSlug || `kira-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
+    let kernelSlug = batch.kernelSlug || `enc-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
 
-    // Build batch manifest & upload items
-    const uploadItems: KiraBatchUploadItem[] = [];
-    const manifestItems: KiraBatchManifestItem[] = [];
+    try {
+      log.info(
+        "PipelineEngine",
+        `Executing Batch #${batchId} on Kaggle GPU (${account.username}) with ${jobs.length} jobs...`,
+      );
 
-    for (const job of jobs) {
-      if (!job.stagedFilePath || !fs.existsSync(job.stagedFilePath)) {
-        continue;
+      // Build batch manifest & upload items
+      const uploadItems: KiraBatchUploadItem[] = [];
+      const manifestItems: KiraBatchManifestItem[] = [];
+
+      for (const job of jobs) {
+        if (!job.stagedFilePath || !fs.existsSync(job.stagedFilePath)) {
+          continue;
+        }
+        const ext = path.extname(job.stagedFilePath);
+        const safeRel = `input_${job.id}${ext}`;
+        const sizeBytes = Number(job.sizeBytes || 0);
+
+        uploadItems.push({
+          jobId: job.id,
+          localFilePath: job.stagedFilePath,
+          remoteFilename: safeRel,
+          sizeBytes,
+        });
+
+        manifestItems.push({
+          jobId: job.id,
+          filename: safeRel,
+          animeId: job.animeId || job.anilistId || job.anidbId || 0,
+          anilistId: job.anilistId || undefined,
+          anidbId: job.anidbId || undefined,
+          episodeNumber: job.episodeNumber,
+          tracks: [["1080p", 0], ["720p", 0], ["480p", 0], ["360p", 0]],
+          hf: hfAccounts[0],
+        });
       }
-      const ext = path.extname(job.stagedFilePath);
-      const safeRel = `input_${job.id}${ext}`;
-      const sizeBytes = Number(job.sizeBytes || 0);
-
-      uploadItems.push({
-        jobId: job.id,
-        localFilePath: job.stagedFilePath,
-        remoteFilename: safeRel,
-        sizeBytes,
-      });
-
-      manifestItems.push({
-        jobId: job.id,
-        filename: safeRel,
-        animeId: job.animeId || job.anilistId || job.anidbId || 0,
-        anilistId: job.anilistId || undefined,
-        anidbId: job.anidbId || undefined,
-        episodeNumber: job.episodeNumber,
-        tracks: [["1080p", 0], ["720p", 0], ["480p", 0], ["360p", 0]],
-        hf: hfAccounts[0],
-      });
-    }
-
-    const datasetSlug = `kira-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
-    const kernelSlug = `enc-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
-
-    await db
-      .update(schema.pipelineBatch)
-      .set({
-        status: "uploading",
-        kaggleUsername: account.username,
-        datasetSlug,
-        kernelSlug,
-        startedAt: new Date(),
-        heartbeatAt: new Date(),
-      })
-      .where(eq(schema.pipelineBatch.id, batchId));
-
-    // Upload Dataset to Kaggle
-    log.info("PipelineEngine", `Uploading dataset ${datasetSlug} to Kaggle (${account.username})...`);
-    await videoManager.uploadBatchDatasetRest(
-      uploadItems,
-      datasetSlug,
-      account.username,
-      account.key,
-    );
-
-    // Push GPU Kernel
-    await db
-      .update(schema.pipelineBatch)
-      .set({ status: "kernel_running", heartbeatAt: new Date() })
-      .where(eq(schema.pipelineBatch.id, batchId));
-
-    log.info("PipelineEngine", `Pushing GPU kernel ${kernelSlug} to Kaggle (${account.username})...`);
-    await videoManager.pushBatchGpuKernel(
-      datasetSlug,
-      kernelSlug,
-      manifestItems,
-      account.username,
-      account.key,
-    );
-
-    // Poll kernel status
-    const kernelStartTime = Date.now();
-    let isComplete = false;
-
-    while (Date.now() - kernelStartTime < 6 * 3600 * 1000) {
-      await new Promise((r) => setTimeout(r, 60000)); // poll every 1 minute
-      const kStatus = await videoManager.checkKernelStatusOnce(kernelSlug, account.username, account.key);
-      const st = kStatus.state;
 
       await db
         .update(schema.pipelineBatch)
-        .set({ heartbeatAt: new Date() })
+        .set({
+          status: "uploading",
+          kaggleUsername: account.username,
+          datasetSlug,
+          kernelSlug,
+          startedAt: batch.startedAt || new Date(),
+          heartbeatAt: new Date(),
+          updatedAt: new Date(),
+        })
         .where(eq(schema.pipelineBatch.id, batchId));
 
-      log.info("PipelineEngine", `Kernel ${kernelSlug} [${account.username}] status: ${st} (${kStatus.rawStatus})`);
+      // Upload Dataset to Kaggle
+      log.info("PipelineEngine", `Uploading dataset ${datasetSlug} to Kaggle (${account.username})...`);
+      await videoManager.uploadBatchDatasetRest(
+        uploadItems,
+        datasetSlug,
+        account.username,
+        account.key,
+      );
 
-      if (st === "completed") {
-        isComplete = true;
-        break;
-      }
-      if (st === "failed") {
-        throw new Error(`Kaggle kernel finished with error status: ${kStatus.rawStatus}`);
-      }
-    }
+      // Push GPU Kernel
+      await db
+        .update(schema.pipelineBatch)
+        .set({ status: "kernel_running", heartbeatAt: new Date(), updatedAt: new Date() })
+        .where(eq(schema.pipelineBatch.id, batchId));
 
-    if (!isComplete) {
-      throw new Error("Kaggle kernel timed out after 6 hours");
-    }
+      log.info("PipelineEngine", `Pushing GPU kernel ${kernelSlug} to Kaggle (${account.username})...`);
+      await videoManager.pushBatchGpuKernel(
+        datasetSlug,
+        kernelSlug,
+        manifestItems,
+        account.username,
+        account.key,
+      );
 
-    // Fetch kernel output & upload to Hugging Face
-    log.info("PipelineEngine", `Downloading encoded outputs for Batch #${batchId}...`);
-    const output = await videoManager.fetchBatchKernelOutput(
-      kernelSlug,
-      account.username,
-      account.key,
-    );
+      // Poll kernel status
+      const kernelStartTime = Date.now();
+      let isComplete = false;
 
-    const records = output.records || [];
-    log.success("PipelineEngine", `Received ${records.length} encoded files. Uploading to Hugging Face...`);
+      while (Date.now() - kernelStartTime < 6 * 3600 * 1000) {
+        await new Promise((r) => setTimeout(r, 60000)); // poll every 1 minute
+        const kStatus = await videoManager.checkKernelStatusOnce(kernelSlug, account.username, account.key);
+        const st = kStatus.state;
 
-    // Group outputs by job
-    for (const job of jobs) {
-      const jobOutputs = records.filter((o) => {
-        if (o.job_id && o.job_id === job.id) return true;
-        const matchesAnime =
-          (job.anidbId && o.anime_id === job.anidbId) ||
-          (job.anilistId && o.anime_id === job.anilistId) ||
-          (job.animeId && o.anime_id === job.animeId);
-        return matchesAnime && o.episode_number === job.episodeNumber;
-      });
+        await db
+          .update(schema.pipelineBatch)
+          .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+          .where(eq(schema.pipelineBatch.id, batchId));
 
-      const sources = jobOutputs.map((o) => ({
-        quality: o.quality,
-        url: o.huggingface?.downloadUrl || "",
-        downloadUrl: o.huggingface?.downloadUrl || "",
-        sha256: o.sha256,
-      }));
+        log.info("PipelineEngine", `Kernel ${kernelSlug} [${account.username}] status: ${st} (${kStatus.rawStatus})`);
 
-      const subtitles = (job.subtitlesPayload as any[]) || [];
-
-      const resultPayload: PipelineEpisodeResult = {
-        jobId: job.id,
-        anilistId: job.anilistId,
-        animeId: job.animeId,
-        anidbId: job.anidbId,
-        episodeNumber: job.episodeNumber,
-        type: job.types.includes("dub") ? "dub" : "sub",
-        sources,
-        subtitles,
-        metadata: job.metadata || {},
-        completedAt: new Date().toISOString(),
-      };
-
-      // Deliver callback to Main Backend if configured (with retry & backoff)
-      if (job.callbackUrl) {
-        const maxAttempts = 5;
-        let delivered = false;
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          try {
-            log.info("PipelineEngine", `Calling callbackUrl for Job #${job.id} (attempt ${attempt}/${maxAttempts}): ${job.callbackUrl}`);
-            const res = await fetch(job.callbackUrl, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(resultPayload),
-            });
-            if (res.ok) {
-              log.info("PipelineEngine", `✓ Callback successfully delivered to Main Backend for Job #${job.id}`);
-              delivered = true;
-              break;
-            } else {
-              const statusText = await res.text().catch(() => "");
-              log.warn("PipelineEngine", `Callback HTTP ${res.status} for Job #${job.id}: ${statusText}`);
-            }
-          } catch (callErr: any) {
-            log.warn("PipelineEngine", `Callback delivery failed attempt ${attempt}/${maxAttempts} for Job #${job.id}: ${callErr?.message || callErr}`);
-          }
-          if (attempt < maxAttempts) {
-            const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 16000);
-            await new Promise((r) => setTimeout(r, delayMs));
-          }
+        if (st === "completed") {
+          isComplete = true;
+          break;
         }
-        if (!delivered) {
-          log.error("PipelineEngine", `Failed to deliver callback to ${job.callbackUrl} after ${maxAttempts} attempts. Result payload preserved in pipeline DB.`);
+        if (st === "failed") {
+          throw new Error(`Kaggle kernel finished with error status: ${kStatus.rawStatus}`);
         }
       }
 
-      // Revalidate cache on Main Backend if animeId or anilistId is known
-      const targetAnimeId = job.animeId || job.anilistId;
-      if (targetAnimeId) {
-        notifyMainBackendRevalidate({
-          animeId: targetAnimeId,
+      if (!isComplete) {
+        throw new Error("Kaggle kernel timed out after 6 hours");
+      }
+
+      // Fetch kernel output & upload to Hugging Face
+      log.info("PipelineEngine", `Downloading encoded outputs for Batch #${batchId}...`);
+      const output = await videoManager.fetchBatchKernelOutput(
+        kernelSlug,
+        account.username,
+        account.key,
+      );
+
+      const records = output.records || [];
+      log.success("PipelineEngine", `Received ${records.length} encoded files. Uploading to Hugging Face...`);
+
+      // Group outputs by job
+      for (const job of jobs) {
+        const jobOutputs = records.filter((o) => {
+          if (o.job_id && o.job_id === job.id) return true;
+          const matchesAnime =
+            (job.anidbId && o.anime_id === job.anidbId) ||
+            (job.anilistId && o.anime_id === job.anilistId) ||
+            (job.animeId && o.anime_id === job.animeId);
+          return matchesAnime && o.episode_number === job.episodeNumber;
+        });
+
+        const sources = jobOutputs.map((o) => ({
+          quality: o.quality,
+          url: o.huggingface?.downloadUrl || "",
+          downloadUrl: o.huggingface?.downloadUrl || "",
+          sha256: o.sha256,
+        }));
+
+        const subtitles = (job.subtitlesPayload as any[]) || [];
+
+        const resultPayload: PipelineEpisodeResult = {
+          jobId: job.id,
+          anilistId: job.anilistId,
+          animeId: job.animeId,
+          anidbId: job.anidbId,
           episodeNumber: job.episodeNumber,
-          airType: job.types.includes("dub") ? "dub" : "sub",
-        }).catch(() => {});
+          type: job.types.includes("dub") ? "dub" : "sub",
+          sources,
+          subtitles,
+          metadata: job.metadata || {},
+          completedAt: new Date().toISOString(),
+        };
+
+        // Deliver callback to Main Backend if configured (with retry & backoff)
+        if (job.callbackUrl) {
+          const maxAttempts = 5;
+          let delivered = false;
+          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+              log.info("PipelineEngine", `Calling callbackUrl for Job #${job.id} (attempt ${attempt}/${maxAttempts}): ${job.callbackUrl}`);
+              const res = await fetch(job.callbackUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(resultPayload),
+              });
+              if (res.ok) {
+                log.info("PipelineEngine", `✓ Callback successfully delivered to Main Backend for Job #${job.id}`);
+                delivered = true;
+                break;
+              } else {
+                const statusText = await res.text().catch(() => "");
+                log.warn("PipelineEngine", `Callback HTTP ${res.status} for Job #${job.id}: ${statusText}`);
+              }
+            } catch (callErr: any) {
+              log.warn("PipelineEngine", `Callback delivery failed attempt ${attempt}/${maxAttempts} for Job #${job.id}: ${callErr?.message || callErr}`);
+            }
+            if (attempt < maxAttempts) {
+              const delayMs = Math.min(1000 * Math.pow(2, attempt - 1), 16000);
+              await new Promise((r) => setTimeout(r, delayMs));
+            }
+          }
+          if (!delivered) {
+            log.error("PipelineEngine", `Failed to deliver callback to ${job.callbackUrl} after ${maxAttempts} attempts. Result payload preserved in pipeline DB.`);
+          }
+        }
+
+        // Revalidate cache on Main Backend if animeId or anilistId is known
+        const targetAnimeId = job.animeId || job.anilistId;
+        if (targetAnimeId) {
+          notifyMainBackendRevalidate({
+            animeId: targetAnimeId,
+            episodeNumber: job.episodeNumber,
+            airType: job.types.includes("dub") ? "dub" : "sub",
+          }).catch(() => {});
+        }
+
+        await db
+          .update(schema.pipelineJob)
+          .set({
+            status: "completed",
+            resultPayload,
+            completedAt: new Date(),
+            heartbeatAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.pipelineJob.id, job.id));
+
+        // Clean up staged file
+        if (job.stagedFilePath && fs.existsSync(job.stagedFilePath)) {
+          await fs.promises.unlink(job.stagedFilePath).catch(() => {});
+        }
       }
 
+      // Clean up Kaggle dataset & kernel
+      await videoManager.deleteKaggleDataset(datasetSlug, account.username, account.key).catch(() => {});
+      await videoManager.deleteKaggleKernel(kernelSlug, account.username, account.key).catch(() => {});
+
+      await db
+        .update(schema.pipelineBatch)
+        .set({
+          status: "completed",
+          completedAt: new Date(),
+          heartbeatAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.pipelineBatch.id, batchId));
+
+      log.success("PipelineEngine", `Batch #${batchId} completed successfully on Kaggle (${account.username})!`);
+    } catch (err: any) {
+      log.error("PipelineEngine", `Execution of Batch #${batchId} failed: ${err?.message || err}`);
+      await db
+        .update(schema.pipelineBatch)
+        .set({
+          status: "failed",
+          lastError: err?.message || String(err),
+          heartbeatAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.pipelineBatch.id, batchId));
+
+      // Also mark jobs as failed or retryable
       await db
         .update(schema.pipelineJob)
         .set({
-          status: "completed",
-          resultPayload,
-          completedAt: new Date(),
+          status: "failed",
+          lastError: `Batch #${batchId} failed: ${err?.message || err}`,
           heartbeatAt: new Date(),
+          updatedAt: new Date(),
         })
-        .where(eq(schema.pipelineJob.id, job.id));
+        .where(eq(schema.pipelineJob.batchId, batchId));
 
-      // Clean up staged file
-      if (job.stagedFilePath && fs.existsSync(job.stagedFilePath)) {
-        await fs.promises.unlink(job.stagedFilePath).catch(() => {});
-      }
+      // Attempt cleanup
+      await videoManager.deleteKaggleDataset(datasetSlug, account.username, account.key).catch(() => {});
+      await videoManager.deleteKaggleKernel(kernelSlug, account.username, account.key).catch(() => {});
+
+      throw err;
     }
-
-    // Clean up Kaggle dataset & kernel
-    await videoManager.deleteKaggleDataset(datasetSlug, account.username, account.key).catch(() => {});
-    await videoManager.deleteKaggleKernel(kernelSlug, account.username, account.key).catch(() => {});
-
-    await db
-      .update(schema.pipelineBatch)
-      .set({
-        status: "completed",
-        completedAt: new Date(),
-        heartbeatAt: new Date(),
-      })
-      .where(eq(schema.pipelineBatch.id, batchId));
-
-    log.success("PipelineEngine", `Batch #${batchId} completed successfully on Kaggle (${account.username})!`);
   }
 
   public static async getStats(): Promise<PipelineStats> {
