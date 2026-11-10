@@ -16,6 +16,7 @@ import {
   DEFAULT_DOWNLOAD_DIR,
   MAIN_BACKEND_URL,
   INTERNAL_SECRET,
+  KIRA_DISCOVERY_CONCURRENCY,
   KIRA_BATCH_WINDOW_MS,
   KIRA_QUEUE_IDLE_SETTLE_MS,
   KIRA_BATCH_SAFE_MAX_BYTES,
@@ -36,9 +37,11 @@ import {
 import { notifyMainBackendRevalidate } from "../utils/notifier.js";
 import type {
   AnimeToshoItem,
+  CandidateSelectionTier,
   EnqueueRequest,
   EnqueueResponse,
   PipelineEpisodeResult,
+  PipelineExecutionType,
   PipelineStats,
   KiraBatchManifestItem,
   KiraBatchUploadItem,
@@ -52,10 +55,15 @@ import { log } from "../utils/logger.js";
 let tablesInitialized = false;
 let lastWatchdogTimestamp: string | null = new Date().toISOString();
 
-// Dedicated VM direct-remux concurrency limiter so local FFmpeg container remuxing never overuses VM resources
+// Dedicated VM direct-remux concurrency limiter (Pipeline 1: H.264 -c:v copy)
 const vmRemuxQueue = new PQueue({ concurrency: KIRA_VM_MAX_CONCURRENT_BATCHES });
 
+// High-concurrency Stage 1 discovery & download queue for standalone fallback execution
+export const stage1DiscoveryQueue = new PQueue({ concurrency: KIRA_DISCOVERY_CONCURRENCY });
+
 export class PipelineEngineService {
+  public static readonly stage1DiscoveryQueue = stage1DiscoveryQueue;
+
   public static markWatchdogRun(): void {
     lastWatchdogTimestamp = new Date().toISOString();
   }
@@ -66,6 +74,7 @@ export class PipelineEngineService {
       await db.execute(sql`
         CREATE TABLE IF NOT EXISTS "pipeline_encoding_batch" (
           "id" bigserial PRIMARY KEY NOT NULL,
+          "pipeline_type" text DEFAULT 'kaggle_gpu' NOT NULL,
           "status" text DEFAULT 'created' NOT NULL,
           "trigger_reason" text DEFAULT 'window_30m' NOT NULL,
           "kaggle_username" text,
@@ -92,6 +101,14 @@ export class PipelineEngineService {
           "episode_number" integer NOT NULL,
           "types" jsonb NOT NULL,
           "status" text DEFAULT 'queued' NOT NULL,
+          "pipeline_type" text DEFAULT 'vm_remux' NOT NULL,
+          "selection_tier" text,
+          "release_group" text,
+          "video_codec" text,
+          "is_batch_torrent" boolean DEFAULT false NOT NULL,
+          "quality_count" integer DEFAULT 1 NOT NULL,
+          "staged_qualities" jsonb,
+          "qualities_payload" jsonb,
           "known_titles" jsonb,
           "metadata" jsonb,
           "callback_url" text,
@@ -115,16 +132,27 @@ export class PipelineEngineService {
       `);
 
       await db.execute(sql`
+        ALTER TABLE "pipeline_encoding_batch" ADD COLUMN IF NOT EXISTS "pipeline_type" text DEFAULT 'kaggle_gpu' NOT NULL;
         ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "anilist_id" integer;
         ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "anime_id" integer;
         ALTER TABLE "pipeline_encoding_job" ALTER COLUMN "anidb_id" DROP NOT NULL;
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "pipeline_type" text DEFAULT 'vm_remux' NOT NULL;
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "selection_tier" text;
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "release_group" text;
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "video_codec" text;
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "is_batch_torrent" boolean DEFAULT false NOT NULL;
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "quality_count" integer DEFAULT 1 NOT NULL;
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "staged_qualities" jsonb;
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "qualities_payload" jsonb;
       `);
 
       await db.execute(sql`
         CREATE INDEX IF NOT EXISTS "sh_pipeline_batch_status_idx" ON "pipeline_encoding_batch" ("status");
+        CREATE INDEX IF NOT EXISTS "sh_pipeline_batch_pipeline_type_idx" ON "pipeline_encoding_batch" ("pipeline_type", "status");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_batch_user_idx" ON "pipeline_encoding_batch" ("kaggle_username", "status");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_batch_heartbeat_idx" ON "pipeline_encoding_batch" ("status", "heartbeat_at");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_job_status_idx" ON "pipeline_encoding_job" ("status");
+        CREATE INDEX IF NOT EXISTS "sh_pipeline_job_pipeline_status_idx" ON "pipeline_encoding_job" ("status", "pipeline_type", "batch_id", "staged_at");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_job_anilist_idx" ON "pipeline_encoding_job" ("anilist_id", "episode_number");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_job_anime_idx" ON "pipeline_encoding_job" ("anime_id");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_job_anidb_idx" ON "pipeline_encoding_job" ("anidb_id", "episode_number");
@@ -132,7 +160,7 @@ export class PipelineEngineService {
       `);
 
       tablesInitialized = true;
-      log.success("PipelineEngine", "Pipeline tables verified.");
+      log.success("PipelineEngine", "Pipeline dual-pipeline tables & indexes verified.");
     } catch (err: any) {
       log.warn("PipelineEngine", `ensureTables: ${err?.message || err}`);
     }
@@ -171,10 +199,6 @@ export class PipelineEngineService {
   /**
    * Strictly checks whether the 56 GB staging limit (KIRA_MAX_STAGING_BYTES) or minimum free SSD floor
    * has been reached before allowing a new torrent download to start.
-   * Accounts for:
-   * 1. Physical staged files on disk + DB staged/encoding bytes
-   * 2. In-flight downloads currently in progress (reserving KIRA_PER_DOWNLOAD_RESERVE_BYTES per active download)
-   * 3. Underlying filesystem free space (KIRA_MIN_FREE_SSD_BYTES)
    */
   public static async checkStorageCapacityForDownload(excludeJobId?: number): Promise<{
     allowed: boolean;
@@ -273,15 +297,24 @@ export class PipelineEngineService {
    */
   public static async cleanupJobStagedFiles(job: {
     stagedFilePath?: string | null;
+    stagedQualities?: Partial<Record<VideoResolutionQuality, string>> | null;
     metadata?: Record<string, any> | null;
   }): Promise<void> {
     const pathsToDelete = new Set<string>();
     if (job.stagedFilePath) {
       pathsToDelete.add(job.stagedFilePath);
     }
-    const stagedQualities = job.metadata?.stagedQualities;
-    if (stagedQualities && typeof stagedQualities === "object") {
-      for (const p of Object.values(stagedQualities)) {
+    const sqDirect = job.stagedQualities;
+    if (sqDirect && typeof sqDirect === "object") {
+      for (const p of Object.values(sqDirect)) {
+        if (typeof p === "string" && p.trim()) {
+          pathsToDelete.add(p);
+        }
+      }
+    }
+    const stagedQualitiesMeta = job.metadata?.stagedQualities;
+    if (stagedQualitiesMeta && typeof stagedQualitiesMeta === "object") {
+      for (const p of Object.values(stagedQualitiesMeta)) {
         if (typeof p === "string" && p.trim()) {
           pathsToDelete.add(p);
         }
@@ -301,36 +334,56 @@ export class PipelineEngineService {
    */
   public static hasValidStagedFiles(job: {
     stagedFilePath?: string | null;
+    stagedQualities?: Partial<Record<VideoResolutionQuality, string>> | null;
     metadata?: Record<string, any> | null;
   }): boolean {
     if (!job.stagedFilePath || !fs.existsSync(job.stagedFilePath)) {
       return false;
     }
+    const sq = job.stagedQualities || job.metadata?.stagedQualities;
+    if (sq && typeof sq === "object") {
+      const paths = Object.values(sq).filter((p): p is string => typeof p === "string" && p.length > 0);
+      if (paths.length > 0 && !paths.some((p) => fs.existsSync(p))) {
+        return false;
+      }
+    }
     return true;
   }
 
   /**
-   * Helper to determine whether a job is marked for direct VM container/audio remuxing (no video re-encode).
+   * Helper to determine whether a job belongs to Pipeline 1: VM Direct-Remux (-c:v copy)
+   * vs Pipeline 2: Kaggle Dual-T4 GPU Encode.
    */
-  public static isJobVmRemux(job: { metadata?: Record<string, any> | null }): boolean {
-    return job.metadata?.processingMode === "vm_remux";
+  public static isJobVmRemux(job: {
+    pipelineType?: string | null;
+    metadata?: Record<string, any> | null;
+  }): boolean {
+    if (job.metadata?.processingMode === "kaggle_gpu" || job.pipelineType === "kaggle_gpu") {
+      if (job.metadata?.processingMode === "vm_remux") return true;
+      if (job.metadata?.processingMode === "kaggle_gpu") return false;
+      return false;
+    }
+    return job.pipelineType === "vm_remux" || job.metadata?.processingMode === "vm_remux";
   }
 
   /**
-   * Helper to determine whether a batch is a local VM direct-remux batch rather than a Kaggle GPU batch.
+   * Helper to determine whether a batch is a Pipeline 1 VM Direct-Remux batch rather than a Pipeline 2 Kaggle GPU batch.
    */
   public static isBatchVmRemux(batch: {
+    pipelineType?: string | null;
     kaggleUsername?: string | null;
     triggerReason?: string | null;
   }): boolean {
     return (
+      batch.pipelineType === "vm_remux" ||
       batch.kaggleUsername === "local-vm" ||
       Boolean(batch.triggerReason && batch.triggerReason.startsWith("vm_remux"))
     );
   }
 
   /**
-   * Enqueues one or more episodes for torrent discovery, subtitle extraction, and VM Remux / GPU batch encoding.
+   * Enqueues one or more episodes for high-concurrency torrent discovery, 1080p R2 subtitle extraction,
+   * and routing into Pipeline 1 (VM Direct Remux) or Pipeline 2 (Kaggle GPU Encode).
    */
   public static async enqueue(req: EnqueueRequest): Promise<EnqueueResponse> {
     await this.ensureTables();
@@ -443,6 +496,7 @@ export class PipelineEngineService {
           episodeNumber: ep,
           types: normalizedTypes,
           status: "queued",
+          pipelineType: "vm_remux",
           knownTitles,
           metadata: {
             ...metadata,
@@ -474,6 +528,12 @@ export class PipelineEngineService {
 
   /**
    * Downloads a single episode file from a torrent candidate via Transmission and moves it into stagingDir.
+   * CRITICAL BATCH-EXTRACTION GUARDRAIL:
+   * - Always prefers solo single-file episode torrents.
+   * - If a candidate is a batch torrent (`isBatch` or `tFiles.length > 1`), it strictly extracts ONLY the
+   *   target episode file (`selectOnlyFiles(tId, [wantedIdx], tFiles.length)`).
+   * - If the batch torrent is a single monolithic combined file or archive where 1 episode cannot be isolated,
+   *   it immediately aborts and removes the torrent (`no fallback to download the whole batch`).
    */
   private static async downloadCandidateEpisodeToStaging(params: {
     jobId: number;
@@ -486,7 +546,14 @@ export class PipelineEngineService {
     stagingDir: string;
     enforceHardCapBeforeStart: boolean;
   }): Promise<
-    | { ok: true; stagedPath: string; sizeBytes: number; magnetUri: string }
+    | {
+        ok: true;
+        stagedPath: string;
+        sizeBytes: number;
+        magnetUri: string;
+        isBatchExtracted: boolean;
+        fileIndex: number;
+      }
     | { ok: false; pausedForCapacity?: boolean; reason: string }
   > {
     const {
@@ -506,15 +573,29 @@ export class PipelineEngineService {
       return { ok: false, reason: "Missing magnet_uri and torrent_url" };
     }
 
+    const parsedCandidateTitle = ReleaseFilter.parseTitle(candidate.title || "", knownTitles, candidate);
+
     let tId: number | null = null;
     try {
-      const tInfo = await transmission.addTorrent(magnetUri, DEFAULT_DOWNLOAD_DIR);
+      const tInfo = await transmission.addTorrent(magnetUri, DEFAULT_DOWNLOAD_DIR, false);
       tId = tInfo.id;
 
       const metaStatus = await transmission.waitForMetadata(tId);
       const tFiles = metaStatus.files || [];
       const dlDir = metaStatus.downloadDir || DEFAULT_DOWNLOAD_DIR;
+      const isMultiFile = tFiles.length > 1;
+      const isMarkedBatch = Boolean(parsedCandidateTitle.isBatch || parsedCandidateTitle.epRange !== null);
 
+      // Guardrail 1: If a torrent is marked as a batch/range pack, it MUST have multiple files so we can extract 1 episode.
+      // Never download a monolithic 1-file season pack!
+      if (isMarkedBatch && !isMultiFile) {
+        await transmission.removeTorrent(tId, true).catch(() => {});
+        throw new TorrentEntryNotFoundException(
+          `Batch torrent '${candidate.title}' is a single monolithic file (cannot selectively extract Ep ${episodeNumber}); skipping to next candidate`,
+        );
+      }
+
+      // Immediately isolate the target episode file before allowing bulk piece transfer
       const epMap = ReleaseFilter.matchFilesToEpisodes(tFiles, {
         knownTitles,
         targetEp: episodeNumber,
@@ -524,14 +605,27 @@ export class PipelineEngineService {
       if (!epMap.has(episodeNumber)) {
         await transmission.removeTorrent(tId, true).catch(() => {});
         throw new TorrentEntryNotFoundException(
-          `Ep ${episodeNumber} not found in torrent ${candidate.title}`,
+          `Ep ${episodeNumber} could not be selectively isolated in torrent '${candidate.title}' (${tFiles.length} files)`,
         );
       }
 
       const [wantedIdx, relPath] = epMap.get(episodeNumber)!;
       const wantedFileBytes = Number(tFiles[wantedIdx]?.length || candidate.size || 0);
 
-      // Gate 2: Verify exact torrent file size against 56 GB cap before starting actual data transfer
+      // Guardrail 2: If this is a multi-file batch torrent, immediately deselect ALL other files BEFORE downloading
+      if (isMultiFile) {
+        await transmission.selectOnlyFiles(tId, [wantedIdx], tFiles.length);
+      }
+
+      // Guardrail 3: Reject abnormally huge single files (> 4.5 GB) from batch torrents
+      if ((isMarkedBatch || isMultiFile) && wantedFileBytes > 4.5 * 1024 * 1024 * 1024) {
+        await transmission.removeTorrent(tId, true).catch(() => {});
+        throw new TorrentEntryNotFoundException(
+          `Matched file in batch '${candidate.title}' is ${(wantedFileBytes / (1024 * 1024 * 1024)).toFixed(2)} GB (exceeds single-episode safety threshold)`,
+        );
+      }
+
+      // Gate 2: Verify exact wanted episode file size against 56 GB cap before data transfer completes
       if (enforceHardCapBeforeStart && wantedFileBytes > 0) {
         const capNow = await this.checkStorageCapacityForDownload(jobId);
         if (capNow.usedBytes > 0 && capNow.usedBytes + wantedFileBytes > KIRA_MAX_STAGING_BYTES) {
@@ -548,11 +642,6 @@ export class PipelineEngineService {
       }
 
       const fullPath = path.join(dlDir, relPath);
-      const fileAlreadyExists = fs.existsSync(fullPath) && fs.statSync(fullPath).size > 1024;
-      if (!fileAlreadyExists && tFiles.length > 1) {
-        await transmission.selectOnlyFiles(tId, [wantedIdx], tFiles.length);
-      }
-
       await transmission.startTorrent(tId);
       await transmission.waitForCompletion(tId, {
         wantedFileIndex: wantedIdx,
@@ -575,10 +664,16 @@ export class PipelineEngineService {
       }
 
       const sizeBytes = fs.statSync(stagedPath).size;
-      // For single-file torrents, delete local data; for multi-episode batch packs, preserve any sibling files
-      await transmission.removeTorrent(tId, tFiles.length <= 1).catch(() => {});
+      await transmission.removeTorrent(tId, !tInfo.isDuplicate).catch(() => {});
 
-      return { ok: true, stagedPath, sizeBytes, magnetUri };
+      return {
+        ok: true,
+        stagedPath,
+        sizeBytes,
+        magnetUri,
+        isBatchExtracted: isMultiFile || isMarkedBatch,
+        fileIndex: wantedIdx,
+      };
     } catch (err: any) {
       if (tId) {
         await transmission.removeTorrent(tId, true).catch(() => {});
@@ -588,17 +683,24 @@ export class PipelineEngineService {
   }
 
   /**
-   * Stage 1:
+   * Common High-Concurrency Stage 1:
    * 1. Enforces the 56 GB staging limit (KIRA_MAX_STAGING_BYTES) before starting any download.
-   * 2. Discovers candidate bundles across Tsukihime and AnimeTosho (all resolutions), prioritizing H.264 releases
-   *    (including WEB-DL H.264) so GPU re-encoding is ONLY used when no H.264 release exists (only HEVC/AV1).
-   * 3. Downloads the 1080p primary release, extracts & uploads subtitles to R2 ONLY from the 1080p version.
-   * 4. When the release is H.264, also downloads the 720p and 480p versions from the exact same release group
-   *    and routes the job to the dedicated VM Direct-Remux batch pipeline (`vm_remux`).
+   * 2. Discovers all candidate torrents across Tsukihime & AnimeTosho in parallel.
+   * 3. Evaluates the 3-Tier Deterministic Waterfall (always preferring Solo releases over Batch packs):
+   *    - Tier 1 (`h264_multi` -> Pipeline 1 `vm_remux`): 1080p H.264 group that ALSO has 720p and/or 480p from the same group.
+   *      If the first 1080p H.264 group lacks 720p/480p, goes back to 1080p candidates to pick another H.264 group that has them.
+   *    - Tier 2 (`h264_single_1080p` -> Pipeline 1 `vm_remux`, 1 quality only): If no H.264 group has lower qualities,
+   *      picks the best 1080p H.264 release and ONLY processes 1 quality (1080p).
+   *    - Tier 3 (`hevc_av1_gpu` -> Pipeline 2 `kaggle_gpu`): If no H.264 release exists at all, picks the best 1080p HEVC/AV1
+   *      release and routes to the Kaggle GPU batch pipeline.
+   * 4. Extracts & uploads subtitles to Cloudflare R2 strictly from the 1080p version.
+   * 5. For Tier 1 (`h264_multi`), downloads same-group 720p & 480p in parallel!
    */
   public static async discoverAndStageJob(jobId: number): Promise<{
     status: "staged" | "download_paused" | "failed";
     jobId: number;
+    pipelineType?: PipelineExecutionType;
+    selectionTier?: CandidateSelectionTier;
     sizeBytes?: number;
     error?: string;
   }> {
@@ -637,7 +739,6 @@ export class PipelineEngineService {
         })
         .where(eq(schema.pipelineJob.id, jobId));
 
-      // Trigger immediate batch sealing so staged episodes flush and free SSD space
       await this.sealAvailableBatches({
         forceFlush: true,
         triggerReason: "storage_limit_56gb",
@@ -670,7 +771,7 @@ export class PipelineEngineService {
     try {
       log.info(
         "PipelineEngine",
-        `Searching Tsukihime & AnimeTosho for Job #${job.id} (AniList ${job.anilistId || "n/a"} | AniDB ${job.anidbId || "n/a"} Ep ${job.episodeNumber} [${job.types.join("/")}])...`,
+        `[Stage 1 Discovery] Job #${job.id} (AniList ${job.anilistId || "n/a"} | AniDB ${job.anidbId || "n/a"} Ep ${job.episodeNumber} [${job.types.join("/")}])...`,
       );
 
       const wantsDub = job.types.includes("dub");
@@ -725,7 +826,7 @@ export class PipelineEngineService {
           {
             knownTitles: effectiveKnownTitles,
             totalExpectedEps,
-            maxBundles: 4,
+            maxBundles: 5,
           },
         );
         if (bundles.length === 0 && wantsSub && wantsDub) {
@@ -736,7 +837,7 @@ export class PipelineEngineService {
             {
               knownTitles: effectiveKnownTitles,
               totalExpectedEps,
-              maxBundles: 4,
+              maxBundles: 5,
             },
           );
         }
@@ -795,7 +896,6 @@ export class PipelineEngineService {
       };
 
       const searchByAnidbId = async (aid: number) => {
-        // Fetch all-resolution feed ("") as well as "1080p" so 1080p, 720p, and 480p from the same group are discovered together
         const [allResItems, hdItems] = await Promise.all([
           AnimeToshoClient.fetchTorrents(aid, "", opts),
           AnimeToshoClient.fetchTorrents(aid, "1080p", opts),
@@ -814,11 +914,11 @@ export class PipelineEngineService {
         }
       };
 
-      // 2. Search AnimeTosho via job's AniDB ID if present (or if Tsukihime didn't already provide a multi-quality H.264 bundle)
-      const hasMultiQualityH264 = topBundles.some(
-        (b) => b.isH264 && Object.keys(b.qualities).length >= 2,
+      // 2. If Tsukihime didn't already give us a Solo Tier 1 (h264_multi) bundle, also query AnimeTosho so we find all 720p/480p siblings
+      const hasSoloMultiQualityH264 = topBundles.some(
+        (b) => b.selectionTier === "h264_multi" && b.isSolo,
       );
-      if (job.anidbId && !hasMultiQualityH264) {
+      if (job.anidbId && !hasSoloMultiQualityH264) {
         await searchByAnidbId(job.anidbId);
       }
 
@@ -828,7 +928,11 @@ export class PipelineEngineService {
         (topBundles.length === 0 && job.anilistId
           ? await AnimeMetadataResolver.resolveAnimapAnidbId(job.anilistId)
           : null);
-      if (canonicalAnidb && canonicalAnidb !== job.anidbId && !topBundles.some((b) => b.isH264 && Object.keys(b.qualities).length >= 2)) {
+      if (
+        canonicalAnidb &&
+        canonicalAnidb !== job.anidbId &&
+        !topBundles.some((b) => b.selectionTier === "h264_multi" && b.isSolo)
+      ) {
         log.info(
           "PipelineEngine",
           `[Job #${job.id}] Searching AnimeTosho via canonical AniDB #${canonicalAnidb} for AniList #${job.anilistId || "n/a"}...`,
@@ -877,17 +981,20 @@ export class PipelineEngineService {
       let primarySizeBytes = 0;
       let primaryMagnet = "";
       let primaryQuality: VideoResolutionQuality = "1080p";
+      let isBatchExtracted = false;
+      const qualitiesPayload: Record<string, any> = {};
       let lastCandidateErr: any = null;
 
-      // Try up to top 3 candidate bundles in order
-      for (let bIdx = 0; bIdx < Math.min(3, topBundles.length); bIdx++) {
+      // Try up to top 4 candidate bundles in strict waterfall order:
+      // Solo Tier 1 (h264_multi) -> Solo Tier 2 (h264_single_1080p) -> Solo Tier 3 (hevc_av1_gpu) -> Selective-Batch fallbacks
+      for (let bIdx = 0; bIdx < Math.min(4, topBundles.length); bIdx++) {
         const bundle = topBundles[bIdx];
         const primaryEntry = bundle.primaryEntry;
         const qualList = (Object.keys(bundle.qualities) as VideoResolutionQuality[]).join("/");
 
         log.info(
           "PipelineEngine",
-          `[Job #${job.id}] Trying bundle ${bIdx + 1}/${Math.min(3, topBundles.length)} [group=${bundle.group}, codec=${bundle.isH264 ? "H.264 (direct-remux)" : "HEVC/AV1 (gpu-encode)"}, qualities=${qualList}]: ${primaryEntry.item.title}`,
+          `[Job #${job.id}] Trying bundle ${bIdx + 1}/${Math.min(4, topBundles.length)} [tier=${bundle.selectionTier}, pipeline=${bundle.pipelineType}, solo=${bundle.isSolo}, group=${bundle.group}, qualities=${qualList}]: ${primaryEntry.item.title}`,
         );
 
         const dlRes = await this.downloadCandidateEpisodeToStaging({
@@ -908,6 +1015,14 @@ export class PipelineEngineService {
           primarySizeBytes = dlRes.sizeBytes;
           primaryMagnet = dlRes.magnetUri;
           primaryQuality = primaryEntry.quality;
+          isBatchExtracted = dlRes.isBatchExtracted;
+          qualitiesPayload[primaryQuality] = {
+            title: primaryEntry.item.title,
+            magnet: dlRes.magnetUri,
+            sizeBytes: dlRes.sizeBytes,
+            isBatchExtracted: dlRes.isBatchExtracted,
+            fileIndex: dlRes.fileIndex,
+          };
           break;
         }
 
@@ -970,123 +1085,167 @@ export class PipelineEngineService {
         tracksConfig = wantsDub && !wantsSub ? [["dub", 0]] : [["sub", 0]];
       }
 
-      // Extract & upload subtitles to Cloudflare R2 ONLY from the primary (1080p) version!
-      const taskToken = crypto.randomUUID().slice(0, 8);
-      const tempSubsDir = path.join(stagingDir, `subs_${taskToken}`);
-      await fs.promises.mkdir(tempSubsDir, { recursive: true });
-
-      const r2SubRecords: R2SubtitleRecord[] = [];
-      try {
-        const extractedSubs = await subtitles.extractSubtitlesFromMkv(primaryStagedPath, tempSubsDir);
-        if (extractedSubs.length > 0) {
-          const animeIdForPath = job.animeId || job.anilistId || job.anidbId || job.id;
-          for (const [trackType] of tracksConfig) {
-            const uploaded = await subtitles.uploadSubtitles(
-              extractedSubs,
-              animeIdForPath,
-              job.episodeNumber,
-              trackType,
-            );
-            r2SubRecords.push(...uploaded);
-          }
-          log.info(
-            "PipelineEngine",
-            `Job #${job.id}: Extracted & uploaded ${r2SubRecords.length} subtitle track(s) from ${primaryQuality} source only.`,
-          );
-        }
-      } finally {
-        await fs.promises.rm(tempSubsDir, { recursive: true, force: true }).catch(() => {});
-      }
-
       const stagedQualities: Partial<Record<VideoResolutionQuality, string>> = {
         [primaryQuality]: primaryStagedPath,
       };
       let totalJobBytes = primarySizeBytes;
 
-      // Determine whether this job uses Direct VM Container/Audio Remux ("vm_remux") or Kaggle GPU Re-encode ("kaggle_gpu")
-      // Re-encoding is ONLY required when there are no H.264 releases (i.e. only H.265/HEVC or AV1).
-      const processingMode: "vm_remux" | "kaggle_gpu" = isBrowserCompatibleH264
+      // Determine final Pipeline Route ("vm_remux" vs "kaggle_gpu") & Selection Tier
+      const processingMode: PipelineExecutionType = isBrowserCompatibleH264
         ? "vm_remux"
         : "kaggle_gpu";
 
-      // If H.264 (vm_remux), also download the same-group 720p and 480p releases so all available qualities
-      // from the exact same group can be remuxed directly to MP4 without video re-encoding!
-      if (processingMode === "vm_remux") {
-        const siblingQualities: VideoResolutionQuality[] = ["720p", "480p"];
-        for (const siblingQ of siblingQualities) {
-          if (siblingQ === primaryQuality) continue;
-          const siblingEntry = selectedBundle.qualities[siblingQ];
-          if (!siblingEntry) continue;
+      let effectiveSelectionTier: CandidateSelectionTier = isBrowserCompatibleH264
+        ? selectedBundle.selectionTier
+        : "hevc_av1_gpu";
 
-          // Respect 56 GB cap before downloading additional resolution sibling
-          const sibCap = await this.checkStorageCapacityForDownload(job.id);
-          if (!sibCap.allowed) {
-            log.warn(
+      // Run 1080p R2 subtitle extraction AND (if Tier 1 h264_multi) parallel sibling 720p/480p downloads concurrently!
+      const extract1080pSubtitlesTask = async (): Promise<R2SubtitleRecord[]> => {
+        const taskToken = crypto.randomUUID().slice(0, 8);
+        const tempSubsDir = path.join(stagingDir, `subs_${taskToken}`);
+        await fs.promises.mkdir(tempSubsDir, { recursive: true });
+        const records: R2SubtitleRecord[] = [];
+        try {
+          const extractedSubs = await subtitles.extractSubtitlesFromMkv(primaryStagedPath!, tempSubsDir);
+          if (extractedSubs.length > 0) {
+            const animeIdForPath = job.animeId || job.anilistId || job.anidbId || job.id;
+            for (const [trackType] of tracksConfig) {
+              const uploaded = await subtitles.uploadSubtitles(
+                extractedSubs,
+                animeIdForPath,
+                job.episodeNumber,
+                trackType,
+              );
+              records.push(...uploaded);
+            }
+            log.info(
               "PipelineEngine",
-              `[Job #${job.id}] Skipping optional ${siblingQ} sibling download to respect 56 GB cap (${sibCap.reason})`,
-            );
-            break;
-          }
-
-          log.info(
-            "PipelineEngine",
-            `[Job #${job.id}] Downloading same-group (${selectedBundle.group}) ${siblingQ} release: ${siblingEntry.item.title}`,
-          );
-
-          const sibDl = await this.downloadCandidateEpisodeToStaging({
-            jobId: job.id,
-            episodeNumber: job.episodeNumber,
-            knownTitles: effectiveKnownTitles,
-            candidate: siblingEntry.item,
-            effectiveEp: siblingEntry.effectiveEp,
-            qualityTag: siblingQ,
-            transmission,
-            stagingDir,
-            enforceHardCapBeforeStart: true,
-          });
-
-          if (sibDl.ok) {
-            // Verify sibling is also H.264 compatible
-            try {
-              const sibProbe = await inspectMkvStreamsSync(sibDl.stagedPath);
-              if (sibProbe.videoCodec && !sibProbe.isBrowserCompatibleH264) {
-                log.warn(
-                  "PipelineEngine",
-                  `[Job #${job.id}] Sibling ${siblingQ} is ${sibProbe.videoCodec} (not 8-bit H.264); discarding sibling file.`,
-                );
-                await fs.promises.unlink(sibDl.stagedPath).catch(() => {});
-                continue;
-              }
-            } catch {}
-
-            stagedQualities[siblingQ] = sibDl.stagedPath;
-            totalJobBytes += sibDl.sizeBytes;
-            log.success(
-              "PipelineEngine",
-              `[Job #${job.id}] Same-group ${siblingQ} staged (${(sibDl.sizeBytes / (1024 * 1024)).toFixed(1)} MB) — subtitles skipped (1080p only).`,
-            );
-          } else {
-            log.warn(
-              "PipelineEngine",
-              `[Job #${job.id}] Same-group ${siblingQ} download skipped: ${sibDl.reason}`,
+              `Job #${job.id}: Extracted & uploaded ${records.length} subtitle track(s) from ${primaryQuality} source only.`,
             );
           }
+        } finally {
+          await fs.promises.rm(tempSubsDir, { recursive: true, force: true }).catch(() => {});
         }
+        return records;
+      };
+
+      const downloadSiblingQualitiesTask = async (): Promise<void> => {
+        // Only download 720p/480p siblings when in Tier 1 (h264_multi) and primary is verified H.264!
+        // In Tier 2 (h264_single_1080p), we strictly only process 1 quality (1080p).
+        if (processingMode !== "vm_remux" || effectiveSelectionTier !== "h264_multi") {
+          return;
+        }
+
+        const siblingQualities: VideoResolutionQuality[] = (["720p", "480p"] as VideoResolutionQuality[]).filter(
+          (q) => q !== primaryQuality && Boolean(selectedBundle!.qualities[q]),
+        );
+
+        if (siblingQualities.length === 0) return;
+
+        // Check 56 GB capacity before launching parallel sibling downloads
+        const sibCap = await this.checkStorageCapacityForDownload(job.id);
+        if (!sibCap.allowed) {
+          log.warn(
+            "PipelineEngine",
+            `[Job #${job.id}] Skipping optional 720p/480p siblings to respect 56 GB cap (${sibCap.reason})`,
+          );
+          return;
+        }
+
+        await Promise.all(
+          siblingQualities.map(async (siblingQ) => {
+            const siblingEntry = selectedBundle!.qualities[siblingQ];
+            if (!siblingEntry) return;
+
+            log.info(
+              "PipelineEngine",
+              `[Job #${job.id}] Downloading same-group (${selectedBundle!.group}) ${siblingQ} release in parallel: ${siblingEntry.item.title}`,
+            );
+
+            const sibDl = await this.downloadCandidateEpisodeToStaging({
+              jobId: job.id,
+              episodeNumber: job.episodeNumber,
+              knownTitles: effectiveKnownTitles,
+              candidate: siblingEntry.item,
+              effectiveEp: siblingEntry.effectiveEp,
+              qualityTag: siblingQ,
+              transmission,
+              stagingDir,
+              enforceHardCapBeforeStart: true,
+            });
+
+            if (sibDl.ok) {
+              try {
+                const sibProbe = await inspectMkvStreamsSync(sibDl.stagedPath);
+                if (sibProbe.videoCodec && !sibProbe.isBrowserCompatibleH264) {
+                  log.warn(
+                    "PipelineEngine",
+                    `[Job #${job.id}] Sibling ${siblingQ} is ${sibProbe.videoCodec} (not 8-bit H.264); discarding sibling file.`,
+                  );
+                  await fs.promises.unlink(sibDl.stagedPath).catch(() => {});
+                  return;
+                }
+              } catch {}
+
+              stagedQualities[siblingQ] = sibDl.stagedPath;
+              totalJobBytes += sibDl.sizeBytes;
+              if (sibDl.isBatchExtracted) {
+                isBatchExtracted = true;
+              }
+              qualitiesPayload[siblingQ] = {
+                title: siblingEntry.item.title,
+                magnet: sibDl.magnetUri,
+                sizeBytes: sibDl.sizeBytes,
+                isBatchExtracted: sibDl.isBatchExtracted,
+                fileIndex: sibDl.fileIndex,
+              };
+              log.success(
+                "PipelineEngine",
+                `[Job #${job.id}] Same-group ${siblingQ} staged (${(sibDl.sizeBytes / (1024 * 1024)).toFixed(1)} MB) — subtitles skipped (1080p only).`,
+              );
+            } else {
+              log.warn(
+                "PipelineEngine",
+                `[Job #${job.id}] Same-group ${siblingQ} download skipped: ${sibDl.reason}`,
+              );
+            }
+          }),
+        );
+      };
+
+      const [r2SubRecords] = await Promise.all([
+        extract1080pSubtitlesTask(),
+        downloadSiblingQualitiesTask(),
+      ]);
+
+      const stagedQualityList = Object.keys(stagedQualities) as VideoResolutionQuality[];
+      if (processingMode === "vm_remux" && stagedQualityList.length === 1) {
+        effectiveSelectionTier = "h264_single_1080p";
       }
 
       const updatedMetadata = {
         ...(job.metadata || {}),
         processingMode,
+        selectionTier: effectiveSelectionTier,
         releaseGroup: selectedBundle.group,
         videoCodec: detectedVideoCodec,
+        isBatchTorrent: isBatchExtracted,
         stagedQualities,
-        availableQualities: Object.keys(stagedQualities),
+        availableQualities: stagedQualityList,
       };
 
       await db
         .update(schema.pipelineJob)
         .set({
           status: "staged",
+          pipelineType: processingMode,
+          selectionTier: effectiveSelectionTier,
+          releaseGroup: selectedBundle.group,
+          videoCodec: detectedVideoCodec,
+          isBatchTorrent: isBatchExtracted,
+          qualityCount: stagedQualityList.length,
+          stagedQualities,
+          qualitiesPayload,
           stagedFilePath: primaryStagedPath,
           sizeBytes: totalJobBytes,
           tracksConfig,
@@ -1103,10 +1262,16 @@ export class PipelineEngineService {
 
       log.success(
         "PipelineEngine",
-        `Job #${job.id} staged on SSD [${processingMode.toUpperCase()} | group=${selectedBundle.group} | qualities=${Object.keys(stagedQualities).join("/")}]: ${(totalJobBytes / (1024 * 1024)).toFixed(1)} MB (tracks: ${tracksConfig.map((t) => t[0]).join("+")})`,
+        `Job #${job.id} staged on SSD [pipeline=${processingMode.toUpperCase()} | tier=${effectiveSelectionTier} | group=${selectedBundle.group} | qualities=${stagedQualityList.join("/")} (${stagedQualityList.length})]: ${(totalJobBytes / (1024 * 1024)).toFixed(1)} MB`,
       );
 
-      return { status: "staged", jobId, sizeBytes: totalJobBytes };
+      return {
+        status: "staged",
+        jobId,
+        pipelineType: processingMode,
+        selectionTier: effectiveSelectionTier,
+        sizeBytes: totalJobBytes,
+      };
     } catch (err: any) {
       await db
         .update(schema.pipelineJob)
@@ -1143,6 +1308,7 @@ export class PipelineEngineService {
       db
         .select({
           id: schema.pipelineJob.id,
+          pipelineType: schema.pipelineJob.pipelineType,
           sizeBytes: schema.pipelineJob.sizeBytes,
           stagedAt: schema.pipelineJob.stagedAt,
           stagedFilePath: schema.pipelineJob.stagedFilePath,
@@ -1198,9 +1364,8 @@ export class PipelineEngineService {
 
   /**
    * Determines whether the current staged window should be sealed into a batch.
-   * Note: VM direct-remux jobs (`stagedRemuxCount > 0`) are always ready to seal immediately into a dedicated VM batch
-   * (up to `KIRA_VM_MAX_CONCURRENT_BATCHES`), while Kaggle GPU re-encode jobs respect the 10-file / 10 GB / 30m window /
-   * queue-drain / 56 GB storage pressure triggers.
+   * - Pipeline 1 (`stagedRemuxCount > 0`): Always ready to seal immediately into a dedicated VM Direct-Remux batch.
+   * - Pipeline 2 (`stagedGpuCount > 0`): Seals when 10 files / 10 GB / 30m window / queue-drain / 56 GB pressure is reached.
    */
   public static async evaluateBatchSealReadiness(forceFlush = false): Promise<{
     shouldSeal: boolean;
@@ -1216,7 +1381,7 @@ export class PipelineEngineService {
       return { shouldSeal: true, reason: "manual_flush", stats };
     }
 
-    // 1. Any H.264 VM direct-remux job can be sealed immediately into a VM Remux batch
+    // 1. Pipeline 1: Any H.264 VM direct-remux job seals immediately into a VM Remux batch
     if (stats.stagedRemuxCount > 0) {
       return { shouldSeal: true, reason: "vm_remux_ready", stats };
     }
@@ -1227,6 +1392,7 @@ export class PipelineEngineService {
       return { shouldSeal: true, reason: "storage_pressure_56gb", stats };
     }
 
+    // 3. Pipeline 2: Kaggle GPU batch triggers
     if (stats.stagedGpuCount >= KIRA_BATCH_MAX_ITEMS) {
       return { shouldSeal: true, reason: "file_limit_10", stats };
     }
@@ -1251,10 +1417,9 @@ export class PipelineEngineService {
   }
 
   /**
-   * Atomically seals a separate VM Direct-Remux batch (`kaggleUsername = "local-vm"`) for staged H.264 jobs.
-   * Strictly enforces `KIRA_VM_MAX_CONCURRENT_BATCHES` (1 active VM batch at a time) and
-   * `KIRA_VM_BATCH_MAX_ITEMS` (5 jobs) / `KIRA_VM_BATCH_SAFE_MAX_BYTES` (6 GB) so local FFmpeg container/audio
-   * conversion never overuses VM resources.
+   * Pipeline 1 Batch Sealer:
+   * Atomically seals a separate VM Direct-Remux batch (`pipelineType = "vm_remux"`, `kaggleUsername = "local-vm"`)
+   * for staged H.264 jobs (both `h264_multi` and `h264_single_1080p`).
    */
   public static async sealVmRemuxBatch(options: {
     triggerReason?: string;
@@ -1272,23 +1437,25 @@ export class PipelineEngineService {
         return { batchId: null, jobCount: 0, totalBytes: 0 };
       }
 
-      const activeVmBatches = await tx
+      const activeBatches = await tx
         .select({
           id: schema.pipelineBatch.id,
+          pipelineType: schema.pipelineBatch.pipelineType,
+          kaggleUsername: schema.pipelineBatch.kaggleUsername,
+          triggerReason: schema.pipelineBatch.triggerReason,
           status: schema.pipelineBatch.status,
         })
         .from(schema.pipelineBatch)
         .where(
-          and(
-            eq(schema.pipelineBatch.kaggleUsername, "local-vm"),
-            inArray(schema.pipelineBatch.status, [
-              "created",
-              "uploading",
-              "waiting_dataset",
-              "kernel_running",
-            ]),
-          ),
+          inArray(schema.pipelineBatch.status, [
+            "created",
+            "uploading",
+            "waiting_dataset",
+            "kernel_running",
+          ]),
         );
+
+      const activeVmBatches = activeBatches.filter((b) => this.isBatchVmRemux(b));
 
       if (activeVmBatches.length >= KIRA_VM_MAX_CONCURRENT_BATCHES) {
         return { batchId: null, jobCount: 0, totalBytes: 0 };
@@ -1347,6 +1514,7 @@ export class PipelineEngineService {
       const [batch] = await tx
         .insert(schema.pipelineBatch)
         .values({
+          pipelineType: "vm_remux",
           status: "created",
           triggerReason: effectiveReason,
           kaggleUsername: "local-vm",
@@ -1363,6 +1531,7 @@ export class PipelineEngineService {
         .update(schema.pipelineJob)
         .set({
           batchId: batch.id,
+          pipelineType: "vm_remux",
           status: "encoding",
           heartbeatAt: new Date(),
           updatedAt: new Date(),
@@ -1371,7 +1540,7 @@ export class PipelineEngineService {
 
       log.success(
         "PipelineEngine",
-        `Sealed VM Direct-Remux Batch #${batch.id} [${effectiveReason}] -> @local-vm (Slot ${activeVmBatches.length + 1}/${KIRA_VM_MAX_CONCURRENT_BATCHES}): ${packedJobs.length} H.264 job(s), ${(accBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`,
+        `[Pipeline 1: VM Remux] Sealed Batch #${batch.id} [${effectiveReason}] -> @local-vm (Slot ${activeVmBatches.length + 1}/${KIRA_VM_MAX_CONCURRENT_BATCHES}): ${packedJobs.length} H.264 job(s), ${(accBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`,
       );
 
       return {
@@ -1383,7 +1552,8 @@ export class PipelineEngineService {
   }
 
   /**
-   * Atomically seals a single Kaggle GPU batch of up to 10 staged HEVC/AV1 jobs / 10 GB
+   * Pipeline 2 Batch Sealer:
+   * Atomically seals a Kaggle GPU batch (`pipelineType = "kaggle_gpu"`) of up to 10 staged HEVC/AV1 jobs / 10 GB
    * and assigns it to the least-loaded Kaggle account (< 2 active notebooks).
    */
   public static async sealStagedBatch(options: {
@@ -1419,6 +1589,7 @@ export class PipelineEngineService {
       const allActiveBatches = await tx
         .select({
           id: schema.pipelineBatch.id,
+          pipelineType: schema.pipelineBatch.pipelineType,
           status: schema.pipelineBatch.status,
           kaggleUsername: schema.pipelineBatch.kaggleUsername,
           triggerReason: schema.pipelineBatch.triggerReason,
@@ -1438,7 +1609,7 @@ export class PipelineEngineService {
       if (activeGpuBatches.length >= maxConcurrentBatches) {
         log.info(
           "PipelineEngine",
-          `Kaggle cluster at full capacity (${activeGpuBatches.length}/${maxConcurrentBatches} active notebooks). Staged HEVC/AV1 episodes will seal as soon as a slot frees.`,
+          `[Pipeline 2: Kaggle GPU] Cluster at full capacity (${activeGpuBatches.length}/${maxConcurrentBatches} active notebooks). Staged HEVC/AV1 episodes will seal as soon as a slot frees.`,
         );
         return { batchId: null, jobCount: 0, totalBytes: 0 };
       }
@@ -1470,7 +1641,7 @@ export class PipelineEngineService {
         .where(and(eq(schema.pipelineJob.status, "staged"), isNull(schema.pipelineJob.batchId)))
         .orderBy(asc(schema.pipelineJob.stagedAt));
 
-      // Only pack jobs that require GPU re-encoding (HEVC/AV1)
+      // Only pack jobs that belong to Pipeline 2 (HEVC/AV1 Kaggle GPU encode)
       const gpuStagedJobs = stagedJobs.filter((j) => !this.isJobVmRemux(j));
       if (gpuStagedJobs.length === 0) {
         return { batchId: null, jobCount: 0, totalBytes: 0 };
@@ -1517,6 +1688,7 @@ export class PipelineEngineService {
       const [batch] = await tx
         .insert(schema.pipelineBatch)
         .values({
+          pipelineType: "kaggle_gpu",
           status: "created",
           triggerReason: effectiveReason,
           kaggleUsername: selectedAccount.username,
@@ -1531,6 +1703,7 @@ export class PipelineEngineService {
         .update(schema.pipelineJob)
         .set({
           batchId: batch.id,
+          pipelineType: "kaggle_gpu",
           status: "encoding",
           heartbeatAt: new Date(),
           updatedAt: new Date(),
@@ -1539,7 +1712,7 @@ export class PipelineEngineService {
 
       log.success(
         "PipelineEngine",
-        `Sealed Kaggle GPU Batch #${batch.id} [${effectiveReason}] -> @${selectedAccount.username} (Slot ${eligibleAccounts[0].activeCount + 1}/${KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT}): ${packedJobs.length} HEVC/AV1 job(s), ${(accBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`,
+        `[Pipeline 2: Kaggle GPU] Sealed Batch #${batch.id} [${effectiveReason}] -> @${selectedAccount.username} (Slot ${eligibleAccounts[0].activeCount + 1}/${KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT}): ${packedJobs.length} HEVC/AV1 job(s), ${(accBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`,
       );
 
       return {
@@ -1552,7 +1725,9 @@ export class PipelineEngineService {
   }
 
   /**
-   * Seals both eligible VM Direct-Remux batches (for H.264 releases) and Kaggle GPU batches (for HEVC/AV1 releases).
+   * Seals both independent pipelines:
+   * - Pipeline 1: VM Direct-Remux batches (for H.264 multi-quality or single 1080p releases)
+   * - Pipeline 2: Kaggle GPU batches (for HEVC/AV1 releases)
    */
   public static async sealAvailableBatches(options: {
     forceFlush?: boolean;
@@ -1560,14 +1735,14 @@ export class PipelineEngineService {
   } = {}): Promise<number[]> {
     const sealedBatchIds: number[] = [];
 
-    // 1. Seal VM Direct-Remux batches first (up to KIRA_VM_MAX_CONCURRENT_BATCHES)
+    // 1. Seal Pipeline 1 (VM Direct-Remux) batches
     while (true) {
       const vmRes = await this.sealVmRemuxBatch({ triggerReason: options.triggerReason });
       if (!vmRes.batchId) break;
       sealedBatchIds.push(vmRes.batchId);
     }
 
-    // 2. Seal Kaggle GPU batches for any HEVC/AV1 jobs
+    // 2. Seal Pipeline 2 (Kaggle GPU) batches
     while (true) {
       const gpuRes = await this.sealStagedBatch(options);
       if (!gpuRes.batchId) break;
@@ -1695,8 +1870,11 @@ export class PipelineEngineService {
   }
 
   /**
-   * Executes a VM Direct-Remux batch locally on the VM under strict concurrency/thread limits (`vmRemuxQueue`).
-   * Converts container to .mp4 with `-c:v copy` (zero video re-encoding) and converts audio to stereo AAC only as required.
+   * Pipeline 1 Executor:
+   * Executes a VM Direct-Remux batch locally on the VM under `vmRemuxQueue`.
+   * Converts container to .mp4 with `-c:v copy` (zero video re-encoding) for either:
+   * - Tier 1 (`h264_multi`): 1080p + 720p + 480p from the same release group
+   * - Tier 2 (`h264_single_1080p`): 1080p only (1 quality) when no group had lower qualities
    */
   public static async executeVmRemuxBatch(batchId: number): Promise<void> {
     await this.ensureTables();
@@ -1713,6 +1891,7 @@ export class PipelineEngineService {
       await db
         .update(schema.pipelineBatch)
         .set({
+          pipelineType: "vm_remux",
           status: "kernel_running",
           kaggleUsername: "local-vm",
           datasetSlug: batch.datasetSlug || "vm-direct-remux",
@@ -1740,7 +1919,7 @@ export class PipelineEngineService {
 
       log.info(
         "PipelineEngine",
-        `VM Direct-Remux Batch #${batchId}: Processing ${jobs.length} H.264 job(s) on VM with -c:v copy...`,
+        `[Pipeline 1: VM Remux] Batch #${batchId}: Processing ${jobs.length} H.264 job(s) on VM with -c:v copy...`,
       );
 
       let anyJobFailed = false;
@@ -1750,13 +1929,19 @@ export class PipelineEngineService {
         if (job.status === "completed") continue;
 
         try {
-          const stagedQualitiesMeta = (job.metadata?.stagedQualities || {}) as Partial<
-            Record<VideoResolutionQuality, string>
-          >;
+          const stagedQualitiesMap = (job.stagedQualities ||
+            job.metadata?.stagedQualities ||
+            {}) as Partial<Record<VideoResolutionQuality, string>>;
           const qualityFiles: Partial<Record<VideoResolutionQuality, string>> = {};
 
-          for (const q of ["1080p", "720p", "480p"] as VideoResolutionQuality[]) {
-            const p = stagedQualitiesMeta[q];
+          // If Tier 2 (h264_single_1080p), strictly only remux 1080p (1 quality)
+          const allowedQualities: VideoResolutionQuality[] =
+            job.selectionTier === "h264_single_1080p"
+              ? ["1080p"]
+              : (["1080p", "720p", "480p"] as VideoResolutionQuality[]);
+
+          for (const q of allowedQualities) {
+            const p = stagedQualitiesMap[q];
             if (p && fs.existsSync(p)) {
               qualityFiles[q] = p;
             }
@@ -1852,7 +2037,7 @@ export class PipelineEngineService {
 
       log.success(
         "PipelineEngine",
-        `VM Direct-Remux Batch #${batchId} finished! Local VM slot is now free.`,
+        `[Pipeline 1: VM Remux] Batch #${batchId} finished! Local VM slot is now free.`,
       );
     });
   }
@@ -1908,9 +2093,11 @@ export class PipelineEngineService {
       const hfAccount = videoManager.getNextHfAccount();
       const isRemux = this.isJobVmRemux(job);
       const qualityFilesManifest: Partial<Record<VideoResolutionQuality, string>> = {};
+      const sq = (job.stagedQualities || job.metadata?.stagedQualities) as
+        | Partial<Record<VideoResolutionQuality, string>>
+        | undefined;
 
-      if (isRemux && job.metadata?.stagedQualities) {
-        const sq = job.metadata.stagedQualities as Partial<Record<VideoResolutionQuality, string>>;
+      if (isRemux && sq) {
         for (const q of ["1080p", "720p", "480p"] as VideoResolutionQuality[]) {
           const localP = sq[q];
           if (localP && fs.existsSync(localP)) {
@@ -1953,9 +2140,6 @@ export class PipelineEngineService {
     return { jobs, uploadItems, manifestItems };
   }
 
-  /**
-   * Resolves the Kaggle account assigned to a batch (or selects a healthy fallback account).
-   */
   private static resolveBatchKaggleAccount(batchKaggleUsername: string | null) {
     const { kaggleAccounts } = loadAccountsFromEnv();
     if (kaggleAccounts.length === 0) {
@@ -1967,9 +2151,6 @@ export class PipelineEngineService {
     return assigned || kaggleAccounts[0];
   }
 
-  /**
-   * Phase 1 (Durable & Idempotent): Uploads the batch dataset to Kaggle GCS if not already uploaded.
-   */
   public static async prepareAndUploadBatchDataset(batchId: number): Promise<{
     skipped: boolean;
     empty: boolean;
@@ -2044,6 +2225,7 @@ export class PipelineEngineService {
     await db
       .update(schema.pipelineBatch)
       .set({
+        pipelineType: "kaggle_gpu",
         status: "uploading",
         kaggleUsername: account.username,
         datasetSlug,
@@ -2056,7 +2238,7 @@ export class PipelineEngineService {
 
     log.info(
       "PipelineEngine",
-      `Batch #${batchId}: Uploading ${uploadItems.length} staged MKV(s) to Kaggle Dataset '${account.username}/${datasetSlug}'...`,
+      `[Pipeline 2: Kaggle GPU] Batch #${batchId}: Uploading ${uploadItems.length} staged MKV(s) to Kaggle Dataset '${account.username}/${datasetSlug}'...`,
     );
 
     await videoManager.uploadBatchDatasetRest(
@@ -2090,9 +2272,6 @@ export class PipelineEngineService {
     };
   }
 
-  /**
-   * Phase 2 (Durable & Idempotent): Waits for Kaggle to finish indexing the uploaded dataset before pushing the kernel.
-   */
   public static async waitBatchDatasetReady(batchId: number): Promise<void> {
     await this.ensureTables();
 
@@ -2124,9 +2303,6 @@ export class PipelineEngineService {
     );
   }
 
-  /**
-   * Phase 3 (Durable & Idempotent): Pushes the GPU kernel to Kaggle (or re-attaches if already running).
-   */
   public static async pushBatchKernel(batchId: number): Promise<void> {
     await this.ensureTables();
 
@@ -2188,9 +2364,6 @@ export class PipelineEngineService {
       .where(eq(schema.pipelineBatch.id, batchId));
   }
 
-  /**
-   * Phase 4 (Durable Single Check): Checks Kaggle kernel status once and updates batch heartbeat.
-   */
   public static async checkBatchKernelProgress(batchId: number): Promise<{
     state: "running" | "completed" | "failed";
     rawStatus: string;
@@ -2260,9 +2433,6 @@ export class PipelineEngineService {
     return { state: "running", rawStatus: kStatus.rawStatus };
   }
 
-  /**
-   * Delivers a PipelineEpisodeResult payload to Main Backend (localhost:4000) with x-internal-secret and exponential backoff.
-   */
   public static async deliverCallbackPayload(
     callbackUrl: string,
     payload: PipelineEpisodeResult,
@@ -2300,10 +2470,6 @@ export class PipelineEngineService {
     return false;
   }
 
-  /**
-   * Phase 5 (Durable & Idempotent): Fetches encoded output from Kaggle, persists results, delivers callbacks to Main Backend,
-   * cleans up staged files and Kaggle resources, and re-stages any partial failed jobs.
-   */
   public static async finalizeCompletedBatch(batchId: number): Promise<void> {
     await this.ensureTables();
 
@@ -2411,14 +2577,10 @@ export class PipelineEngineService {
 
     log.success(
       "PipelineEngine",
-      `Batch #${batchId} completed on Kaggle (@${account.username})! Slot is now free.`,
+      `[Pipeline 2: Kaggle GPU] Batch #${batchId} completed on Kaggle (@${account.username})! Slot is now free.`,
     );
   }
 
-  /**
-   * Handles a batch failure by cleaning up Kaggle artifacts and returning eligible staged jobs
-   * back to 'staged' status so they can be re-batched without re-downloading torrents.
-   */
   public static async handleBatchFailure(batchId: number, errorMsg: string): Promise<void> {
     await this.ensureTables();
 
@@ -2491,9 +2653,6 @@ export class PipelineEngineService {
     }
   }
 
-  /**
-   * Direct end-to-end batch executor (supports both VM Direct-Remux batches and Kaggle GPU batches).
-   */
   public static async executeBatch(batchId: number): Promise<void> {
     await this.ensureTables();
     const batch = await db.query.pipelineBatch.findFirst({
@@ -2537,9 +2696,6 @@ export class PipelineEngineService {
     }
   }
 
-  /**
-   * Re-delivers any completed job callbacks that failed while Main Backend (localhost:4000) was restarting.
-   */
   public static async retryPendingCallbacks(): Promise<number> {
     await this.ensureTables();
 
@@ -2637,20 +2793,24 @@ export class PipelineEngineService {
       // PostgreSQL not connected in standalone UI preview; return zeroed DB counters gracefully
     }
 
-    const activeBatches = activeBatchRows.map((row) => ({
-      id: row.id,
-      status: row.status,
-      mode: (this.isBatchVmRemux(row) ? "vm_remux" : "kaggle_gpu") as "vm_remux" | "kaggle_gpu",
-      kaggleUsername: row.kaggleUsername,
-      datasetSlug: row.datasetSlug,
-      kernelSlug: row.kernelSlug,
-      jobCount: row.jobCount,
-      totalBytes: Number(row.totalBytes || 0),
-      elapsedSeconds: row.startedAt
-        ? Math.floor((Date.now() - row.startedAt.getTime()) / 1000)
-        : 0,
-      heartbeatAt: row.heartbeatAt.toISOString(),
-    }));
+    const activeBatches = activeBatchRows.map((row) => {
+      const mode: PipelineExecutionType = this.isBatchVmRemux(row) ? "vm_remux" : "kaggle_gpu";
+      return {
+        id: row.id,
+        status: row.status,
+        pipelineType: mode,
+        mode,
+        kaggleUsername: row.kaggleUsername,
+        datasetSlug: row.datasetSlug,
+        kernelSlug: row.kernelSlug,
+        jobCount: row.jobCount,
+        totalBytes: Number(row.totalBytes || 0),
+        elapsedSeconds: row.startedAt
+          ? Math.floor((Date.now() - row.startedAt.getTime()) / 1000)
+          : 0,
+        heartbeatAt: row.heartbeatAt.toISOString(),
+      };
+    });
 
     const vmActiveBatches = activeBatches.filter((b) => b.mode === "vm_remux");
     const gpuActiveBatches = activeBatches.filter((b) => b.mode === "kaggle_gpu");
@@ -2689,6 +2849,7 @@ export class PipelineEngineService {
         maxPerAccount: KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT,
         vmActive: vmActiveBatches.length,
         vmMax: KIRA_VM_MAX_CONCURRENT_BATCHES,
+        discoveryConcurrency: KIRA_DISCOVERY_CONCURRENCY,
       },
       queue: {
         queued: queueMap["queued"] || 0,

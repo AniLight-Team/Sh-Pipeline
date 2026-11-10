@@ -8,6 +8,8 @@ import {
   KIRA_MAX_STAGING_BYTES,
   KIRA_VM_MAX_CONCURRENT_BATCHES,
   KIRA_VM_FFMPEG_THREADS,
+  KIRA_DISCOVERY_CONCURRENCY,
+  KIRA_DISCOVERY_PER_ANIME_CONCURRENCY,
 } from "../config.js";
 import type { MkvStreamProbe } from "./types.js";
 
@@ -221,71 +223,97 @@ test("TsukihimeClient & ReleaseFilter accurately match relative episode_no and a
   assert.equal(topEp10[0][0].tsukihime_id, 28448);
 });
 
-test("ReleaseFilter.selectTopCandidateBundles prioritizes H.264 over HEVC/AV1 and bundles 1080p/720p/480p strictly from the same group", () => {
-  const mixedTorrents = [
-    // HEVC release with high seeders
+test("Waterfall Tier 1 (h264_multi): If first 1080p H.264 group lacks 720p/480p, goes back and picks another H.264 group that HAS 720p and 480p", () => {
+  const torrents = [
+    // Group A (VARYG): Has 1080p H.264 with high seeders (300), but NO 720p or 480p
     {
-      id: 101,
-      title: "[EMBER] Dandadan - 04 [1080p] [HEVC WEBRip 10bits] [A1B2C3D4].mkv",
-      seeders: 250,
+      id: 10,
+      title: "[VARYG] Dandadan - 04 (1080p WEB-DL H.264 AAC).mkv",
+      seeders: 300,
       num_files: 1,
     },
-    // AV1 release
+    // Group B (SubsPlease): Has 1080p H.264 (90 seeders) AND also has 720p + 480p
     {
-      id: 102,
-      title: "[AV1-Group] Dandadan - 04 (1080p AV1 Opus).mkv",
-      seeders: 180,
-      num_files: 1,
-    },
-    // SubsPlease H.264 1080p, 720p, and 480p (same group)
-    {
-      id: 201,
+      id: 20,
       title: "[SubsPlease] Dandadan - 04 (1080p) [1111AAAA].mkv",
-      seeders: 120,
+      seeders: 90,
       num_files: 1,
     },
     {
-      id: 202,
+      id: 21,
       title: "[SubsPlease] Dandadan - 04 (720p) [2222BBBB].mkv",
-      seeders: 65,
+      seeders: 45,
       num_files: 1,
     },
     {
-      id: 203,
+      id: 22,
       title: "[SubsPlease] Dandadan - 04 (480p) [3333CCCC].mkv",
-      seeders: 30,
+      seeders: 25,
       num_files: 1,
     },
-    // Different group (Erai-raws) 720p — must NEVER be mixed into SubsPlease's bundle
+    // Group C (EMBER): HEVC 1080p
     {
-      id: 301,
-      title: "[Erai-raws] Dandadan - 04 [720p][Multiple Subtitle].mkv",
-      seeders: 95,
+      id: 30,
+      title: "[EMBER] Dandadan - 04 [1080p] [HEVC WEBRip 10bits].mkv",
+      seeders: 400,
       num_files: 1,
     },
   ];
 
-  const bundles = ReleaseFilter.selectTopCandidateBundles(mixedTorrents as any, 4, "sub", {
+  const bundles = ReleaseFilter.selectTopCandidateBundles(torrents as any, 4, "sub", {
     knownTitles: ["Dandadan"],
-    maxBundles: 4,
+    maxBundles: 5,
   });
 
-  assert.equal(bundles.length >= 2, true);
+  // #1 bundle must be SubsPlease (Tier 1: h264_multi) because it has 720p & 480p
+  assert.equal(bundles[0].groupLower, "subsplease");
+  assert.equal(bundles[0].selectionTier, "h264_multi");
+  assert.equal(bundles[0].pipelineType, "vm_remux");
+  assert.equal(bundles[0].isSolo, true);
+  assert.equal(bundles[0].qualities["1080p"]?.item.id, 20);
+  assert.equal(bundles[0].qualities["720p"]?.item.id, 21);
+  assert.equal(bundles[0].qualities["480p"]?.item.id, 22);
 
-  // #1 bundle must be SubsPlease H.264 (even though EMBER HEVC had more seeders)
-  const bestBundle = bundles[0];
-  assert.equal(bestBundle.isH264, true);
-  assert.equal(bestBundle.groupLower, "subsplease");
-  assert.equal(bestBundle.primaryEntry.quality, "1080p");
-  assert.equal(bestBundle.primaryEntry.item.id, 201);
+  // #2 bundle must be VARYG (Tier 2: h264_single_1080p) with strictly 1 quality (1080p)
+  assert.equal(bundles[1].groupLower, "varyg");
+  assert.equal(bundles[1].selectionTier, "h264_single_1080p");
+  assert.equal(bundles[1].pipelineType, "vm_remux");
+  assert.deepEqual(Object.keys(bundles[1].qualities), ["1080p"]);
 
-  // Verify all 3 qualities (1080p, 720p, 480p) in the bundle belong strictly to SubsPlease
-  assert.equal(bestBundle.qualities["1080p"]?.item.id, 201);
-  assert.equal(bestBundle.qualities["720p"]?.item.id, 202);
-  assert.equal(bestBundle.qualities["480p"]?.item.id, 203);
+  // #3 bundle must be EMBER (Tier 3: hevc_av1_gpu) routed to Pipeline 2 (kaggle_gpu)
+  assert.equal(bundles[2].groupLower, "ember");
+  assert.equal(bundles[2].selectionTier, "hevc_av1_gpu");
+  assert.equal(bundles[2].pipelineType, "kaggle_gpu");
 });
 
-test("ReleaseFilter.selectTopCandidateBundles falls back to HEVC/AV1 only when no viable H.264 release exists", () => {
+test("Waterfall Tier 2 (h264_single_1080p): When no H.264 group has lower qualities, picks best 1080p H.264 and processes strictly 1 quality on VM Remux", () => {
+  const torrents = [
+    {
+      id: 401,
+      title: "[ToonsHub] Dandadan - 04 (1080p AMZN WEB-DL H.264 AAC).mkv",
+      seeders: 85,
+      num_files: 1,
+    },
+    {
+      id: 402,
+      title: "[Judas] Dandadan - S01E04 [1080p][HEVC x265 10bit].mkv",
+      seeders: 220,
+      num_files: 1,
+    },
+  ];
+
+  const bundles = ReleaseFilter.selectTopCandidateBundles(torrents as any, 4, "sub", {
+    knownTitles: ["Dandadan"],
+    maxBundles: 3,
+  });
+
+  assert.equal(bundles[0].primaryEntry.item.id, 401);
+  assert.equal(bundles[0].selectionTier, "h264_single_1080p");
+  assert.equal(bundles[0].pipelineType, "vm_remux");
+  assert.deepEqual(Object.keys(bundles[0].qualities), ["1080p"]);
+});
+
+test("Waterfall Tier 3 (hevc_av1_gpu): Falls back to HEVC/AV1 and routes to Kaggle GPU only when no viable H.264 release exists", () => {
   const hevcOnlyTorrents = [
     {
       id: 501,
@@ -308,11 +336,86 @@ test("ReleaseFilter.selectTopCandidateBundles falls back to HEVC/AV1 only when n
 
   assert.equal(bundles.length, 2);
   assert.equal(bundles[0].isH264, false);
+  assert.equal(bundles[0].selectionTier, "hevc_av1_gpu");
+  assert.equal(bundles[0].pipelineType, "kaggle_gpu");
   assert.equal(bundles[0].primaryEntry.quality, "1080p");
 });
 
-test("56 GB staging limit and VM Direct-Remux resource guardrails are strictly configured", () => {
+test("Strict Solo-Over-Batch Preference & Single-Episode Batch File Isolation (never downloads whole batch)", () => {
+  const soloVsBatchTorrents = [
+    // Multi-file batch torrent with huge seeders
+    {
+      id: 601,
+      title: "[SubsPlease] Dandadan (01-12) (1080p) [Batch]",
+      seeders: 500,
+      num_files: 12,
+    },
+    // Monolithic 1-file batch archive (must be completely rejected!)
+    {
+      id: 602,
+      title: "[BadPack] Dandadan Season 1 Complete Batch (01-12) (1080p).mkv",
+      seeders: 900,
+      num_files: 1,
+    },
+    // Solo single-episode release with moderate seeders
+    {
+      id: 603,
+      title: "[Erai-raws] Dandadan - 04 [1080p H.264][Multiple Subtitle].mkv",
+      seeders: 35,
+      num_files: 1,
+    },
+  ];
+
+  const bundles = ReleaseFilter.selectTopCandidateBundles(soloVsBatchTorrents as any, 4, "sub", {
+    knownTitles: ["Dandadan"],
+    maxBundles: 5,
+  });
+
+  // Monolithic 1-file batch (602) must be rejected completely
+  assert.equal(bundles.some((b) => b.primaryEntry.item.id === 602), false);
+
+  // Solo release (603) MUST rank #1 ahead of multi-file batch (601) despite 35 vs 500 seeders
+  assert.equal(bundles[0].primaryEntry.item.id, 603);
+  assert.equal(bundles[0].isSolo, true);
+
+  // Multi-file batch (601) is kept only as a lower-priority fallback with isSolo = false
+  assert.equal(bundles[1].primaryEntry.item.id, 601);
+  assert.equal(bundles[1].isSolo, false);
+
+  // Verify matchFilesToEpisodes isolates ONLY Episode 4 from a multi-file batch torrent
+  const batchFiles = [
+    { name: "Dandadan/[SubsPlease] Dandadan - 01 (1080p).mkv", length: 1_200_000_000 },
+    { name: "Dandadan/[SubsPlease] Dandadan - 02 (1080p).mkv", length: 1_200_000_000 },
+    { name: "Dandadan/[SubsPlease] Dandadan - 03 (1080p).mkv", length: 1_200_000_000 },
+    { name: "Dandadan/[SubsPlease] Dandadan - 04 (1080p).mkv", length: 1_250_000_000 },
+    { name: "Dandadan/[SubsPlease] Dandadan - 05 (1080p).mkv", length: 1_200_000_000 },
+  ];
+
+  const matched = ReleaseFilter.matchFilesToEpisodes(batchFiles, {
+    targetEp: 4,
+    effectiveEp: 4,
+    knownTitles: ["Dandadan"],
+  });
+  assert.equal(matched.has(4), true);
+  assert.equal(matched.get(4)?.[0], 3); // File index 3 is Episode 04
+
+  // Verify monolithic 1-file batch torrent is rejected by matchFilesToEpisodes when targeting a single episode
+  const monolithicBatchFile = [
+    { name: "Dandadan Complete Season 1 (01-12).mkv", length: 14_000_000_000 },
+  ];
+  const rejectedMonolithic = ReleaseFilter.matchFilesToEpisodes(monolithicBatchFile, {
+    targetEp: 4,
+    effectiveEp: 4,
+    knownTitles: ["Dandadan"],
+  });
+  assert.equal(rejectedMonolithic.size, 0);
+});
+
+test("High-concurrency Stage 1 discovery and 56 GB staging guardrails are configured", () => {
   assert.equal(KIRA_MAX_STAGING_BYTES, 56 * 1024 * 1024 * 1024);
-  assert.equal(KIRA_VM_MAX_CONCURRENT_BATCHES, 1);
+  assert.equal(KIRA_DISCOVERY_CONCURRENCY, 16);
+  assert.equal(KIRA_DISCOVERY_PER_ANIME_CONCURRENCY, 8);
+  assert.equal(KIRA_VM_MAX_CONCURRENT_BATCHES, 2);
   assert.equal(KIRA_VM_FFMPEG_THREADS, 2);
 });
+

@@ -2,15 +2,22 @@ import { inngest } from "../client.js";
 import { db, schema } from "../../db/index.js";
 import { eq } from "drizzle-orm";
 import { PipelineEngineService } from "../../engine/service.js";
+import {
+  KIRA_DISCOVERY_CONCURRENCY,
+  KIRA_DISCOVERY_PER_ANIME_CONCURRENCY,
+} from "../../config.js";
 import { log } from "../../utils/logger.js";
 
 export const jobDiscoverStageFn = inngest.createFunction(
   {
     id: "pipeline-job-discover-stage",
-    name: "Pipeline Stage 1: Torrent Discovery, Download & Staging",
+    name: "Pipeline Stage 1: High-Concurrency Torrent Discovery, Download & Staging",
     concurrency: [
-      { limit: 4 },
-      { limit: 2, key: "event.data.anilistId || event.data.anidbId || event.data.jobId" },
+      { limit: KIRA_DISCOVERY_CONCURRENCY },
+      {
+        limit: KIRA_DISCOVERY_PER_ANIME_CONCURRENCY,
+        key: "event.data.anilistId || event.data.anidbId || event.data.jobId",
+      },
     ],
     retries: 2,
     triggers: [{ event: "pipeline/job.discover" }],

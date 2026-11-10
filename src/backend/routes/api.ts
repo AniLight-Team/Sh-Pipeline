@@ -36,24 +36,26 @@ async function dispatchJobDiscovery(job: {
       },
     });
   } catch (err: any) {
-    log.warn("API", `Inngest server unreachable (${err?.message || err}); running discovery for Job #${job.id} directly in background.`);
-    setImmediate(async () => {
-      try {
-        const res = await PipelineEngineService.discoverAndStageJob(job.id);
-        if (res.status === "staged") {
-          const readiness = await PipelineEngineService.evaluateBatchSealReadiness(false);
-          if (readiness.shouldSeal) {
-            const batchIds = await PipelineEngineService.sealAvailableBatches({
-              forceFlush: false,
-              triggerReason: readiness.reason,
-            });
-            for (const bId of batchIds) {
-              await PipelineEngineService.executeBatch(bId).catch(() => {});
+    log.warn("API", `Inngest server unreachable (${err?.message || err}); queuing discovery for Job #${job.id} in high-concurrency background worker.`);
+    PipelineEngineService.stage1DiscoveryQueue
+      .add(async () => {
+        try {
+          const res = await PipelineEngineService.discoverAndStageJob(job.id);
+          if (res.status === "staged") {
+            const readiness = await PipelineEngineService.evaluateBatchSealReadiness(false);
+            if (readiness.shouldSeal) {
+              const batchIds = await PipelineEngineService.sealAvailableBatches({
+                forceFlush: false,
+                triggerReason: readiness.reason,
+              });
+              for (const bId of batchIds) {
+                await PipelineEngineService.executeBatch(bId).catch(() => {});
+              }
             }
           }
-        }
-      } catch {}
-    });
+        } catch {}
+      })
+      .catch(() => {});
   }
 }
 
@@ -361,6 +363,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
           .set({
             status: nextStatus,
             batchId: nextStatus === "staged" ? null : job.batchId,
+            pipelineType: targetMode,
             metadata: {
               ...(job.metadata || {}),
               processingMode: targetMode,

@@ -107,7 +107,7 @@ export class TransmissionClient {
     magnetOrUrl: string,
     downloadDir = DEFAULT_DOWNLOAD_DIR,
     paused = false,
-  ): Promise<{ id: number; name: string }> {
+  ): Promise<{ id: number; name: string; isDuplicate?: boolean }> {
     log.info("Transmission", `Adding torrent to ${this.activeUrl}...`);
     const res = await this.callRpc("torrent-add", {
       filename: magnetOrUrl,
@@ -118,16 +118,20 @@ export class TransmissionClient {
     if (res["torrent-added"]) {
       const info = res["torrent-added"];
       log.success("Transmission", `Torrent added: ${info.name} (ID: ${info.id})`);
-      return info;
+      return { id: info.id, name: info.name, isDuplicate: false };
     }
     if (res["torrent-duplicate"]) {
       const info = res["torrent-duplicate"];
       log.info("Transmission", `Torrent already present: ${info.name} (ID: ${info.id})`);
-      return info;
+      return { id: info.id, name: info.name, isDuplicate: true };
     }
     throw new Error(`Unexpected response adding torrent: ${JSON.stringify(res)}`);
   }
 
+  /**
+   * Strictly marks ONLY `wantedIndices` as wanted + high priority, and marks all other files in a
+   * multi-file batch torrent as unwanted + low priority so the whole batch is NEVER downloaded.
+   */
   public async selectOnlyFiles(
     torrentId: number,
     wantedIndices: number[],
@@ -140,14 +144,20 @@ export class TransmissionClient {
     }
 
     const args: Record<string, any> = { ids: [torrentId] };
-    if (wantedIndices.length > 0) args["files-wanted"] = Array.from(wantedSet);
-    if (unwanted.length > 0) args["files-unwanted"] = unwanted;
+    if (wantedIndices.length > 0) {
+      args["files-wanted"] = Array.from(wantedSet);
+      args["priority-high"] = Array.from(wantedSet);
+    }
+    if (unwanted.length > 0) {
+      args["files-unwanted"] = unwanted;
+      args["priority-low"] = unwanted;
+    }
 
     await this.callRpc("torrent-set", args);
     await this.startTorrent(torrentId);
     log.info(
       "Transmission",
-      `Selective file download: wanted=[${Array.from(wantedSet)}] (skipped ${unwanted.length} other files)`,
+      `Selective single-episode extraction: wanted=[${Array.from(wantedSet)}] (strictly excluded ${unwanted.length} other batch files)`,
     );
   }
 
@@ -158,6 +168,7 @@ export class TransmissionClient {
     await this.callRpc("torrent-set", {
       ids: [torrentId],
       "files-wanted": [fileIndex],
+      "priority-high": [fileIndex],
     });
     await this.startTorrent(torrentId);
     log.info("Transmission", `Added file index ${fileIndex} to wanted list for Torrent ID ${torrentId}`);
@@ -189,14 +200,14 @@ export class TransmissionClient {
     return res.torrents?.[0] || null;
   }
 
-  public async waitForMetadata(torrentId: number, timeoutSec = 180): Promise<any> {
+  public async waitForMetadata(torrentId: number, timeoutSec = 150): Promise<any> {
     const start = Date.now();
     while ((Date.now() - start) / 1000 < timeoutSec) {
       const info = await this.getStatus(torrentId);
       if (info && Array.isArray(info.files) && info.files.length > 0) {
         return info;
       }
-      await new Promise((r) => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 800));
     }
     throw new Error(`Timed out waiting for magnet metadata on Torrent ${torrentId}`);
   }
@@ -213,7 +224,7 @@ export class TransmissionClient {
     const {
       wantedFileIndex,
       expectedDiskPath,
-      pollInterval = 5,
+      pollInterval = 2,
       timeoutSec = TORRENT_DOWNLOAD_TIMEOUT_SEC,
     } = options;
 
@@ -231,6 +242,7 @@ export class TransmissionClient {
       }
 
       const files = info.files || [];
+      const fileStats = info.fileStats || [];
       const rateDownload = info.rateDownload || 0;
       const rateMb = rateDownload / (1024 * 1024);
       const status = info.status || 0;
@@ -244,6 +256,16 @@ export class TransmissionClient {
       let fDone = 0;
 
       if (wantedFileIndex !== undefined && wantedFileIndex < files.length) {
+        // Guardrail: Ensure Transmission hasn't re-enabled unwanted files in a multi-file batch torrent
+        if (files.length > 1 && Array.isArray(fileStats) && fileStats.length === files.length) {
+          const unwantedActive = fileStats.some(
+            (st: any, idx: number) => idx !== wantedFileIndex && st?.wanted === true,
+          );
+          if (unwantedActive) {
+            await this.selectOnlyFiles(torrentId, [wantedFileIndex], files.length).catch(() => {});
+          }
+        }
+
         const fObj = files[wantedFileIndex];
         targetSz = fObj.length || 1;
         fDone = fObj.bytesCompleted || 0;
@@ -277,7 +299,7 @@ export class TransmissionClient {
               fs.statSync(expectedDiskPath).size <= 1024)
           ) {
             const now = Date.now();
-            if (now - lastVerifyAttempt > 20000) {
+            if (now - lastVerifyAttempt > 15000) {
               log.warn(
                 "Transmission",
                 `Transmission reports 100%, but file missing on disk: ${expectedDiskPath}`,
@@ -289,6 +311,8 @@ export class TransmissionClient {
             await new Promise((r) => setTimeout(r, pollInterval * 1000));
             continue;
           }
+          // Stop torrent immediately so no extra pieces of a batch pack continue downloading
+          await this.stopTorrent(torrentId).catch(() => {});
           log.success(
             "Transmission",
             `Selective file download complete: ${files[wantedFileIndex]?.name}`,
@@ -307,7 +331,7 @@ export class TransmissionClient {
               fs.statSync(expectedDiskPath).size <= 1024)
           ) {
             const now = Date.now();
-            if (now - lastVerifyAttempt > 20000) {
+            if (now - lastVerifyAttempt > 15000) {
               log.warn(
                 "Transmission",
                 `Transmission reports 100%, but file missing on disk: ${expectedDiskPath}`,
@@ -376,4 +400,3 @@ export class TransmissionClient {
     }
   }
 }
-

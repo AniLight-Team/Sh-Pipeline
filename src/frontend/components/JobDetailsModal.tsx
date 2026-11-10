@@ -62,10 +62,14 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
   const activeStreamUrl = activeStreamSource?.downloadUrl || activeStreamSource?.url || "";
 
   const tsukihimeId = job.metadata?.tsukihimeId;
-  const processingMode = job.metadata?.processingMode;
-  const releaseGroup = job.metadata?.releaseGroup;
-  const videoCodec = job.metadata?.videoCodec;
-  const stagedQualities = (job.metadata?.stagedQualities || {}) as Record<string, string>;
+  const processingMode = job.pipelineType || job.metadata?.processingMode;
+  const selectionTier = job.selectionTier || job.metadata?.selectionTier;
+  const releaseGroup = job.releaseGroup || job.metadata?.releaseGroup;
+  const videoCodec = job.videoCodec || job.metadata?.videoCodec;
+  const isBatchTorrent = Boolean(job.isBatchTorrent ?? job.metadata?.isBatchTorrent);
+  const stagedQualities = (job.stagedQualities ||
+    job.metadata?.stagedQualities ||
+    {}) as Record<string, string>;
   const stagedQualityKeys = Object.keys(stagedQualities);
 
   const handleCopyJson = () => {
@@ -234,9 +238,10 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
           </div>
 
           <div className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
-            <span className="text-[11px] text-[#636b82] block mb-0.5">Release Group & Codec</span>
+            <span className="text-[11px] text-[#636b82] block mb-0.5">Release Group & Tier</span>
             <span className="font-mono text-xs font-semibold text-[#d5d9e6] truncate block">
               {releaseGroup || "auto"} · {(videoCodec || "h264").toUpperCase()}
+              {selectionTier ? ` (${selectionTier})` : ""}
             </span>
           </div>
 
@@ -245,7 +250,8 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
             <span className="font-mono tabular-nums font-semibold text-xs text-[#d5d9e6]">
               {job.sizeBytes
                 ? `${(job.sizeBytes / (1024 * 1024)).toFixed(1)} MB`
-                : "—"}
+                : "—"}{" "}
+              · {isBatchTorrent ? "1-Ep Batch Extract" : "Solo Release"}
             </span>
           </div>
         </div>

@@ -18,6 +18,7 @@ import {
 interface Batch {
   id: number;
   status: string;
+  pipelineType?: "vm_remux" | "kaggle_gpu" | string | null;
   triggerReason: string;
   kaggleUsername?: string | null;
   datasetSlug?: string | null;
@@ -131,7 +132,9 @@ export function BatchViewer({
   const filteredBatches = batches.filter((b) => {
     if (modeFilter === "all") return true;
     const isVmRemux =
-      b.kaggleUsername === "local-vm" || b.triggerReason.startsWith("vm_remux");
+      b.pipelineType === "vm_remux" ||
+      b.kaggleUsername === "local-vm" ||
+      b.triggerReason.startsWith("vm_remux");
     return modeFilter === "vm_remux" ? isVmRemux : !isVmRemux;
   });
 
@@ -199,14 +202,14 @@ export function BatchViewer({
         <div>
           <div className="flex items-center gap-2">
             <h2 className="text-sm font-semibold text-[#f3f4f8]">
-              Batch Executions (VM Direct Remux & Kaggle GPU)
+              Dual-Pipeline Batch Executions (Pipeline 1: VM Remux · Pipeline 2: Kaggle GPU)
             </h2>
             <span className="text-xs font-mono tabular-nums text-[#636b82]">
               · {filteredBatches.length} {filteredBatches.length === 1 ? "batch" : "batches"}
             </span>
           </div>
           <p className="text-xs text-[#636b82] mt-0.5">
-            H.264 same-group releases remux directly on VM (-c:v copy, max 1 active) · HEVC/AV1 releases batch to Kaggle GPU
+            Pipeline 1: H.264 multi-quality or 1080p solo remux on VM (-c:v copy) · Pipeline 2: HEVC/AV1 batch encode on Kaggle Dual-T4 GPU
           </p>
         </div>
 

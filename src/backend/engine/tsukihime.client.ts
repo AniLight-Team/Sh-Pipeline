@@ -80,11 +80,11 @@ const DEFAULT_ANIME_TRACKERS = [
   "udp://open.demonii.com:1337/announce",
 ];
 
-// Rate limit: 100 req/min, 60 req/30s, 25 req/10s -> cap at 15 req/10s with concurrency 4
+// Rate limit: 100 req/min, 60 req/30s, 25 req/10s -> cap at 22 req/10s with concurrency 8 for fast Stage 1 discovery
 const tsukihimeQueue = new PQueue({
-  concurrency: 4,
+  concurrency: 8,
   interval: 10_000,
-  intervalCap: 15,
+  intervalCap: 22,
 });
 
 // Cache resolved Tsukihime anime metadata (1 hour TTL)

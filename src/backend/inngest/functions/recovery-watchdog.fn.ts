@@ -2,7 +2,11 @@ import { inngest } from "../client.js";
 import { db, schema } from "../../db/index.js";
 import { eq, inArray, lt, and } from "drizzle-orm";
 import { PipelineEngineService } from "../../engine/service.js";
-import { MAX_JOB_ATTEMPTS, MAX_BATCH_ATTEMPTS } from "../../config.js";
+import {
+  MAX_JOB_ATTEMPTS,
+  MAX_BATCH_ATTEMPTS,
+  KIRA_DISCOVERY_CONCURRENCY,
+} from "../../config.js";
 import { log } from "../../utils/logger.js";
 
 export const recoveryWatchdogFn = inngest.createFunction(
@@ -136,7 +140,9 @@ export const recoveryWatchdogFn = inngest.createFunction(
 
       // 7. Only dispatch queued jobs if staging buffer is below the 56 GB limit
       const cap = await PipelineEngineService.checkStorageCapacityForDownload();
-      const jobsAllowedToDispatch = cap.allowed ? jobsToRediscover.slice(0, 6) : [];
+      const jobsAllowedToDispatch = cap.allowed
+        ? jobsToRediscover.slice(0, KIRA_DISCOVERY_CONCURRENCY)
+        : [];
 
       const allBatchIdsToDispatch = Array.from(
         new Set([...batchesToResume, ...pendingBatchIds, ...newlySealedIds]),

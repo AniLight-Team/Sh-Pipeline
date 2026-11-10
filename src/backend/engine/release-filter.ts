@@ -1,7 +1,9 @@
 import path from "path";
 import type {
   AnimeToshoItem,
+  CandidateSelectionTier,
   ParsedReleaseTitle,
+  PipelineExecutionType,
   ReleaseCandidateBundle,
   ReleaseQualityEntry,
   VideoResolutionQuality,
@@ -301,12 +303,12 @@ export class ReleaseFilter {
     const isDub = String(langType).toLowerCase() === "dub";
     const isSingleEpTarget = String(targetEp).toLowerCase() !== "all";
 
-    // When searching for a single episode, do not stop pagination early on a non-SeaDex batch
-    if (isSingleEpTarget && (parsed.isBatch || (item.num_files || 1) > 1) && !isSeadex) {
+    // Never stop pagination early on a batch torrent when searching for a single episode
+    if (isSingleEpTarget && (parsed.isBatch || (item.num_files || 1) > 1)) {
       return false;
     }
 
-    // Strongly prefer stopping early only when we have a viable H.264 1080p candidate
+    // Strongly prefer stopping early only when we have a viable H.264 1080p solo candidate
     if (!parsed.isH264) {
       return false;
     }
@@ -384,7 +386,15 @@ export class ReleaseFilter {
       return true;
     }
 
-    if (parsed.singleEp === targetEpNum) return true;
+    if (parsed.singleEp === targetEpNum && !parsed.isBatch) return true;
+
+    // For batch torrents when targeting a single episode:
+    // Reject if the batch only has 1 file (monolithic combined file/archive cannot extract 1 episode!)
+    if (parsed.isBatch || parsed.epRange !== null) {
+      if (item?.num_files !== undefined && item.num_files <= 1) {
+        return false;
+      }
+    }
 
     if (parsed.epRange) {
       const [start, end] = parsed.epRange;
@@ -438,7 +448,6 @@ export class ReleaseFilter {
     else if (parsed.isWeb) score += 20;
 
     // Prefer H.264 releases strongly so they can be direct-remuxed without GPU re-encoding.
-    // Only fall back to HEVC/AV1 when no viable H.264 release exists.
     if (parsed.isH264) {
       score += 55;
     } else if (parsed.isHevc && !parsed.isAv1) {
@@ -455,7 +464,6 @@ export class ReleaseFilter {
     } else if (langLower === "dub" && parsed.isEnglishDub) {
       score += 35;
     } else if (langLower === "all" && parsed.isEnglishDub && !parsed.isDualAudio) {
-      // Dub-only release lacks Japanese audio when both sub+dub ("all") are desired
       score -= 35;
     }
 
@@ -477,11 +485,11 @@ export class ReleaseFilter {
         item.tsukihime_episode_no === targetEpNum &&
         !parsed.isBatch &&
         numFiles === 1;
-      if (parsed.singleEp === targetEpNum || isTsukihimeEpMatch) {
-        score += 60;
-        if (isTsukihimeEpMatch) score += 10;
-      } else if (parsed.isBatch) {
-        score -= 20;
+      if ((parsed.singleEp === targetEpNum && !parsed.isBatch && numFiles === 1) || isTsukihimeEpMatch) {
+        score += 120;
+        if (isTsukihimeEpMatch) score += 15;
+      } else if (parsed.isBatch || numFiles > 1) {
+        score -= 80;
       }
     }
 
@@ -496,11 +504,6 @@ export class ReleaseFilter {
     60, 61, 62, 63, 64, 65,
   ]);
 
-  /**
-   * Infers cumulative episode offsets (e.g. +12, +24, +26, +40, +392) from both
-   * cour/season batch ranges (e.g. S01E27-E40, S17E41-E50, 393-406) and contiguous
-   * single-episode clusters in the feed.
-   */
   public static inferCumulativeOffsets(
     torrentList: AnimeToshoItem[],
     targetEpNum: number,
@@ -588,13 +591,24 @@ export class ReleaseFilter {
   }
 
   /**
-   * Selects top candidate bundles grouped by the SAME release group.
-   * - Strongly prioritizes H.264 releases (`isH264: true`) over HEVC/AV1 so re-encoding is only used
-   *   when no viable H.264 release exists.
-   * - For H.264 releases, collects all available quality versions (`1080p`, `720p`, `480p`) from the
-   *   EXACT same group, preferring groups with fuller multi-quality coverage and better encodes.
-   * - For HEVC/AV1 releases (fallback when no H.264 exists), selects only the best `1080p` release
-   *   for GPU transcoding.
+   * Deterministic 3-Tier Waterfall + Strict Solo-Over-Batch Selection:
+   *
+   * 1. Tier 1 ("h264_multi" -> Pipeline 1 "vm_remux"):
+   *    Identify a 1080p H.264 release group that ALSO has 720p and/or 480p from the EXACT same group.
+   *    If the first 1080p H.264 group lacks 720p/480p, it goes back to 1080p candidates and picks another
+   *    H.264 group whose lower qualities (720p/480p) ARE available.
+   *    Groups with all 3 qualities (1080p + 720p + 480p) rank highest, followed by 2 qualities.
+   *
+   * 2. Tier 2 ("h264_single_1080p" -> Pipeline 1 "vm_remux", 1 quality only):
+   *    If NO H.264 group has lower qualities (720p/480p), fall back to the best 1080p H.264 release
+   *    and ONLY process 1 quality (1080p) via VM Direct-Remux (-c:v copy).
+   *
+   * 3. Tier 3 ("hevc_av1_gpu" -> Pipeline 2 "kaggle_gpu"):
+   *    If not even a single 1080p H.264 release exists, select the best 1080p HEVC (x265) or AV1 release
+   *    and route it to the second pipeline (Kaggle Dual-T4 GPU Batch Transcoder).
+   *
+   * Solo vs Batch Rule:
+   *    Solo (single-episode) releases ALWAYS outrank multi-episode batch torrents (+10,000 solo priority).
    */
   public static selectTopCandidateBundles(
     torrentList: AnimeToshoItem[],
@@ -612,7 +626,7 @@ export class ReleaseFilter {
       knownTitles,
       totalExpectedEps,
       episodeOffset = 0,
-      maxBundles = 4,
+      maxBundles = 5,
       minSeeders = DEFAULT_MIN_SEEDERS,
     } = options;
 
@@ -757,6 +771,7 @@ export class ReleaseFilter {
     }
 
     const bundles: ReleaseCandidateBundle[] = [];
+    const isSingleEpTarget = String(targetEp).toLowerCase() !== "all";
 
     for (const b of bundleMap.values()) {
       const q1080 = b.qualities["1080p"];
@@ -766,40 +781,37 @@ export class ReleaseFilter {
       const primaryEntry = q1080 || q720 || q480;
       if (!primaryEntry) continue;
 
-      // For HEVC/AV1 bundles (which will be GPU transcoded from 1080p into 1080p/720p/480p),
-      // only keep the primary (1080p) entry so we never waste bandwidth downloading 720p/480p HEVC.
-      const effectiveQualities: Partial<Record<VideoResolutionQuality, ReleaseQualityEntry>> = b.isH264
-        ? b.qualities
-        : { [primaryEntry.quality]: primaryEntry };
+      const hasLowerSameGroup = Boolean(b.groupLower && q1080 && (q720 || q480));
+      const hasAllThreeSameGroup = Boolean(b.groupLower && q1080 && q720 && q480);
 
-      let bundleScore = primaryEntry.score;
+      let selectionTier: CandidateSelectionTier;
+      let pipelineType: PipelineExecutionType;
+      let effectiveQualities: Partial<Record<VideoResolutionQuality, ReleaseQualityEntry>>;
+      let tierBonus = 0;
 
-      // Strongly prefer having a 1080p master (for 1080p stream + canonical R2 subtitle extraction)
-      if (q1080) {
-        bundleScore += 50;
-      } else {
-        bundleScore -= 80;
-      }
-
-      // CRITICAL RULE: Re-encoding is ONLY required when no viable H.264 release exists!
-      // Any viable H.264 bundle with a 1080p stream outranks HEVC/AV1 bundles.
-      if (b.isH264 && q1080) {
-        bundleScore += 250;
-        // Same-group multi-quality completeness bonus (rewards groups providing 1080p + 720p + 480p)
-        if (q720) bundleScore += 45;
-        if (q480) bundleScore += 45;
+      if (b.isH264 && hasLowerSameGroup) {
+        // Tier 1: Same-group H.264 with 1080p AND lower qualities (720p and/or 480p)
+        selectionTier = "h264_multi";
+        pipelineType = "vm_remux";
+        effectiveQualities = b.qualities;
+        tierBonus = 3000 + (hasAllThreeSameGroup ? 250 : 100);
       } else if (b.isH264) {
-        // H.264 without 1080p (e.g. only 720p exists) still gets a moderate H.264 bonus
-        bundleScore += 120;
+        // Tier 2: Best 1080p H.264 without lower qualities -> process ONLY 1 quality (1080p) on VM Remux!
+        selectionTier = "h264_single_1080p";
+        pipelineType = "vm_remux";
+        effectiveQualities = { [primaryEntry.quality]: primaryEntry };
+        tierBonus = q1080 ? 2000 : 1500;
+      } else {
+        // Tier 3: HEVC / AV1 fallback -> route to Pipeline 2 (Kaggle Dual-T4 GPU Encode)
+        selectionTier = "hevc_av1_gpu";
+        pipelineType = "kaggle_gpu";
+        effectiveQualities = { [primaryEntry.quality]: primaryEntry };
+        tierBonus = q1080 ? 1000 : 600;
       }
 
-      if (String(targetEp).toLowerCase() !== "all") {
-        if (b.isSolo) {
-          bundleScore += 35;
-        } else if (!b.isSeadex) {
-          bundleScore -= 25;
-        }
-      }
+      // Solo vs Batch priority: Solo releases ALWAYS outrank batch torrents when targeting a single episode
+      const soloBonus = isSingleEpTarget ? (b.isSolo ? 10000 : 0) : 0;
+      const bundleScore = soloBonus + tierBonus + primaryEntry.score;
 
       bundles.push({
         group: b.group,
@@ -807,6 +819,9 @@ export class ReleaseFilter {
         isH264: b.isH264,
         isDualAudio: b.isDualAudio,
         isEnglishDub: b.isEnglishDub,
+        isSolo: b.isSolo,
+        selectionTier,
+        pipelineType,
         bundleScore,
         primaryEntry,
         qualities: effectiveQualities,
@@ -857,6 +872,13 @@ export class ReleaseFilter {
     return [null, targetEp];
   }
 
+  /**
+   * Maps torrent file entries to episode numbers.
+   * CRITICAL SAFETY RULE:
+   * - When `targetEp` is a single episode (not "all") and the torrent is a multi-file batch pack,
+   *   ONLY map files with an explicit episode number match. Never guess alphabetically, and never
+   *   allow a single monolithic combined batch file to masquerade as a single episode!
+   */
   public static matchFilesToEpisodes(
     files: { name?: string; length?: number }[],
     options: {
@@ -869,6 +891,10 @@ export class ReleaseFilter {
     const { knownTitles, targetEp, effectiveEp } = options;
     const videoExts = [".mkv", ".mp4", ".avi", ".webm"];
     const epMap = new Map<number, [number, string]>();
+    const isSingleEpTarget =
+      targetEp !== null &&
+      targetEp !== undefined &&
+      String(targetEp).toLowerCase() !== "all";
 
     const videoFiles: { idx: number; relPath: string; length: number }[] = [];
     for (let i = 0; i < files.length; i++) {
@@ -883,11 +909,15 @@ export class ReleaseFilter {
 
     if (videoFiles.length === 1) {
       const { idx, relPath } = videoFiles[0];
+      const parsed = this.parseTitle(relPath, knownTitles);
+      // If targeting a single episode, reject a 1-file torrent whose filename is a multi-episode range/batch!
+      if (isSingleEpTarget && (parsed.epRange !== null || parsed.isSeasonBatch)) {
+        return epMap;
+      }
       let assignedEp = 1;
-      if (targetEp !== null && targetEp !== undefined && String(targetEp).toLowerCase() !== "all") {
+      if (isSingleEpTarget) {
         assignedEp = Number(targetEp);
       } else {
-        const parsed = this.parseTitle(relPath, knownTitles);
         assignedEp = parsed.singleEp || 1;
       }
       epMap.set(assignedEp, [idx, relPath]);
@@ -905,11 +935,10 @@ export class ReleaseFilter {
       let epN = parsed.singleEp;
       if (epN !== null) {
         if (
-          targetEp !== null &&
-          targetEp !== undefined &&
+          isSingleEpTarget &&
           effectiveEp !== null &&
           effectiveEp !== undefined &&
-          String(targetEp).toLowerCase() !== "all"
+          String(effectiveEp).toLowerCase() !== "all"
         ) {
           const targetNum = Number(targetEp);
           const effectiveNum = Number(effectiveEp);
@@ -930,9 +959,7 @@ export class ReleaseFilter {
     }
 
     if (
-      targetEp !== null &&
-      targetEp !== undefined &&
-      String(targetEp).toLowerCase() !== "all" &&
+      isSingleEpTarget &&
       !epMap.has(Number(targetEp)) &&
       epMap.size > 1
     ) {
@@ -950,8 +977,11 @@ export class ReleaseFilter {
 
     if (epMap.size === 0 && nonBonusFiles.length === 1) {
       const { idx, relPath, parsed } = nonBonusFiles[0];
+      if (isSingleEpTarget && (parsed.epRange !== null || parsed.isSeasonBatch)) {
+        return epMap;
+      }
       let assignedEp = 1;
-      if (targetEp !== null && targetEp !== undefined && String(targetEp).toLowerCase() !== "all") {
+      if (isSingleEpTarget) {
         assignedEp = Number(targetEp);
       } else {
         assignedEp = parsed.singleEp || 1;
@@ -960,7 +990,8 @@ export class ReleaseFilter {
       return epMap;
     }
 
-    if (epMap.size === 0 && nonBonusFiles.length > 0) {
+    // Only allow sequential 1..N fallback when targetEp === "all" (never guess blindly for single-episode extraction!)
+    if (!isSingleEpTarget && epMap.size === 0 && nonBonusFiles.length > 0) {
       const sorted = [...nonBonusFiles].sort((a, b) => a.relPath.localeCompare(b.relPath));
       for (let i = 0; i < sorted.length; i++) {
         epMap.set(i + 1, [sorted[i].idx, sorted[i].relPath]);

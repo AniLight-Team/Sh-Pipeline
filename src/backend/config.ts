@@ -48,6 +48,16 @@ export const TRANSMISSION_USER = process.env.TRANSMISSION_USER || "";
 export const TRANSMISSION_PASS = process.env.TRANSMISSION_PASS || "";
 export const DEFAULT_DOWNLOAD_DIR = process.env.DEFAULT_DOWNLOAD_DIR || "/srv/torrents/complete";
 
+// ── High-Concurrency Stage 1 Discovery & Download Limits ────────
+export const KIRA_DISCOVERY_CONCURRENCY = Math.max(
+  4,
+  parseInt(process.env.KIRA_DISCOVERY_CONCURRENCY || "16", 10),
+);
+export const KIRA_DISCOVERY_PER_ANIME_CONCURRENCY = Math.max(
+  2,
+  parseInt(process.env.KIRA_DISCOVERY_PER_ANIME_CONCURRENCY || "8", 10),
+);
+
 // ── Thresholds & Performance Limits ────────────────────────────
 export const DEFAULT_MIN_SEEDERS = parseInt(process.env.MIN_SEEDERS || "1", 10);
 export const TORRENT_DOWNLOAD_TIMEOUT_SEC = parseInt(process.env.TORRENT_DOWNLOAD_TIMEOUT_SEC || "1800", 10);
@@ -67,18 +77,18 @@ export const KIRA_BATCH_MAX_ITEMS = Math.max(1, parseInt(process.env.KIRA_BATCH_
 export const KIRA_MAX_STAGING_GB = Math.max(KIRA_BATCH_MAX_GB, parseInt(process.env.KIRA_MAX_STAGING_GB || "56", 10));
 export const KIRA_MAX_STAGING_BYTES = Math.floor(KIRA_MAX_STAGING_GB * 1024 * 1024 * 1024); // Strict 56 GiB cap
 export const KIRA_MIN_FREE_SSD_BYTES = Math.floor(Math.max(5, parseInt(process.env.KIRA_MIN_FREE_SSD_GB || "12", 10)) * 1024 * 1024 * 1024);
-export const KIRA_PER_DOWNLOAD_RESERVE_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024); // 1.5 GiB reserve per active torrent download
+export const KIRA_PER_DOWNLOAD_RESERVE_BYTES = Math.floor(0.65 * 1024 * 1024 * 1024); // ~665 MB reserve per active download so 16+ concurrent downloads run smoothly within 56 GiB
 export const KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT = 2; // Kaggle allows 2 concurrent GPU sessions per account
 
-// ── Local VM Direct-Remux Batch Guardrails (H.264 Container + Audio Copy/Convert) ──
-export const KIRA_VM_MAX_CONCURRENT_BATCHES = Math.max(1, parseInt(process.env.KIRA_VM_MAX_CONCURRENT_BATCHES || "1", 10));
-export const KIRA_VM_BATCH_MAX_ITEMS = Math.max(1, parseInt(process.env.KIRA_VM_BATCH_MAX_ITEMS || "5", 10));
-export const KIRA_VM_BATCH_SAFE_MAX_BYTES = Math.floor(Math.max(2, parseInt(process.env.KIRA_VM_BATCH_MAX_GB || "6", 10)) * 1024 * 1024 * 1024);
+// ── Pipeline 1: Local VM Direct-Remux Batch Guardrails (H.264 Container + Audio Copy/Convert) ──
+export const KIRA_VM_MAX_CONCURRENT_BATCHES = Math.max(1, parseInt(process.env.KIRA_VM_MAX_CONCURRENT_BATCHES || "2", 10));
+export const KIRA_VM_BATCH_MAX_ITEMS = Math.max(1, parseInt(process.env.KIRA_VM_BATCH_MAX_ITEMS || "8", 10));
+export const KIRA_VM_BATCH_SAFE_MAX_BYTES = Math.floor(Math.max(2, parseInt(process.env.KIRA_VM_BATCH_MAX_GB || "12", 10)) * 1024 * 1024 * 1024);
 export const KIRA_VM_FFMPEG_THREADS = Math.max(1, parseInt(process.env.KIRA_VM_FFMPEG_THREADS || "2", 10));
 
 export function getMaxConcurrentBatches(): number {
   const { kaggleAccounts } = loadAccountsFromEnv();
-  // Total concurrent tasks limit = total number of kaggle accounts * 2 + VM direct-remux slot
+  // Total concurrent tasks limit = total number of kaggle accounts * 2 + VM direct-remux slots
   return Math.max(2, kaggleAccounts.length * KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT) + KIRA_VM_MAX_CONCURRENT_BATCHES;
 }
 

@@ -33,6 +33,13 @@ export interface AnimeToshoItem {
 
 export type VideoResolutionQuality = "1080p" | "720p" | "480p";
 
+export type CandidateSelectionTier =
+  | "h264_multi"
+  | "h264_single_1080p"
+  | "hevc_av1_gpu";
+
+export type PipelineExecutionType = "vm_remux" | "kaggle_gpu";
+
 export interface ParsedReleaseTitle {
   group: string;
   groupLower: string;
@@ -74,6 +81,9 @@ export interface ReleaseCandidateBundle {
   isH264: boolean;
   isDualAudio: boolean;
   isEnglishDub: boolean;
+  isSolo: boolean;
+  selectionTier: CandidateSelectionTier;
+  pipelineType: PipelineExecutionType;
   bundleScore: number;
   primaryEntry: ReleaseQualityEntry;
   qualities: Partial<Record<VideoResolutionQuality, ReleaseQualityEntry>>;
@@ -220,6 +230,7 @@ export interface EnqueueResponse {
 export interface ActiveBatchSummary {
   id: number;
   status: string;
+  pipelineType?: PipelineExecutionType;
   kaggleUsername: string | null;
   datasetSlug: string | null;
   kernelSlug: string | null;
@@ -248,6 +259,7 @@ export interface PipelineStats {
     maxPerAccount: number; // 2
     vmActive?: number;
     vmMax?: number;
+    discoveryConcurrency?: number;
   };
   queue: {
     queued: number;

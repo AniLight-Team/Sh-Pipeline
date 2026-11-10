@@ -2,7 +2,11 @@ import { inngest } from "../client.js";
 import { db, schema } from "../../db/index.js";
 import { eq, asc } from "drizzle-orm";
 import { PipelineEngineService } from "../../engine/service.js";
-import { getMaxConcurrentBatches, KIRA_VM_MAX_CONCURRENT_BATCHES } from "../../config.js";
+import {
+  getMaxConcurrentBatches,
+  KIRA_VM_MAX_CONCURRENT_BATCHES,
+  KIRA_DISCOVERY_CONCURRENCY,
+} from "../../config.js";
 import { log } from "../../utils/logger.js";
 
 export const batchExecuteFn = inngest.createFunction(
@@ -11,7 +15,7 @@ export const batchExecuteFn = inngest.createFunction(
     name: "Pipeline Stage 3: VM Direct-Remux & Kaggle GPU Batch Executor",
     concurrency: [
       // Allow up to (Kaggle Accounts * 2 + VM Direct Remux slots) batches to run concurrently
-      { limit: Math.max(4, getMaxConcurrentBatches() + KIRA_VM_MAX_CONCURRENT_BATCHES) },
+      { limit: Math.max(6, getMaxConcurrentBatches() + KIRA_VM_MAX_CONCURRENT_BATCHES) },
       // Strictly prevent the same batchId from ever executing twice concurrently
       { limit: 1, key: "event.data.batchId" },
     ],
@@ -146,7 +150,7 @@ export const batchExecuteFn = inngest.createFunction(
           .from(schema.pipelineJob)
           .where(eq(schema.pipelineJob.status, "queued"))
           .orderBy(asc(schema.pipelineJob.id))
-          .limit(3);
+          .limit(KIRA_DISCOVERY_CONCURRENCY);
 
         resumedJobs = queuedRows.map((j) => ({
           id: j.id,

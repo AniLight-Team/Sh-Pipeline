@@ -34,6 +34,13 @@ interface Job {
   episodeNumber: number;
   types: string[];
   status: string;
+  pipelineType?: "vm_remux" | "kaggle_gpu" | string | null;
+  selectionTier?: "h264_multi" | "h264_single_1080p" | "hevc_av1_gpu" | string | null;
+  releaseGroup?: string | null;
+  videoCodec?: string | null;
+  isBatchTorrent?: boolean | null;
+  qualityCount?: number | null;
+  stagedQualities?: Record<string, string> | null;
   torrentTitle?: string | null;
   sizeBytes?: number | null;
   lastError?: string | null;
@@ -197,7 +204,7 @@ export function JobTable({
   const filteredJobs = useMemo(() => {
     const base = jobs.filter((j) => {
       if (modeFilter !== "all") {
-        const jobMode = j.metadata?.processingMode;
+        const jobMode = j.pipelineType || j.metadata?.processingMode;
         if (jobMode !== modeFilter) return false;
       }
       if (!search) return true;
@@ -819,13 +826,15 @@ export function JobTable({
                               {job.torrentTitle}
                             </span>
                             <div className="flex items-center gap-1.5 mt-0.5 text-[10px] font-mono text-[#636b82]">
-                              {job.metadata?.processingMode === "vm_remux" ? (
+                              {(job.pipelineType || job.metadata?.processingMode) === "vm_remux" ? (
                                 <span className="text-emerald-400">
-                                  VM Remux (-c:v copy)
+                                  {(job.selectionTier || job.metadata?.selectionTier) === "h264_single_1080p"
+                                    ? "Pipeline 1: VM Remux (1Q 1080p)"
+                                    : "Pipeline 1: VM Remux (-c:v copy)"}
                                 </span>
-                              ) : job.metadata?.processingMode === "kaggle_gpu" ? (
+                              ) : (job.pipelineType || job.metadata?.processingMode) === "kaggle_gpu" ? (
                                 <span className="text-violet-400">
-                                  Kaggle GPU (HEVC/AV1)
+                                  Pipeline 2: Kaggle GPU (HEVC/AV1)
                                 </span>
                               ) : null}
                               {Array.isArray(job.metadata?.availableQualities) &&
@@ -834,6 +843,9 @@ export function JobTable({
                                     · {job.metadata.availableQualities.join("/")}
                                   </span>
                                 )}
+                              {Boolean(job.isBatchTorrent ?? job.metadata?.isBatchTorrent) && (
+                                <span className="text-amber-300">· 1-Ep Batch Extract</span>
+                              )}
                             </div>
                           </div>
                         ) : job.lastError ? (

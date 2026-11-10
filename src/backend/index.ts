@@ -6,7 +6,13 @@ import inngestFastify from "inngest/fastify";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { PORT, HOST, INNGEST_BASE_URL, DATABASE_URL } from "./config.js";
+import {
+  PORT,
+  HOST,
+  INNGEST_BASE_URL,
+  DATABASE_URL,
+  KIRA_DISCOVERY_CONCURRENCY,
+} from "./config.js";
 import { inngest } from "./inngest/client.js";
 import { pipelineInngestFunctions } from "./inngest/functions/index.js";
 import { apiRoutes } from "./routes/api.js";
@@ -178,7 +184,7 @@ async function runAutonomousReconciliationTick() {
             lt(schema.pipelineJob.updatedAt, ninetySecsAgo),
           ),
         )
-        .limit(4);
+        .limit(KIRA_DISCOVERY_CONCURRENCY);
 
       for (const j of stuckQueuedJobs) {
         await db
@@ -200,7 +206,11 @@ async function runAutonomousReconciliationTick() {
             },
           })
           .catch(() => {
-            PipelineEngineService.discoverAndStageJob(j.id).catch(() => {});
+            PipelineEngineService.stage1DiscoveryQueue
+              .add(async () => {
+                await PipelineEngineService.discoverAndStageJob(j.id).catch(() => {});
+              })
+              .catch(() => {});
           });
       }
     } else {
