@@ -3,6 +3,7 @@ import PQueue from "p-queue";
 import { db } from "../db/index.js";
 import { sql } from "drizzle-orm";
 import { log } from "../utils/logger.js";
+import { TsukihimeClient } from "./tsukihime.client.js";
 import type { AnimeResolvedMetadata } from "./types.js";
 
 // Cache resolved anime in memory (1 hour TTL)
@@ -16,7 +17,7 @@ const requestQueue = new PQueue({
 
 export class AnimeMetadataResolver {
   /**
-   * Resolves AniList ID to AniDB ID, internal anime ID, title variations, and cover art.
+   * Resolves AniList ID to AniDB ID, MAL ID, Tsukihime internal ID, internal anime ID, title variations, and cover art.
    */
   public static async resolve(anilistId: number): Promise<AnimeResolvedMetadata> {
     if (!anilistId || isNaN(anilistId) || anilistId <= 0) {
@@ -40,58 +41,130 @@ export class AnimeMetadataResolver {
       const dbResult = await this.resolveFromDatabase(anilistId);
       if (dbResult) {
         resolved = { ...resolved, ...dbResult, source: "database" };
-        if (resolved.anidbId && resolved.animeId) {
-          metadataCache.set(anilistId, { data: resolved, expiresAt: Date.now() + 3600_000 });
-          return resolved;
-        }
       }
     } catch {
       // Database might be unreachable or tables differ, continue to APIs
     }
 
-    // 2. Try resolving from Animap API
+    // 2. Enrich / resolve from Tsukihime API (/animes/anilist/{id} -> /animes/mal/{id} -> /animes/anidb/{id})
+    try {
+      const tsukihimeAnime = await TsukihimeClient.resolveAnime({
+        anilistId,
+        malId: resolved.malId,
+        anidbId: resolved.anidbId,
+      });
+      if (tsukihimeAnime && tsukihimeAnime.id) {
+        const tsukiSynonyms = [
+          tsukihimeAnime.title,
+          tsukihimeAnime.english_title,
+        ].filter(Boolean) as string[];
+        resolved = {
+          ...resolved,
+          tsukihimeId: tsukihimeAnime.id,
+          anidbId: resolved.anidbId || tsukihimeAnime.anidb || undefined,
+          malId: resolved.malId || tsukihimeAnime.mal || undefined,
+          titleRomaji: resolved.titleRomaji || tsukihimeAnime.title || undefined,
+          titleEnglish: resolved.titleEnglish || tsukihimeAnime.english_title || undefined,
+          primaryTitle:
+            resolved.primaryTitle !== `AniList #${anilistId}`
+              ? resolved.primaryTitle
+              : tsukihimeAnime.english_title || tsukihimeAnime.title || resolved.primaryTitle,
+          synonyms: Array.from(new Set([...(resolved.synonyms || []), ...tsukiSynonyms])),
+          totalEpisodes: resolved.totalEpisodes || tsukihimeAnime.total_episodes || undefined,
+          coverImage: resolved.coverImage || tsukihimeAnime.thumbnail || undefined,
+          source: resolved.source === "unresolved" ? "tsukihime" : `${resolved.source}+tsukihime`,
+        };
+        if (resolved.anidbId && resolved.tsukihimeId) {
+          metadataCache.set(anilistId, { data: resolved, expiresAt: Date.now() + 3600_000 });
+          return resolved;
+        }
+      }
+    } catch (e: any) {
+      log.warn("MetadataResolver", `Tsukihime resolution failed for AniList ${anilistId}: ${e?.message || e}`);
+    }
+
+    // 3. Try resolving from Animap API
     try {
       const animapResult = await this.resolveFromAnimap(anilistId);
       if (animapResult) {
         resolved = {
           ...resolved,
           ...animapResult,
-          // Preserve any existing fields from DB if Animap was partial
           animeId: resolved.animeId || animapResult.animeId,
+          tsukihimeId: resolved.tsukihimeId,
+          malId: resolved.malId || animapResult.malId,
+          synonyms: Array.from(new Set([...(resolved.synonyms || []), ...(animapResult.synonyms || [])])),
           source: resolved.animeId ? "database+animap" : "animap",
         };
-        if (resolved.anidbId) {
-          metadataCache.set(anilistId, { data: resolved, expiresAt: Date.now() + 3600_000 });
-          return resolved;
-        }
       }
     } catch (e: any) {
       log.warn("MetadataResolver", `Animap resolution failed for AniList ${anilistId}: ${e?.message || e}`);
     }
 
-    // 3. Fallback to AniList GraphQL + MAL Animap lookup
-    try {
-      const anilistData = await this.resolveFromAnilistGraphql(anilistId);
-      if (anilistData) {
-        resolved = {
-          ...resolved,
-          ...anilistData,
-          animeId: resolved.animeId || anilistData.animeId,
-          anidbId: resolved.anidbId || anilistData.anidbId,
-          source: "anilist_api",
-        };
+    // 4. Fallback to AniList GraphQL + MAL Animap lookup if still missing anidbId or primaryTitle
+    if (!resolved.anidbId || resolved.primaryTitle === `AniList #${anilistId}`) {
+      try {
+        const anilistData = await this.resolveFromAnilistGraphql(anilistId);
+        if (anilistData) {
+          resolved = {
+            ...resolved,
+            ...anilistData,
+            animeId: resolved.animeId || anilistData.animeId,
+            anidbId: resolved.anidbId || anilistData.anidbId,
+            malId: resolved.malId || anilistData.malId,
+            tsukihimeId: resolved.tsukihimeId,
+            synonyms: Array.from(new Set([...(resolved.synonyms || []), ...(anilistData.synonyms || [])])),
+            source: resolved.source === "unresolved" ? "anilist_api" : `${resolved.source}+anilist_api`,
+          };
+        }
+      } catch (e: any) {
+        log.warn("MetadataResolver", `AniList GraphQL failed for AniList ${anilistId}: ${e?.message || e}`);
       }
-    } catch (e: any) {
-      log.warn("MetadataResolver", `AniList GraphQL failed for AniList ${anilistId}: ${e?.message || e}`);
+    }
+
+    // 5. If Tsukihime wasn't resolved via AniList ID earlier, try resolving via newly discovered MAL or AniDB ID
+    if (!resolved.tsukihimeId && (resolved.malId || resolved.anidbId)) {
+      try {
+        const tsukiFallback = await TsukihimeClient.resolveAnime({
+          malId: resolved.malId,
+          anidbId: resolved.anidbId,
+        });
+        if (tsukiFallback?.id) {
+          resolved.tsukihimeId = tsukiFallback.id;
+          if (!resolved.anidbId && tsukiFallback.anidb) resolved.anidbId = tsukiFallback.anidb;
+          if (!resolved.malId && tsukiFallback.mal) resolved.malId = tsukiFallback.mal;
+        }
+      } catch {}
     }
 
     metadataCache.set(anilistId, { data: resolved, expiresAt: Date.now() + 3600_000 });
     return resolved;
   }
 
+  /**
+   * Resolves the canonical AniDB ID directly from Tsukihime/Animap/AniList for a given AniList ID,
+   * useful when a local DB external_id mapping points to a parent/adjacent season.
+   */
+  public static async resolveAnimapAnidbId(anilistId: number): Promise<number | null> {
+    if (!anilistId || isNaN(anilistId) || anilistId <= 0) return null;
+    try {
+      const tsuki = await TsukihimeClient.resolveAnime({ anilistId });
+      if (tsuki?.anidb && tsuki.anidb > 0) return tsuki.anidb;
+    } catch {}
+    try {
+      const animap = await this.resolveFromAnimap(anilistId);
+      if (animap?.anidbId) return animap.anidbId;
+    } catch {}
+    try {
+      const gql = await this.resolveFromAnilistGraphql(anilistId);
+      if (gql?.anidbId) return gql.anidbId;
+    } catch {}
+    return null;
+  }
+
   private static async resolveFromDatabase(anilistId: number): Promise<Partial<AnimeResolvedMetadata> | null> {
     const animeRows = await db.execute(sql`
-      SELECT id, title_romaji, title_english, title_native, synonyms, poster_url, episode_count
+      SELECT id, mal_id, title_romaji, title_english, title_native, synonyms, poster_url, episode_count
       FROM anime
       WHERE anilist_id = ${anilistId}
       LIMIT 1
@@ -101,16 +174,20 @@ export class AnimeMetadataResolver {
     const anime = animeRows[0] as any;
 
     let anidbId: number | undefined;
+    let malId: number | undefined = anime.mal_id ? Number(anime.mal_id) : undefined;
     const extRows = await db.execute(sql`
-      SELECT external_id
+      SELECT source, external_id
       FROM anime_external_id
-      WHERE anime_id = ${anime.id} AND source = 'anidb'
-      LIMIT 1
+      WHERE anime_id = ${anime.id} AND source IN ('anidb', 'mal', 'myanimelist')
     `).catch(() => null);
 
     if (extRows && extRows.length > 0) {
-      const parsed = parseInt((extRows[0] as any).external_id, 10);
-      if (!isNaN(parsed) && parsed > 0) anidbId = parsed;
+      for (const row of extRows as any[]) {
+        const parsed = parseInt(row.external_id, 10);
+        if (isNaN(parsed) || parsed <= 0) continue;
+        if (row.source === "anidb" && !anidbId) anidbId = parsed;
+        if ((row.source === "mal" || row.source === "myanimelist") && !malId) malId = parsed;
+      }
     }
 
     const titleEnglish = anime.title_english || undefined;
@@ -129,6 +206,7 @@ export class AnimeMetadataResolver {
     return {
       animeId: Number(anime.id),
       anidbId,
+      malId,
       titleRomaji,
       titleEnglish,
       titleNative,
@@ -180,6 +258,7 @@ export class AnimeMetadataResolver {
 
       return {
         anidbId,
+        malId,
         primaryTitle,
         synonyms,
         totalEpisodes: typeof data.episodes === "number" ? data.episodes : undefined,
@@ -272,6 +351,7 @@ export class AnimeMetadataResolver {
 
       return {
         anidbId,
+        malId: media.idMal ? Number(media.idMal) : undefined,
         titleRomaji,
         titleEnglish,
         titleNative,

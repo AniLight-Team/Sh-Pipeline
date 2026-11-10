@@ -23,6 +23,12 @@ export interface AnimeToshoItem {
   date?: number;
   num_files?: number;
   is_seadex?: boolean;
+  provider?: "animetosho" | "tsukihime";
+  tsukihime_id?: number;
+  tsukihime_episode_no?: number | null;
+  audiolangs?: string[];
+  sublangs?: string[];
+  group_name?: string;
 }
 
 export interface ParsedReleaseTitle {
@@ -245,6 +251,8 @@ export interface AnimeResolvedMetadata {
   anilistId: number;
   animeId?: number;
   anidbId?: number;
+  malId?: number;
+  tsukihimeId?: number;
   titleRomaji?: string;
   titleEnglish?: string;
   titleNative?: string;

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { VideoEncodingManager } from "./video.manager.js";
 import { SubtitleManager } from "./subtitles.manager.js";
 import { ReleaseFilter } from "./release-filter.js";
+import { TsukihimeClient } from "./tsukihime.client.js";
 import type { MkvStreamProbe } from "./types.js";
 
 test("VideoEncodingManager.generateBatchGpuKernelScript always encodes 1080p, 720p, and 480p with AniLight watermark", () => {
@@ -113,3 +114,105 @@ test("ReleaseFilter parses dual-audio and single episode releases accurately", (
   assert.equal(parsed.isDualAudio, true);
   assert.equal(parsed.is1080p, true);
 });
+
+test("ReleaseFilter infers cumulative cour offsets (+26 and +40) even when relative episodes exist in the same feed", () => {
+  const mockFeed18220 = [
+    {
+      id: 1,
+      title: "Bleach.Thousand-Year.Blood.War.S04E01.Dub.GOD.OF.THUNDER.1080p.DSNP.WEB-DL.AAC2.0.H.264-STRiKES [English Dub]",
+      seeders: 74,
+      num_files: 1,
+    },
+    {
+      id: 2,
+      title: "[NeoLX] Bleach - Sennen Kessen Hen - Soukoku Tan - 14 [END][1080p x264 10bits AAC][Multiple Subtitles].mkv",
+      seeders: 12,
+      num_files: 1,
+    },
+    {
+      id: 3,
+      title: "BLEACH.Thousand.Year.Blood.War.S01E27.A.1080p.DSNP.WEB-DL.AAC2.0.H.264.DUAL-VARYG.mkv",
+      seeders: 67,
+      num_files: 1,
+    },
+    {
+      id: 4,
+      title: "BLEACH.Thousand.Year.Blood.War.S01E40.MY.LAST.WORDS.1080p.DSNP.WEB-DL.AAC2.0.H.264.DUAL-VARYG.mkv",
+      seeders: 32,
+      num_files: 1,
+    },
+    {
+      id: 5,
+      title: "BLEACH.Thousand.Year.Blood.War.S01E27-E40.1080p.DSNP.WEB-DL.AAC2.0.H.264.DUAL-VARYG",
+      seeders: 50,
+      num_files: 14,
+    },
+  ];
+
+  // Ep 1 with "all" (sub+dub) should select S01E27 DUAL-VARYG (effectiveEp = 27) over Dub-only S04E01
+  const topEp1 = ReleaseFilter.selectTopCandidates(mockFeed18220 as any, 1, "all", {
+    maxCandidates: 3,
+  });
+  assert.equal(topEp1.length > 0, true);
+  assert.equal(topEp1[0][1], 27);
+  assert.equal(topEp1[0][0].id, 3);
+
+  // Ep 1 with "sub" should also match S01E27 DUAL-VARYG (and reject Dub-only S04E01)
+  const topEp1Sub = ReleaseFilter.selectTopCandidates(mockFeed18220 as any, 1, "sub", {
+    maxCandidates: 3,
+  });
+  assert.equal(topEp1Sub.length > 0, true);
+  assert.equal(topEp1Sub[0][1], 27);
+  assert.equal(topEp1Sub[0][0].id, 3);
+});
+
+test("TsukihimeClient & ReleaseFilter accurately match relative episode_no and audiolangs for BLEACH The Calamity (id 9403)", () => {
+  const varygEp10 = TsukihimeClient.toAnimeToshoItem({
+    id: 28448,
+    btih: "a5a98b0993a835a3aa87d1a4c5617fb63a622e35",
+    name: "[VARYG] BLEACH Thousand-Year Blood War S01E50 1080p DSNP WEB-DL AAC2.0 H.264 MULTi (Bleach: Sennen Kessen-hen - Kashin-tan S04E10)",
+    totalsize: 1384776242,
+    filecount: 1,
+    audiolangs: ["ja", "en", "de", "es", "fr", "pt"],
+    sublangs: ["en", "de", "es", "fr", "pt"],
+    episode_no: 10,
+    group: { id: 12, name: "VARYG" },
+  });
+
+  const omarArabicDual = TsukihimeClient.toAnimeToshoItem({
+    id: 28449,
+    btih: "b5a98b0993a835a3aa87d1a4c5617fb63a622e36",
+    name: "[Omar] Bleach Sennen Kessen-hen S01E50 1080p Shahid WEB-DL AAC2.0 H.264 DUAL.mkv",
+    totalsize: 950000000,
+    filecount: 1,
+    audiolangs: ["ar", "ja"],
+    sublangs: ["ar"],
+    episode_no: 10,
+    group: { id: 99, name: "Omar" },
+  });
+
+  assert.ok(varygEp10);
+  assert.ok(omarArabicDual);
+
+  // VARYG has ["ja", "en", ...] audio and ["en", ...] subs -> true Dual-Audio
+  const parsedVaryg = ReleaseFilter.parseTitle(varygEp10.title, [], varygEp10);
+  assert.equal(parsedVaryg.isDualAudio, true);
+  assert.equal(parsedVaryg.isEnglishDub, true);
+  assert.equal(parsedVaryg.isForeign, false);
+
+  // Omar has ["ar", "ja"] audio and ["ar"] subs -> NOT English dub/dual-audio, marked foreign
+  const parsedOmar = ReleaseFilter.parseTitle(omarArabicDual.title, [], omarArabicDual);
+  assert.equal(parsedOmar.isDualAudio, false);
+  assert.equal(parsedOmar.isEnglishDub, false);
+  assert.equal(parsedOmar.isForeign, true);
+
+  // Querying Episode 10 should select VARYG and reject Omar Arabic-only subs
+  const topEp10 = ReleaseFilter.selectTopCandidates([omarArabicDual, varygEp10], 10, "all", {
+    totalExpectedEps: 10,
+    maxCandidates: 3,
+  });
+  assert.equal(topEp10.length, 1);
+  assert.equal(topEp10[0][0].tsukihime_id, 28448);
+});
+
+

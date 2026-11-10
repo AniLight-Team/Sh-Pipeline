@@ -2,126 +2,103 @@
 
 @layer base {
   :root {
-    /* Graphite & Slate (AniLight's exact default modern dark mode) */
-    --background: oklch(0.16 0.01 260); /* #12131c */
-    --foreground: oklch(0.96 0.01 260); /* Clean, crisp paper white #f1f3f9 */
+    --bg-canvas: #090a0f;
+    --bg-surface: #10121a;
+    --bg-elevated: #151822;
+    --bg-hover: #1a1e2b;
+    --border-hairline: #1e2230;
+    --border-strong: #2a3042;
+    --text-primary: #f3f4f8;
+    --text-secondary: #949bb0;
+    --text-muted: #636b82;
+    --accent-primary: #6366f1;
+    --accent-hover: #4f46e5;
+  }
 
-    --surface: oklch(0.2 0.01 260); /* #181926 */
-    --surface-elevated: oklch(0.23 0.01 260); /* #1f2030 */
-
-    --card: oklch(0.19 0.01 260); /* #161723 */
-    --card-foreground: oklch(0.96 0.01 260);
-
-    --primary: oklch(0.95 0.01 260); /* Crisp paper white */
-    --primary-foreground: oklch(0.14 0.01 260); /* Dark text on white buttons */
-
-    --muted: oklch(0.23 0.01 260);
-    --muted-foreground: oklch(0.65 0.02 260); /* Pencil lead gray #9499ab */
-
-    --border: oklch(0.26 0.01 260); /* #262838 */
-    --border-subtle: rgba(255, 255, 255, 0.08);
-
-    --gradient-primary: linear-gradient(135deg, #ffffff 0%, #cbd5e1 100%);
+  html {
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 
   body {
-    font-family: 'Space Grotesk', 'Inter', system-ui, -apple-system, sans-serif;
-    background-color: #12131c;
-    color: #f1f3f9;
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    font-family: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, sans-serif;
     overflow-x: hidden;
+    letter-spacing: 0.005em;
   }
 
-  code, pre, .font-mono {
-    font-family: 'JetBrains Mono', monospace;
+  code,
+  pre,
+  .font-mono {
+    font-family: "JetBrains Mono", monospace;
+    font-variant-numeric: tabular-nums;
   }
 }
 
-/* AniLight Luxury Buttons & Badges (Matching styles.css exactly) */
-.button-glow {
-  background: linear-gradient(180deg, #ffffff 0%, #e0e2eb 100%);
-  color: #111827 !important;
-  border: none !important;
-  box-shadow:
-    0 0 14px -2px rgba(255, 255, 255, 0.28),
-    0 0 24px -3px rgba(255, 255, 255, 0.15),
-    inset 0 -1px 2px 0 rgba(0, 0, 0, 0.1);
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-  isolation: isolate;
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }
 
-.button-glow:hover {
-  filter: brightness(1.05);
-  box-shadow:
-    0 0 18px 0px rgba(255, 255, 255, 0.38),
-    0 0 30px -1px rgba(255, 255, 255, 0.22),
-    inset 0 -1px 2px 0 rgba(0, 0, 0, 0.1);
+/* Primary High-Intent Action Button */
+.btn-primary {
+  background-color: #6366f1;
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+  transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1), background-color 150ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-.button-glow:active {
-  transform: scale(0.98);
+.btn-primary:hover:not(:disabled) {
+  background-color: #4f46e5;
 }
 
-.button-liquid-glass {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  transition: all 0.2s cubic-bezier(0.25, 1, 0.5, 1);
+.btn-primary:active:not(:disabled) {
+  transform: scale(0.985);
 }
 
-.button-liquid-glass:hover {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.2);
+/* Secondary Surface Button */
+.btn-secondary {
+  background-color: #151822;
+  color: #d5d9e6;
+  border: 1px solid #232838;
+  transition: transform 150ms cubic-bezier(0.16, 1, 0.3, 1), background-color 150ms cubic-bezier(0.16, 1, 0.3, 1), border-color 150ms cubic-bezier(0.16, 1, 0.3, 1), color 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background-color: #1c202e;
+  border-color: #31384f;
   color: #ffffff;
 }
 
-.button-liquid-glass:active {
-  transform: scale(0.98);
+.btn-secondary:active:not(:disabled) {
+  transform: scale(0.985);
 }
 
-/* AniLight Signature Text Gradient */
-.text-gradient {
-  background: linear-gradient(135deg, #ffffff 0%, #cbd5e1 100%);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+/* Surface Card Contract (Single-Elevation Depth) */
+.surface-panel {
+  background-color: #10121a;
+  border: 1px solid #1e2230;
 }
 
-/* AniLight Recessed Glass Dock */
-.anilight-dock {
-  background: rgba(22, 23, 35, 0.88);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: 0 16px 40px -12px rgba(0, 0, 0, 0.7);
-  backdrop-filter: blur(28px) saturate(180%);
-  -webkit-backdrop-filter: blur(28px) saturate(180%);
-}
-
-/* Ambient subtle monochrome glow */
-.ambient-glow {
-  position: absolute;
-  top: 0;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 900px;
-  height: 280px;
-  background: radial-gradient(ellipse at top, rgba(255, 255, 255, 0.05), transparent 70%);
-  pointer-events: none;
-  z-index: 0;
-}
-
-/* Custom dark scrollbar */
+/* Subtle Custom Scrollbar */
 ::-webkit-scrollbar {
-  width: 5px;
-  height: 5px;
+  width: 6px;
+  height: 6px;
 }
+
 ::-webkit-scrollbar-track {
   background: transparent;
 }
+
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
-  border-radius: 9999px;
-  transition: background 0.2s ease;
+  background: #232838;
+  border-radius: 3px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.22);
+  background: #32394f;
 }

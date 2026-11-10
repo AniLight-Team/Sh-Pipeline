@@ -6,7 +6,7 @@ import inngestFastify from "inngest/fastify";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { PORT, HOST, INNGEST_BASE_URL } from "./config.js";
+import { PORT, HOST, INNGEST_BASE_URL, DATABASE_URL } from "./config.js";
 import { inngest } from "./inngest/client.js";
 import { pipelineInngestFunctions } from "./inngest/functions/index.js";
 import { apiRoutes } from "./routes/api.js";
@@ -107,6 +107,7 @@ async function registerWithInngestServer() {
  * Ensures restarts of sh-pipeline (:4050) or Main Backend (:4000) never stall jobs, batches, or callbacks.
  */
 async function runAutonomousReconciliationTick() {
+  if (!DATABASE_URL) return;
   try {
     await PipelineEngineService.ensureTables();
 

@@ -13,78 +13,70 @@ export function KaggleAccountsModal({ isOpen, onClose, stats }: KaggleAccountsMo
 
   const accounts = stats?.accounts?.kaggle || [];
   const activeBatches = stats?.activeBatches || [];
-  const totalSlots = stats?.concurrency?.max || accounts.length * 2;
+  const totalSlots = stats?.concurrency?.max || Math.max(2, accounts.length * 2);
   const activeSlots = stats?.concurrency?.active || 0;
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
-      <div className="bg-[#161724] border border-white/[0.1] rounded-3xl max-w-2xl w-full p-6 shadow-2xl relative max-h-[90vh] overflow-y-auto">
-        <div className="flex items-start justify-between pb-4 border-b border-white/[0.08]">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-2xl bg-purple-500/10 border border-purple-500/20 flex items-center justify-center text-purple-300">
-              <Cpu className="w-5 h-5" />
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="kaggle-modal-title"
+      className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+    >
+      <div className="surface-panel rounded-xl max-w-2xl w-full p-6 shadow-2xl relative max-h-[90vh] overflow-y-auto">
+        <div className="flex items-start justify-between pb-4 border-b border-[#1e2230]">
+          <div className="flex items-center gap-3 pr-8">
+            <div className="w-9 h-9 rounded-lg bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-indigo-400 shrink-0">
+              <Cpu className="w-4 h-4" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <h3 className="text-base font-bold text-white tracking-tight">
-                  Kaggle GPU Cluster & Account Pool
-                </h3>
-                <span className="px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold bg-purple-500/10 text-purple-300 border border-purple-500/20">
-                  {accounts.length} Accounts
-                </span>
-              </div>
-              <p className="text-xs text-neutral-400 mt-0.5">
-                Each Kaggle account supports up to 2 concurrent running notebooks ({totalSlots} total cluster slots).
+              <h3 id="kaggle-modal-title" className="text-base font-bold text-[#f3f4f8]">
+                Kaggle GPU Cluster & Account Pool
+              </h3>
+              <p className="text-xs text-[#636b82] mt-0.5">
+                {accounts.length} configured {accounts.length === 1 ? "account" : "accounts"} · 2 concurrent T4×2 GPU notebook slots per account ({totalSlots} total slots)
               </p>
             </div>
           </div>
 
           <button
+            type="button"
             onClick={onClose}
-            className="button-liquid-glass w-8 h-8 rounded-full flex items-center justify-center text-neutral-400 hover:text-white transition-colors cursor-pointer"
+            aria-label="Close Kaggle cluster modal"
+            className="btn-secondary w-8 h-8 rounded-lg flex items-center justify-center text-[#949bb0] hover:text-white cursor-pointer"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Global Cluster Meter */}
-        <div className="my-5 p-4 rounded-2xl bg-[#10111a] border border-white/[0.07] flex items-center justify-between">
+        {/* Cluster Summary Bar */}
+        <div className="my-4 p-4 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex items-center justify-between">
           <div>
-            <div className="text-[11px] font-mono uppercase tracking-wider text-neutral-400">
-              Active Concurrent Sessions
-            </div>
-            <div className="text-2xl font-bold font-mono text-white mt-1">
+            <div className="text-xs text-[#949bb0]">Active Concurrent GPU Sessions</div>
+            <div className="text-xl font-bold font-mono tabular-nums text-[#f3f4f8] mt-0.5">
               {activeSlots}{" "}
-              <span className="text-sm text-neutral-500 font-normal">/ {totalSlots} max slots</span>
+              <span className="text-xs text-[#636b82] font-normal">/ {totalSlots} max slots</span>
             </div>
           </div>
-          <div className="text-right">
-            <span
-              className={`px-3 py-1 rounded-full text-xs font-mono font-bold ${
-                activeSlots >= totalSlots
-                  ? "bg-rose-500/10 text-rose-300 border border-rose-500/20"
-                  : activeSlots > 0
-                  ? "bg-white/[0.1] text-white border border-white/20"
-                  : "bg-emerald-500/10 text-emerald-300 border border-emerald-500/20"
-              }`}
-            >
-              {activeSlots >= totalSlots
-                ? "FULL CAPACITY"
-                : activeSlots > 0
-                ? "CLUSTER RUNNING"
-                : "ALL SLOTS IDLE"}
-            </span>
+          <div className="text-xs font-mono">
+            {activeSlots >= totalSlots ? (
+              <span className="text-amber-400">Cluster at Full Capacity</span>
+            ) : activeSlots > 0 ? (
+              <span className="text-sky-400">Active Encoding ({activeSlots} running)</span>
+            ) : (
+              <span className="text-emerald-400">All Slots Available</span>
+            )}
           </div>
         </div>
 
-        {/* Accounts List */}
+        {/* Account Cards */}
         <div className="space-y-3">
-          <h4 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">
-            Configured Kaggle Accounts ({accounts.length})
+          <h4 className="text-xs font-semibold text-[#949bb0]">
+            Account Slot Allocation
           </h4>
 
           {accounts.length === 0 ? (
-            <div className="p-6 text-center text-neutral-500 text-xs rounded-2xl bg-[#10111a] border border-white/[0.05]">
+            <div className="p-6 text-center text-[#636b82] text-xs rounded-lg bg-[#0c0e14] border border-[#1e2230]">
               No Kaggle accounts found in environment (KAGGLE_ACCOUNTS).
             </div>
           ) : (
@@ -94,97 +86,53 @@ export function KaggleAccountsModal({ isOpen, onClose, stats }: KaggleAccountsMo
               return (
                 <div
                   key={acc.username || idx}
-                  className="p-4 rounded-2xl bg-[#10111a] border border-white/[0.06] hover:border-white/[0.12] transition-colors"
+                  className="p-4 rounded-lg bg-[#0c0e14] border border-[#1e2230]"
                 >
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-sm font-bold text-white">
-                        @{acc.username}
-                      </span>
-                      <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-white/[0.04] text-neutral-400 border border-white/[0.06]">
-                        Account #{idx + 1}
-                      </span>
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2 font-mono text-xs">
+                      <span className="font-semibold text-[#f3f4f8]">@{acc.username}</span>
+                      <span className="text-[#636b82]">· Account #{idx + 1}</span>
                     </div>
-
-                    <div className="flex items-center gap-2">
-                      <span className="text-[11px] font-mono text-neutral-400">
-                        Load: {acc.activeTasks}/2 Slots
-                      </span>
-                      <div className="flex items-center gap-1">
-                        <span
-                          className={`w-2 h-2 rounded-full ${
-                            acc.slots[0] ? "bg-emerald-400 animate-pulse" : "bg-neutral-700"
-                          }`}
-                          title={acc.slots[0] ? "Slot 1: Active" : "Slot 1: Idle"}
-                        />
-                        <span
-                          className={`w-2 h-2 rounded-full ${
-                            acc.slots[1] ? "bg-emerald-400 animate-pulse" : "bg-neutral-700"
-                          }`}
-                          title={acc.slots[1] ? "Slot 2: Active" : "Slot 2: Idle"}
-                        />
-                      </div>
-                    </div>
+                    <span className="text-xs font-mono tabular-nums text-[#949bb0]">
+                      {acc.activeTasks} / 2 slots active
+                    </span>
                   </div>
 
-                  {/* Dual-Slot Visual Representation */}
-                  <div className="grid grid-cols-2 gap-2 mt-3">
-                    <div
-                      className={`p-2.5 rounded-xl border text-[11px] font-mono flex items-center justify-between ${
-                        acc.slots[0]
-                          ? "bg-white/[0.08] border-white/20 text-white"
-                          : "bg-white/[0.02] border-white/[0.05] text-neutral-500"
-                      }`}
-                    >
-                      <div className="flex items-center gap-2">
-                        <Zap
-                          className={`w-3.5 h-3.5 ${
-                            acc.slots[0] ? "text-emerald-400" : "text-neutral-600"
+                  <div className="grid grid-cols-2 gap-2.5">
+                    {[0, 1].map((slotIdx) => {
+                      const isOccupied = Boolean(acc.slots?.[slotIdx]);
+                      return (
+                        <div
+                          key={slotIdx}
+                          className={`p-2.5 rounded-lg border text-xs font-mono flex items-center justify-between ${
+                            isOccupied
+                              ? "bg-indigo-500/10 border-indigo-500/30 text-[#f3f4f8]"
+                              : "bg-[#10121a] border-[#1e2230] text-[#636b82]"
                           }`}
-                        />
-                        <span>Slot 1: {acc.slots[0] ? "Running Notebook" : "Available"}</span>
-                      </div>
-                      {acc.slots[0] && (
-                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-white/20 text-white font-bold">
-                          BUSY
-                        </span>
-                      )}
-                    </div>
-
-                    <div
-                      className={`p-2.5 rounded-xl border text-[11px] font-mono flex items-center justify-between ${
-                        acc.slots[1]
-                          ? "bg-white/[0.08] border-white/20 text-white"
-                          : "bg-white/[0.02] border-white/[0.05] text-neutral-500"
-                      }`}
-                    >
-                      <div className="flex items-center gap-2">
-                        <Zap
-                          className={`w-3.5 h-3.5 ${
-                            acc.slots[1] ? "text-emerald-400" : "text-neutral-600"
-                          }`}
-                        />
-                        <span>Slot 2: {acc.slots[1] ? "Running Notebook" : "Available"}</span>
-                      </div>
-                      {acc.slots[1] && (
-                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-white/20 text-white font-bold">
-                          BUSY
-                        </span>
-                      )}
-                    </div>
+                        >
+                          <div className="flex items-center gap-2">
+                            <Zap
+                              className={`w-3.5 h-3.5 ${
+                                isOccupied ? "text-indigo-400" : "text-[#636b82]"
+                              }`}
+                            />
+                            <span>Slot {slotIdx + 1}</span>
+                          </div>
+                          <span>{isOccupied ? "Running" : "Idle"}</span>
+                        </div>
+                      );
+                    })}
                   </div>
 
-                  {/* Running Batches Info */}
                   {accountBatches.length > 0 && (
-                    <div className="mt-3 pt-2.5 border-t border-white/[0.05] flex flex-wrap gap-2">
+                    <div className="mt-3 pt-2.5 border-t border-[#1e2230] flex flex-wrap gap-3">
                       {accountBatches.map((b) => (
                         <div
                           key={b.id}
-                          className="flex items-center gap-1.5 text-[10px] font-mono px-2.5 py-1 rounded-full bg-white/[0.04] text-neutral-300 border border-white/[0.08]"
+                          className="flex items-center gap-1.5 text-xs font-mono text-[#d5d9e6]"
                         >
-                          <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                          <span>Batch #{b.id}</span>
-                          <span className="text-neutral-500">({b.jobCount} files)</span>
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Batch #{b.id} ({b.jobCount} files)</span>
                         </div>
                       ))}
                     </div>
@@ -195,10 +143,11 @@ export function KaggleAccountsModal({ isOpen, onClose, stats }: KaggleAccountsMo
           )}
         </div>
 
-        <div className="mt-5 pt-4 border-t border-white/[0.08] flex justify-end">
+        <div className="mt-5 pt-4 border-t border-[#1e2230] flex justify-end">
           <button
+            type="button"
             onClick={onClose}
-            className="button-liquid-glass px-5 py-2 rounded-full text-xs font-semibold text-neutral-300 hover:text-white transition-colors cursor-pointer"
+            className="btn-secondary px-4 py-2 rounded-lg text-xs font-medium cursor-pointer"
           >
             Close
           </button>

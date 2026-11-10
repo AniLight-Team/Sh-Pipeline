@@ -21,7 +21,11 @@ export class TorrentDownloadTooSlowException extends Error {
 }
 
 // ── Service & Networking Configuration ──────────────────────────
-export const PORT = parseInt(process.env.PORT || "4050", 10);
+export const PORT = parseInt(
+  process.env.PIPELINE_PORT ||
+    (process.env.PORT && process.env.PORT !== "3000" ? process.env.PORT : "4050"),
+  10,
+);
 export const HOST = process.env.HOST || "0.0.0.0";
 export const NODE_ENV = process.env.NODE_ENV || "development";
 export const IS_PROD = NODE_ENV === "production";

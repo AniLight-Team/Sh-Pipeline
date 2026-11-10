@@ -109,8 +109,8 @@ export class AnimeToshoClient {
         },
       );
 
-      const hasTopQuality = matchingCandidates.some(([item]) =>
-        ReleaseFilter.isHighQualityCandidate(item, targetEpNum, langType, knownTitles),
+      const hasTopQuality = matchingCandidates.some(([item, effectiveEp]) =>
+        ReleaseFilter.isHighQualityCandidate(item, effectiveEp, langType, knownTitles),
       );
 
       const isDubSearch = String(langType).toLowerCase() === "dub";

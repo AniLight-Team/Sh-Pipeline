@@ -7,9 +7,11 @@ import { TransmissionClient } from "./transmission.client.js";
 import { SubtitleManager, inspectMkvStreamsSync } from "./subtitles.manager.js";
 import { VideoEncodingManager } from "./video.manager.js";
 import { AnimeToshoClient, type FetchTorrentsOptions } from "./animetosho.client.js";
+import { TsukihimeClient } from "./tsukihime.client.js";
 import { ReleaseFilter } from "./release-filter.js";
 import { AnimeMetadataResolver } from "./metadata-resolver.js";
 import {
+  DATABASE_URL,
   DEFAULT_DOWNLOAD_DIR,
   MAIN_BACKEND_URL,
   INTERNAL_SECRET,
@@ -48,7 +50,7 @@ export class PipelineEngineService {
   }
 
   public static async ensureTables(): Promise<void> {
-    if (tablesInitialized) return;
+    if (tablesInitialized || !DATABASE_URL) return;
     try {
       await db.execute(sql`
         CREATE TABLE IF NOT EXISTS "pipeline_encoding_batch" (
@@ -175,6 +177,8 @@ export class PipelineEngineService {
             ...metadata,
             animeId: animeId || metadata?.animeId,
             anilistId,
+            malId: resolved.malId || metadata?.malId,
+            tsukihimeId: resolved.tsukihimeId || metadata?.tsukihimeId,
             primaryTitle: resolved.primaryTitle,
             coverImage: resolved.coverImage,
             totalEpisodes: resolved.totalEpisodes,
@@ -182,7 +186,7 @@ export class PipelineEngineService {
           };
           log.info(
             "PipelineEngine",
-            `Resolved AniList #${anilistId} -> AniDB: ${anidbId || "n/a"}, AnimeId: ${animeId || "n/a"}, Title: "${resolved.primaryTitle}"`,
+            `Resolved AniList #${anilistId} -> AniDB: ${anidbId || "n/a"}, Tsukihime: ${resolved.tsukihimeId || "n/a"}, AnimeId: ${animeId || "n/a"}, Title: "${resolved.primaryTitle}"`,
           );
         }
       } catch (err: any) {
@@ -320,76 +324,193 @@ export class PipelineEngineService {
     try {
       log.info(
         "PipelineEngine",
-        `Searching AnimeTosho for Job #${job.id} (AniList ${job.anilistId || "n/a"} | AniDB ${job.anidbId || "n/a"} Ep ${job.episodeNumber} [${job.types.join("/")}])...`,
+        `Searching Tsukihime & AnimeTosho for Job #${job.id} (AniList ${job.anilistId || "n/a"} | AniDB ${job.anidbId || "n/a"} Ep ${job.episodeNumber} [${job.types.join("/")}])...`,
       );
 
       const wantsDub = job.types.includes("dub");
       const wantsSub = job.types.includes("sub");
       const isDubOnly = wantsDub && !wantsSub;
-      const langTypeForSearch = isDubOnly ? "dub" : "all";
-      const langQuery = wantsDub ? "dual-audio 1080p" : "1080p";
+      const isSubOnly = wantsSub && !wantsDub;
+      const langTypeForSearch = isDubOnly ? "dub" : isSubOnly ? "sub" : "all";
+      let totalExpectedEps =
+        typeof job.metadata?.totalEpisodes === "number" && job.metadata.totalEpisodes > 0
+          ? job.metadata.totalEpisodes
+          : null;
+      const effectiveKnownTitles = Array.from(new Set([...(job.knownTitles || [])]));
+
+      const torrentByKey = new Map<string | number, AnimeToshoItem>();
+      const allTorrents: AnimeToshoItem[] = [];
+      const mergeTorrents = (items: AnimeToshoItem[]) => {
+        for (const item of items) {
+          const hashKey = item.info_hash ? item.info_hash.toLowerCase().trim() : null;
+          const key = hashKey || item.id || item.title;
+          if (!key) continue;
+
+          const existing = torrentByKey.get(key);
+          if (!existing) {
+            torrentByKey.set(key, item);
+            allTorrents.push(item);
+          } else {
+            // Merge metadata across Tsukihime and AnimeTosho when both index the same info_hash
+            if (item.tsukihime_id && !existing.tsukihime_id) existing.tsukihime_id = item.tsukihime_id;
+            if (typeof item.tsukihime_episode_no === "number" && existing.tsukihime_episode_no == null) {
+              existing.tsukihime_episode_no = item.tsukihime_episode_no;
+            }
+            if (Array.isArray(item.audiolangs) && item.audiolangs.length > 0 && !existing.audiolangs?.length) {
+              existing.audiolangs = item.audiolangs;
+            }
+            if (Array.isArray(item.sublangs) && item.sublangs.length > 0 && !existing.sublangs?.length) {
+              existing.sublangs = item.sublangs;
+            }
+            if (item.group_name && !existing.group_name) existing.group_name = item.group_name;
+            if (item.is_seadex) existing.is_seadex = true;
+            if ((item.seeders || 0) > (existing.seeders || 0)) existing.seeders = item.seeders;
+            if ((item.leechers || 0) > (existing.leechers || 0)) existing.leechers = item.leechers;
+            if (item.torrent_url && !existing.torrent_url) existing.torrent_url = item.torrent_url;
+          }
+        }
+      };
+
+      const evaluateCandidates = (): [AnimeToshoItem, number | string][] => {
+        if (allTorrents.length === 0) return [];
+        let cands = ReleaseFilter.selectTopCandidates(
+          allTorrents,
+          job.episodeNumber,
+          langTypeForSearch,
+          {
+            knownTitles: effectiveKnownTitles,
+            totalExpectedEps,
+            maxCandidates: 4,
+          },
+        );
+        if (cands.length === 0 && wantsSub && wantsDub) {
+          cands = ReleaseFilter.selectTopCandidates(
+            allTorrents,
+            job.episodeNumber,
+            "sub",
+            {
+              knownTitles: effectiveKnownTitles,
+              totalExpectedEps,
+              maxCandidates: 4,
+            },
+          );
+        }
+        return cands;
+      };
+
+      let topCandidates: [AnimeToshoItem, number | string][] = [];
+
+      // 1. Search Tsukihime API first (/animes/anilist/{id} -> /animes/mal/{id} -> /animes/anidb/{id},
+      //    then /animes/{internalId}/episodes/{ep} + paginated /animes/{internalId})
+      let tsukihimeAnidbId: number | null = null;
+      try {
+        const tsukiLookup = {
+          tsukihimeId: job.metadata?.tsukihimeId ? Number(job.metadata.tsukihimeId) : null,
+          anilistId: job.anilistId,
+          malId: job.metadata?.malId ? Number(job.metadata.malId) : null,
+          anidbId: job.anidbId,
+        };
+        const { anime: tsukiAnime, torrents: tsukiTorrents } = await TsukihimeClient.fetchTorrents(
+          tsukiLookup,
+          {
+            targetEp: job.episodeNumber,
+            langType: langTypeForSearch,
+            knownTitles: effectiveKnownTitles,
+            episodeCount: totalExpectedEps,
+            maxPages: 4,
+          },
+        );
+        if (tsukiAnime) {
+          if (!totalExpectedEps && tsukiAnime.total_episodes && tsukiAnime.total_episodes > 0) {
+            totalExpectedEps = tsukiAnime.total_episodes;
+          }
+          if (tsukiAnime.title && !effectiveKnownTitles.includes(tsukiAnime.title)) {
+            effectiveKnownTitles.push(tsukiAnime.title);
+          }
+          if (tsukiAnime.english_title && !effectiveKnownTitles.includes(tsukiAnime.english_title)) {
+            effectiveKnownTitles.push(tsukiAnime.english_title);
+          }
+          if (tsukiAnime.anidb && tsukiAnime.anidb > 0) {
+            tsukihimeAnidbId = tsukiAnime.anidb;
+          }
+        }
+        if (tsukiTorrents.length > 0) {
+          mergeTorrents(tsukiTorrents);
+          topCandidates = evaluateCandidates();
+        }
+      } catch (tsukiErr: any) {
+        log.warn("PipelineEngine", `[Job #${job.id}] Tsukihime search warning: ${tsukiErr?.message || tsukiErr}`);
+      }
 
       const opts: FetchTorrentsOptions = {
         targetEp: job.episodeNumber,
         langType: langTypeForSearch,
-        knownTitles: job.knownTitles || [],
+        knownTitles: effectiveKnownTitles,
+        episodeCount: totalExpectedEps,
         maxPages: 6,
       };
 
-      let torrents: AnimeToshoItem[] = [];
+      const searchByAnidbId = async (aid: number) => {
+        // 1. Primary 1080p feed for this AniDB ID (includes Dual-Audio, Dub, and Sub releases)
+        mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "1080p", opts));
+        topCandidates = evaluateCandidates();
 
-      // 1. Search via AniDB ID if present
+        // 2. If dub requested and still no viable candidate, try explicit dub/dual-audio queries
+        if (topCandidates.length === 0 && wantsDub) {
+          mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "dual-audio 1080p", opts));
+          topCandidates = evaluateCandidates();
+        }
+        if (topCandidates.length === 0 && wantsDub) {
+          mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "dub 1080p", opts));
+          topCandidates = evaluateCandidates();
+        }
+
+        // 3. Broaden to all resolutions on this AniDB ID if 1080p had no viable candidates
+        if (topCandidates.length === 0) {
+          mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "", opts));
+          topCandidates = evaluateCandidates();
+        }
+      };
+
+      // 2. Search AnimeTosho via job's AniDB ID if present
       if (job.anidbId) {
-        torrents = await AnimeToshoClient.fetchTorrents(job.anidbId, langQuery, opts);
-
-        if (torrents.length === 0 && wantsDub) {
-          torrents = await AnimeToshoClient.fetchTorrents(job.anidbId, "dub 1080p", opts);
-        }
-        if (torrents.length === 0) {
-          torrents = await AnimeToshoClient.fetchTorrents(job.anidbId, "1080p", opts);
-        }
-        if (torrents.length === 0) {
-          torrents = await AnimeToshoClient.fetchTorrents(job.anidbId, "", opts);
-        }
+        await searchByAnidbId(job.anidbId);
       }
 
-      // 2. Fallback: Search via known titles if AniDB ID was missing or yielded 0 results
-      if (torrents.length === 0 && Array.isArray(job.knownTitles) && job.knownTitles.length > 0) {
-        for (const title of job.knownTitles) {
-          if (!title || !title.trim()) continue;
-          log.info("PipelineEngine", `Searching AnimeTosho by title "${title.trim()}" Ep ${job.episodeNumber}...`);
-          torrents = await AnimeToshoClient.fetchTorrentsByTitle(title.trim(), langQuery, opts);
-          if (torrents.length > 0) break;
-          if (wantsDub) {
-            torrents = await AnimeToshoClient.fetchTorrentsByTitle(title.trim(), "dub 1080p", opts);
-            if (torrents.length > 0) break;
-          }
-          torrents = await AnimeToshoClient.fetchTorrentsByTitle(title.trim(), "1080p", opts);
-          if (torrents.length > 0) break;
-        }
-      }
-
-      let topCandidates = ReleaseFilter.selectTopCandidates(
-        torrents,
-        job.episodeNumber,
-        langTypeForSearch,
-        {
-          knownTitles: job.knownTitles || [],
-          maxCandidates: 4,
-        },
-      );
-
-      // If strict dub filter found 0 candidates when both sub+dub were requested, fallback to "all" so sub still succeeds
-      if (topCandidates.length === 0 && wantsSub && wantsDub) {
-        topCandidates = ReleaseFilter.selectTopCandidates(
-          torrents,
-          job.episodeNumber,
-          "all",
-          {
-            knownTitles: job.knownTitles || [],
-            maxCandidates: 4,
-          },
+      // 3. If Tsukihime or Animap resolved a different canonical AniDB ID (e.g. 19079 vs 18220), search that too
+      const canonicalAnidb =
+        tsukihimeAnidbId ||
+        (topCandidates.length === 0 && job.anilistId
+          ? await AnimeMetadataResolver.resolveAnimapAnidbId(job.anilistId)
+          : null);
+      if (canonicalAnidb && canonicalAnidb !== job.anidbId) {
+        log.info(
+          "PipelineEngine",
+          `[Job #${job.id}] Searching AnimeTosho via canonical AniDB #${canonicalAnidb} for AniList #${job.anilistId || "n/a"}...`,
         );
+        await searchByAnidbId(canonicalAnidb);
+      }
+
+      // 4. Fallback: Search via known titles if ID searches yielded 0 viable candidates
+      if (topCandidates.length === 0 && effectiveKnownTitles.length > 0) {
+        for (const title of effectiveKnownTitles) {
+          if (!title || !title.trim()) continue;
+          const clean = title.trim();
+          log.info("PipelineEngine", `Searching AnimeTosho by title "${clean}" Ep ${job.episodeNumber}...`);
+          mergeTorrents(await AnimeToshoClient.fetchTorrentsByTitle(clean, "1080p", opts));
+          topCandidates = evaluateCandidates();
+          if (topCandidates.length > 0) break;
+
+          if (wantsDub) {
+            mergeTorrents(await AnimeToshoClient.fetchTorrentsByTitle(clean, "dual-audio 1080p", opts));
+            topCandidates = evaluateCandidates();
+            if (topCandidates.length > 0) break;
+
+            mergeTorrents(await AnimeToshoClient.fetchTorrentsByTitle(clean, "dub 1080p", opts));
+            topCandidates = evaluateCandidates();
+            if (topCandidates.length > 0) break;
+          }
+        }
       }
 
       if (topCandidates.length === 0) {
@@ -397,6 +518,9 @@ export class PipelineEngineService {
           `No viable candidate releases found for AniList ${job.anilistId || "n/a"} / AniDB ${job.anidbId || "n/a"} Ep ${job.episodeNumber}`,
         );
       }
+
+      // Hydrate Tsukihime candidates with live tracker announce URLs and seeder counts from /v1/torrents/{id}
+      topCandidates = await TsukihimeClient.hydrateCandidates(topCandidates);
 
       let downloadedFilePath: string | null = null;
       let selectedCandidate: AnimeToshoItem | null = null;
@@ -1676,11 +1800,32 @@ export class PipelineEngineService {
   public static async getStats(): Promise<PipelineStats> {
     await this.ensureTables();
 
-    const activeBatchRows = await db
-      .select()
-      .from(schema.pipelineBatch)
-      .where(inArray(schema.pipelineBatch.status, ["created", "uploading", "waiting_dataset", "kernel_running"]))
-      .orderBy(asc(schema.pipelineBatch.id));
+    let activeBatchRows: (typeof schema.pipelineBatch.$inferSelect)[] = [];
+    let counts: { status: string; count: number }[] = [];
+    let windowStats: { stagedCount: number; totalBytes: number } = {
+      stagedCount: 0,
+      totalBytes: 0,
+    };
+
+    try {
+      activeBatchRows = await db
+        .select()
+        .from(schema.pipelineBatch)
+        .where(inArray(schema.pipelineBatch.status, ["created", "uploading", "waiting_dataset", "kernel_running"]))
+        .orderBy(asc(schema.pipelineBatch.id));
+
+      counts = await db
+        .select({
+          status: schema.pipelineJob.status,
+          count: sql<number>`count(*)`,
+        })
+        .from(schema.pipelineJob)
+        .groupBy(schema.pipelineJob.status);
+
+      windowStats = await this.getStagedWindowStats();
+    } catch {
+      // PostgreSQL not connected in standalone UI preview; return zeroed DB counters gracefully
+    }
 
     const activeBatches = activeBatchRows.map((row) => ({
       id: row.id,
@@ -1696,14 +1841,6 @@ export class PipelineEngineService {
       heartbeatAt: row.heartbeatAt.toISOString(),
     }));
 
-    const counts = await db
-      .select({
-        status: schema.pipelineJob.status,
-        count: sql<number>`count(*)`,
-      })
-      .from(schema.pipelineJob)
-      .groupBy(schema.pipelineJob.status);
-
     const queueMap: Record<string, number> = {};
     let total = 0;
     for (const c of counts) {
@@ -1712,7 +1849,6 @@ export class PipelineEngineService {
       total += n;
     }
 
-    const windowStats = await this.getStagedWindowStats();
     const { kaggleAccounts, hfAccounts } = loadAccountsFromEnv();
 
     const kaggleAccountStatus = kaggleAccounts.map((a) => {

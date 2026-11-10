@@ -119,8 +119,12 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
         .offset(offset) as any;
     }
 
-    const jobs = await q;
-    return { jobs, limit, offset };
+    try {
+      const jobs = await q;
+      return { jobs, limit, offset };
+    } catch {
+      return { jobs: [], limit, offset };
+    }
   });
 
   app.post("/jobs/:id/retry", async (req, reply) => {
@@ -198,12 +202,16 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
 
   app.get("/batches", async () => {
     await PipelineEngineService.ensureTables();
-    const batches = await db
-      .select()
-      .from(schema.pipelineBatch)
-      .orderBy(desc(schema.pipelineBatch.id))
-      .limit(25);
-    return { batches };
+    try {
+      const batches = await db
+        .select()
+        .from(schema.pipelineBatch)
+        .orderBy(desc(schema.pipelineBatch.id))
+        .limit(25);
+      return { batches };
+    } catch {
+      return { batches: [] };
+    }
   });
 
   app.post("/batches/flush", async () => {

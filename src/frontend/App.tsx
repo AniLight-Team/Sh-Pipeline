@@ -10,7 +10,7 @@ import { KaggleAccountsModal } from "./components/KaggleAccountsModal.js";
 import { HuggingFaceModal } from "./components/HuggingFaceModal.js";
 import { MobileBottomDock } from "./components/MobileBottomDock.js";
 import { usePipelineStream } from "./hooks/usePipelineStream.js";
-import { Plus } from "lucide-react";
+import { Plus, Cpu, Cloud, CheckCircle2, Zap } from "lucide-react";
 
 export default function App() {
   const { stats, logs, connected } = usePipelineStream();
@@ -22,15 +22,19 @@ export default function App() {
   const [actionNotice, setActionNotice] = useState<string | null>(null);
 
   const queuedCount =
-    (stats?.queue?.queued ?? 0) + (stats?.queue?.downloading ?? 0) + (stats?.queue?.staged ?? 0);
+    (stats?.queue?.queued ?? 0) +
+    (stats?.queue?.downloading ?? 0) +
+    (stats?.queue?.staged ?? 0) +
+    (stats?.queue?.encoding ?? 0);
   const activeSlots = stats?.concurrency?.active ?? 0;
+  const stagedCount = stats?.storage?.stagedCount ?? 0;
 
   const showNotice = (msg: string) => {
     setActionNotice(msg);
     setTimeout(() => setActionNotice(null), 4000);
   };
 
-  // Keyboard shortcut listener: Cmd/Ctrl + K to open Enqueue
+  // Keyboard shortcut: Cmd/Ctrl + K to toggle Enqueue modal
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -46,7 +50,7 @@ export default function App() {
     try {
       const res = await fetch("/api/batches/flush", { method: "POST" });
       const data = await res.json();
-      showNotice(data.message || "Force flush event sent! Packaging batch now.");
+      showNotice(data.message || "Force flush event dispatched.");
     } catch {
       showNotice("Failed to trigger force flush.");
     }
@@ -54,19 +58,17 @@ export default function App() {
 
   const handleRunRecovery = async () => {
     try {
-      await fetch("/api/system/recovery", { method: "POST" });
-      showNotice("Recovery watchdog event sent!");
+      const res = await fetch("/api/system/recovery", { method: "POST" });
+      const data = await res.json();
+      showNotice(data.message || "Recovery reconciliation triggered.");
     } catch {
       showNotice("Failed to trigger recovery.");
     }
   };
 
   return (
-    <div className="min-h-screen bg-[#12131c] text-neutral-100 flex relative overflow-x-hidden selection:bg-white/20 selection:text-white">
-      {/* Subtle atmospheric ambient glow */}
-      <div className="fixed top-0 left-1/2 -translate-x-1/2 w-[900px] h-[300px] bg-radial from-white/[0.03] via-transparent to-transparent pointer-events-none z-0" />
-
-      {/* Desktop Collapsible Sidebar (Hidden on Mobile) */}
+    <div className="min-h-screen bg-[#090a0f] text-[#f3f4f8] flex relative overflow-x-hidden">
+      {/* Desktop Sidebar */}
       <Sidebar
         collapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
@@ -78,34 +80,40 @@ export default function App() {
         onOpenHfDetails={() => setIsHfOpen(true)}
       />
 
-      {/* Main Content Pane (Adaptive: 0 offset on mobile, dynamic offset on desktop) */}
+      {/* Main Content Container */}
       <div
-        className={`flex-1 flex flex-col min-h-screen transition-all duration-300 ease-in-out relative z-10 ${
-          sidebarCollapsed ? "pl-0 md:pl-16" : "pl-0 md:pl-64"
+        className={`flex-1 flex flex-col min-h-screen transition-all duration-200 ${
+          sidebarCollapsed ? "pl-0 md:pl-16" : "pl-0 md:pl-60"
         }`}
       >
-        {/* Top Navbar */}
         <Navbar
           connected={connected}
           stats={stats}
+          activeView={activeView}
+          onSelectView={(v) => setActiveView(v)}
           onOpenEnqueue={() => setIsEnqueueOpen(true)}
           onForceFlush={handleForceFlush}
           onRunRecovery={handleRunRecovery}
-          sidebarCollapsed={sidebarCollapsed}
         />
 
-        {/* Action Notification Toast */}
+        {/* Operational Notification Banner */}
         {actionNotice && (
-          <div className="sticky top-[57px] z-30 bg-white/[0.12] backdrop-blur-md text-white text-xs font-semibold py-2 px-4 text-center border-b border-white/20 shadow-lg transition-all">
-            {actionNotice}
+          <div className="sticky top-14 z-30 bg-indigo-500/15 backdrop-blur-md text-indigo-200 text-xs font-medium py-2 px-6 border-b border-indigo-500/30 flex items-center justify-between">
+            <span>{actionNotice}</span>
+            <button
+              type="button"
+              onClick={() => setActionNotice(null)}
+              className="text-indigo-300 hover:text-white text-[11px] font-mono cursor-pointer"
+            >
+              Dismiss
+            </button>
           </div>
         )}
 
-        {/* Dynamic Views (Padded at bottom on mobile for the floating 5-item dock) */}
-        <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-5 md:p-6 pb-24 md:pb-6 space-y-6">
+        {/* Primary Viewport */}
+        <main className="flex-1 max-w-[1400px] w-full mx-auto p-4 sm:p-6 pb-20 md:pb-8 space-y-6">
           {activeView === "dashboard" && (
             <>
-              {/* Custom Designed Charts & Widgets (12-Segment Speedometer & Spline Wave with travelling dot) */}
               <DashboardCharts
                 stats={stats}
                 logs={logs}
@@ -113,90 +121,194 @@ export default function App() {
                 onOpenEnqueue={() => setIsEnqueueOpen(true)}
                 onOpenKaggleDetails={() => setIsKaggleOpen(true)}
                 onOpenHfDetails={() => setIsHfOpen(true)}
+                onForceFlush={handleForceFlush}
               />
 
-              {/* Recent Kaggle Batches History */}
-              <BatchViewer />
+              <BatchViewer onForceFlush={handleForceFlush} stagedCount={stagedCount} />
 
-              {/* Jobs Table (AniList ID Prominently Displayed) */}
-              <JobTable />
+              <JobTable onOpenEnqueue={() => setIsEnqueueOpen(true)} />
             </>
           )}
 
           {activeView === "jobs" && (
             <div className="space-y-4">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h1 className="text-xl font-bold text-white tracking-tight">
-                    Pipeline Jobs Queue
+                  <h1 className="text-lg font-bold text-[#f3f4f8] tracking-tight">
+                    Pipeline Encoding Queue
                   </h1>
-                  <p className="text-xs text-neutral-400 mt-0.5">
-                    Live tracking of episodes from AniList trigger to Kaggle GPU batch encoding.
+                  <p className="text-xs text-[#636b82] mt-0.5">
+                    End-to-end episode tracking across Tsukihime & AnimeTosho discovery, R2 subtitle extraction, and Kaggle GPU batches
                   </p>
                 </div>
                 <button
+                  type="button"
                   onClick={() => setIsEnqueueOpen(true)}
-                  className="button-glow px-4 py-2 rounded-full font-bold text-xs shadow-md flex items-center gap-1.5 cursor-pointer"
+                  className="btn-primary px-3.5 py-2 rounded-lg font-semibold text-xs flex items-center gap-1.5 cursor-pointer"
                 >
-                  <Plus className="w-4 h-4 text-neutral-950" />
-                  <span>Enqueue Anime</span>
+                  <Plus className="w-4 h-4" />
+                  <span>Enqueue Episode</span>
                 </button>
               </div>
-              <JobTable />
+              <JobTable onOpenEnqueue={() => setIsEnqueueOpen(true)} />
+            </div>
+          )}
+
+          {activeView === "batches" && (
+            <div className="space-y-6">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h1 className="text-lg font-bold text-[#f3f4f8] tracking-tight">
+                    GPU Batches & Cluster Infrastructure
+                  </h1>
+                  <p className="text-xs text-[#636b82] mt-0.5">
+                    Kaggle Dual-T4 GPU notebook execution history, slot allocation, and Hugging Face / R2 storage targets
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsKaggleOpen(true)}
+                    className="btn-secondary px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Cpu className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Inspect Cluster</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsHfOpen(true)}
+                    className="btn-secondary px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Cloud className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Storage Targets</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Inline Cluster & Storage Summary Grid */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <div className="surface-panel rounded-xl p-5">
+                  <div className="flex items-center justify-between pb-3 border-b border-[#1e2230]">
+                    <div className="flex items-center gap-2">
+                      <Cpu className="w-4 h-4 text-indigo-400" />
+                      <h2 className="text-sm font-semibold text-[#f3f4f8]">
+                        Kaggle GPU Account Pool
+                      </h2>
+                    </div>
+                    <span className="text-xs font-mono tabular-nums text-[#949bb0]">
+                      {stats?.concurrency?.active ?? 0} / {stats?.concurrency?.max ?? 2} slots active
+                    </span>
+                  </div>
+                  <div className="mt-3 space-y-2">
+                    {(stats?.accounts?.kaggle || []).length === 0 ? (
+                      <div className="text-xs text-[#636b82] py-4 text-center">
+                        No Kaggle accounts configured in KAGGLE_ACCOUNTS.
+                      </div>
+                    ) : (
+                      (stats?.accounts?.kaggle || []).map((acc, i) => (
+                        <div
+                          key={acc.username || i}
+                          className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex items-center justify-between text-xs font-mono"
+                        >
+                          <span className="text-[#f3f4f8] font-medium">@{acc.username}</span>
+                          <div className="flex items-center gap-3 text-[#949bb0] tabular-nums">
+                            <span>Slot 1: {acc.slots?.[0] ? "Running" : "Idle"}</span>
+                            <span>·</span>
+                            <span>Slot 2: {acc.slots?.[1] ? "Running" : "Idle"}</span>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                <div className="surface-panel rounded-xl p-5">
+                  <div className="flex items-center justify-between pb-3 border-b border-[#1e2230]">
+                    <div className="flex items-center gap-2">
+                      <Cloud className="w-4 h-4 text-sky-400" />
+                      <h2 className="text-sm font-semibold text-[#f3f4f8]">
+                        Hugging Face & Cloudflare R2 Targets
+                      </h2>
+                    </div>
+                    <span className="text-xs font-mono text-[#949bb0]">
+                      1080p · 720p · 480p MP4
+                    </span>
+                  </div>
+                  <div className="mt-3 space-y-2">
+                    {(stats?.accounts?.huggingFace || []).length === 0 ? (
+                      <div className="text-xs text-[#636b82] py-4 text-center">
+                        No Hugging Face accounts configured in HF_ACCOUNTS.
+                      </div>
+                    ) : (
+                      (stats?.accounts?.huggingFace || []).map((hf, i) => (
+                        <div
+                          key={i}
+                          className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex items-center justify-between text-xs font-mono"
+                        >
+                          <div className="flex items-center gap-2">
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                            <span className="text-[#f3f4f8] font-medium">{hf.owner}</span>
+                          </div>
+                          <span className="text-[#949bb0]">
+                            datasets/{hf.owner}/{hf.bucket}
+                          </span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <BatchViewer onForceFlush={handleForceFlush} stagedCount={stagedCount} />
             </div>
           )}
 
           {activeView === "terminal" && (
             <div className="space-y-4">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h1 className="text-xl font-bold text-white tracking-tight">
-                    Pipeline Live Execution Log Stream
-                  </h1>
-                  <p className="text-xs text-neutral-400 mt-0.5">
-                    Real-time transmission, MKV staging, subtitle extraction, and Kaggle GPU kernel logs.
-                  </p>
-                </div>
+              <div>
+                <h1 className="text-lg font-bold text-[#f3f4f8] tracking-tight">
+                  Live Telemetry Console
+                </h1>
+                <p className="text-xs text-[#636b82] mt-0.5">
+                  Real-time SSE event log stream from Tsukihime, AnimeTosho, Transmission, R2 Subtitles, and Kaggle GPU kernels
+                </p>
               </div>
               <LiveTerminal logs={logs} />
             </div>
           )}
         </main>
 
-        {/* Minimalist Footer */}
-        <footer className="border-t border-white/[0.06] bg-[#12131c]/90 backdrop-blur-md py-4 px-6 text-xs text-neutral-500 flex flex-wrap items-center justify-between max-w-7xl mx-auto w-full mb-16 md:mb-0">
-          <span>AniLight Kira Self-Hosted Pipeline Service • Production Edition</span>
-          <span className="font-mono text-[11px] text-neutral-500">
-            Kaggle Limit: Accounts × 2 • Batch Cap: 10 Files / 10 GB
+        {/* Quiet Footer */}
+        <footer className="border-t border-[#1e2230] py-4 px-6 text-xs text-[#636b82] flex flex-wrap items-center justify-between max-w-[1400px] mx-auto w-full mb-12 md:mb-0">
+          <span>AniLight Kira Pipeline Operations Console</span>
+          <span className="font-mono text-[11px] tabular-nums">
+            Providers: Tsukihime v1 · AnimeTosho · Kaggle Dual-GPU · Cloudflare R2
           </span>
         </footer>
       </div>
 
-      {/* Mobile Continuous 5-Option Dock (Matches AniLight's Mobile Floating Menu) */}
+      {/* Mobile Navigation Dock */}
       <MobileBottomDock
         activeView={activeView}
         onSelectView={(v) => setActiveView(v)}
         onOpenEnqueue={() => setIsEnqueueOpen(true)}
-        onOpenKaggleDetails={() => setIsKaggleOpen(true)}
         queuedCount={queuedCount}
         activeSlots={activeSlots}
       />
 
-      {/* Enqueue Modal (AniList ID-first) */}
+      {/* Modals */}
       <EnqueueModal
         isOpen={isEnqueueOpen}
         onClose={() => setIsEnqueueOpen(false)}
-        onSuccess={() => showNotice("Job(s) enqueued successfully!")}
+        onSuccess={() => showNotice("Episode(s) enqueued for Tsukihime & AnimeTosho discovery.")}
       />
 
-      {/* Kaggle Accounts Details Modal */}
       <KaggleAccountsModal
         isOpen={isKaggleOpen}
         onClose={() => setIsKaggleOpen(false)}
         stats={stats}
       />
 
-      {/* Hugging Face Accounts Details Modal */}
       <HuggingFaceModal
         isOpen={isHfOpen}
         onClose={() => setIsHfOpen(false)}

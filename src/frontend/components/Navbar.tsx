@@ -1,95 +1,128 @@
 import React from "react";
-import { Zap, Sparkles, Flame, RotateCw, Plus } from "lucide-react";
+import { RotateCw, Layers, Plus, Wifi, WifiOff } from "lucide-react";
 import type { PipelineStats } from "../../backend/engine/types.js";
 
 interface NavbarProps {
   connected: boolean;
   stats: PipelineStats | null;
+  activeView: string;
+  onSelectView: (view: string) => void;
   onOpenEnqueue: () => void;
   onForceFlush: () => void;
   onRunRecovery: () => void;
-  sidebarCollapsed: boolean;
+}
+
+const VIEW_LABELS: Record<string, string> = {
+  dashboard: "Operations Overview",
+  jobs: "Encoding Jobs Queue",
+  batches: "GPU Batches & Cluster",
+  terminal: "Live Telemetry Console",
+};
+
+function formatUptime(seconds?: number): string {
+  if (!seconds || seconds <= 0) return "0m";
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  if (hrs > 0) return `${hrs}h ${mins}m`;
+  return `${mins}m`;
 }
 
 export function Navbar({
   connected,
   stats,
+  activeView,
+  onSelectView,
   onOpenEnqueue,
   onForceFlush,
   onRunRecovery,
-  sidebarCollapsed,
 }: NavbarProps) {
   const activeSlots = stats?.concurrency?.active ?? 0;
   const maxSlots = stats?.concurrency?.max ?? 2;
-  const slotPct = Math.round((activeSlots / maxSlots) * 100);
+  const stagedCount = stats?.storage?.stagedCount ?? 0;
+  const uptime = formatUptime(stats?.engine?.uptimeSeconds);
 
   return (
-    <header className="sticky top-0 z-20 border-b border-white/[0.07] bg-[#12131c]/90 backdrop-blur-xl px-4 sm:px-6 py-3">
-      <div className="flex items-center justify-between">
-        {/* Left Status Bar */}
-        <div className="flex items-center gap-2.5">
-          {/* Connection Status Indicator */}
-          <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-white/[0.04] border border-white/[0.08] text-[11px] font-mono">
-            <span className="relative flex h-2 w-2">
-              {connected && (
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-              )}
-              <span
-                className={`relative inline-flex rounded-full h-2 w-2 ${
-                  connected ? "bg-emerald-400" : "bg-rose-400"
-                }`}
-              />
-            </span>
-            <span className={connected ? "text-neutral-300" : "text-rose-400"}>
-              {connected ? "SSE Stream Active" : "Reconnecting..."}
-            </span>
-          </div>
-
-          {/* 10 Files / 10 GB Limit Chip */}
-          <div className="hidden sm:flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/[0.05] border border-white/10 text-[11px] font-mono text-white">
-            <Sparkles className="w-3 h-3 text-neutral-300" />
-            <span>Dual Trigger: 10 Files or 10 GB</span>
-          </div>
-
-          {/* GPU Cluster Capacity Meter */}
-          <div className="hidden lg:flex items-center gap-2 px-3 py-1 rounded-full bg-white/[0.04] border border-white/[0.08] text-[11px] font-mono text-neutral-400">
-            <Zap className={`w-3 h-3 ${activeSlots > 0 ? "text-white" : "text-neutral-500"}`} />
-            <span>GPU Load:</span>
-            <span className={`font-semibold ${activeSlots > 0 ? "text-white" : "text-neutral-400"}`}>
-              {activeSlots}/{maxSlots} Slots
-            </span>
-            <span className="text-[10px] text-neutral-500 font-sans">({slotPct}%)</span>
-          </div>
+    <header className="sticky top-0 z-20 h-14 border-b border-[#1e2230] bg-[#090a0f]/90 backdrop-blur-md px-4 sm:px-6 flex items-center justify-between gap-8">
+      {/* Zone 1: Contextual Breadcrumb & Live Telemetry Status */}
+      <div className="flex items-center gap-3 min-w-0 shrink-0">
+        <div className="flex items-center gap-2 text-xs font-medium">
+          <button
+            type="button"
+            onClick={() => onSelectView("dashboard")}
+            className="text-[#636b82] hover:text-[#f3f4f8] transition-colors cursor-pointer whitespace-nowrap"
+          >
+            Kira Pipeline
+          </button>
+          <span className="text-[#2a3042]" aria-hidden="true">
+            /
+          </span>
+          <span className="text-[#f3f4f8] font-semibold whitespace-nowrap">
+            {VIEW_LABELS[activeView] || "Overview"}
+          </span>
         </div>
 
-        {/* Right Actions Bar */}
-        <div className="flex items-center gap-2">
-          <button
-            onClick={onForceFlush}
-            className="button-liquid-glass flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold text-neutral-300 hover:text-white transition-all cursor-pointer"
-            title="Immediately package staged episodes into GPU batch"
-          >
-            <Flame className="w-3.5 h-3.5 text-neutral-300" />
-            <span className="hidden sm:inline">Force Flush</span>
-          </button>
+        <span className="hidden sm:inline text-[#2a3042]" aria-hidden="true">
+          ·
+        </span>
 
-          <button
-            onClick={onRunRecovery}
-            className="button-liquid-glass flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold text-neutral-300 hover:text-white transition-all cursor-pointer"
-            title="Reconcile pipeline heartbeats and watchdog state"
-          >
-            <RotateCw className="w-3.5 h-3.5 text-neutral-400" />
-            <span className="hidden sm:inline">Reconcile</span>
-          </button>
-
-          <button
-            onClick={onOpenEnqueue}
-            className="button-glow hidden sm:flex items-center gap-1.5 px-4 py-1.5 rounded-full text-xs font-bold shadow-md cursor-pointer"
-          >
-            <Plus className="w-3.5 h-3.5 text-neutral-950" />
-            <span>Enqueue Anime</span>
-          </button>
+        {/* Real SSE Stream Connection State */}
+        <div className="hidden sm:flex items-center gap-1.5 text-xs font-mono tabular-nums">
+          {connected ? (
+            <>
+              <Wifi className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              <span className="text-emerald-400">Live</span>
+            </>
+          ) : (
+            <>
+              <WifiOff className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+              <span className="text-rose-400">Reconnecting</span>
+            </>
+          )}
+          <span className="text-[#2a3042] mx-1" aria-hidden="true">
+            ·
+          </span>
+          <span className="text-[#636b82]">Uptime {uptime}</span>
+          <span className="hidden lg:inline text-[#2a3042] mx-1" aria-hidden="true">
+            ·
+          </span>
+          <span className="hidden lg:inline text-[#949bb0]">
+            GPU {activeSlots}/{maxSlots} slots
+          </span>
         </div>
+      </div>
+
+      {/* Zone 2: Operational Actions */}
+      <div className="flex items-center gap-2 shrink-0">
+        <button
+          type="button"
+          onClick={onRunRecovery}
+          className="btn-secondary flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer whitespace-nowrap shrink-0"
+          title="Reconcile stuck jobs, batch heartbeats, and pending webhooks"
+        >
+          <RotateCw className="w-3.5 h-3.5 text-[#949bb0]" />
+          <span className="hidden sm:inline">Reconcile</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={onForceFlush}
+          className="btn-secondary flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer whitespace-nowrap shrink-0"
+          title="Immediately seal and dispatch staged episodes to Kaggle GPU"
+        >
+          <Layers className="w-3.5 h-3.5 text-indigo-400" />
+          <span className="hidden sm:inline">
+            Flush Batch{stagedCount > 0 ? ` (${stagedCount})` : ""}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          onClick={onOpenEnqueue}
+          className="btn-primary flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold cursor-pointer whitespace-nowrap shrink-0"
+        >
+          <Plus className="w-3.5 h-3.5" />
+          <span>Enqueue Episode</span>
+        </button>
       </div>
     </header>
   );

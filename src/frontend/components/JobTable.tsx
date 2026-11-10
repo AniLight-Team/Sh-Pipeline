@@ -1,5 +1,17 @@
 import React, { useState, useEffect } from "react";
-import { Search, RefreshCw, Trash2, ExternalLink, Info, AlertCircle } from "lucide-react";
+import {
+  Search,
+  RefreshCw,
+  Trash2,
+  ExternalLink,
+  Info,
+  AlertCircle,
+  CheckCircle2,
+  Clock,
+  Loader2,
+  HardDrive,
+  Plus,
+} from "lucide-react";
 import { JobDetailsModal } from "./JobDetailsModal.js";
 
 interface Job {
@@ -20,24 +32,31 @@ interface Job {
   completedAt?: string | null;
 }
 
-export function JobTable() {
+interface JobTableProps {
+  onOpenEnqueue?: () => void;
+}
+
+export function JobTable({ onOpenEnqueue }: JobTableProps) {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [loading, setLoading] = useState(false);
   const [statusFilter, setStatusFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
 
   const fetchJobs = async () => {
     setLoading(true);
     try {
       const url =
         statusFilter === "all"
-          ? "/api/jobs?limit=50"
-          : `/api/jobs?status=${statusFilter}&limit=50`;
+          ? "/api/jobs?limit=75"
+          : `/api/jobs?status=${statusFilter}&limit=75`;
       const res = await fetch(url);
       const data = await res.json();
       setJobs(data.jobs || []);
-    } catch {} finally {
+    } catch {
+      // Ignore transient errors
+    } finally {
       setLoading(false);
     }
   };
@@ -56,9 +75,9 @@ export function JobTable() {
   };
 
   const handleDelete = async (jobId: number) => {
-    if (!confirm(`Delete Job #${jobId}?`)) return;
     try {
       await fetch(`/api/jobs/${jobId}/delete`, { method: "POST" });
+      setConfirmDeleteId(null);
       fetchJobs();
     } catch {}
   };
@@ -70,6 +89,7 @@ export function JobTable() {
       (j.anilistId && String(j.anilistId).includes(s)) ||
       (j.anidbId && String(j.anidbId).includes(s)) ||
       (j.animeId && String(j.animeId).includes(s)) ||
+      (j.metadata?.tsukihimeId && String(j.metadata.tsukihimeId).includes(s)) ||
       String(j.episodeNumber).includes(s) ||
       (j.metadata?.primaryTitle && j.metadata.primaryTitle.toLowerCase().includes(s)) ||
       (j.torrentTitle && j.torrentTitle.toLowerCase().includes(s)) ||
@@ -77,107 +97,133 @@ export function JobTable() {
     );
   });
 
-  const getStatusBadge = (status: string) => {
+  const renderStatus = (status: string) => {
     switch (status) {
       case "completed":
         return (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-            COMPLETED
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-emerald-400">
+            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+            <span>Completed</span>
           </span>
         );
       case "encoding":
         return (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-sky-500/15 text-sky-300 border border-sky-500/30">
-            <span className="w-1.5 h-1.5 rounded-full bg-sky-400 animate-ping" />
-            ENCODING (GPU)
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-violet-300">
+            <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin" />
+            <span>Encoding GPU</span>
           </span>
         );
       case "staged":
         return (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
-            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
-            STAGED (SSD)
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-indigo-300">
+            <HardDrive className="w-3.5 h-3.5 shrink-0" />
+            <span>Staged SSD</span>
           </span>
         );
       case "downloading":
         return (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-purple-500/10 text-purple-300 border border-purple-500/20">
-            <span className="w-1.5 h-1.5 rounded-full bg-purple-400 animate-pulse" />
-            DOWNLOADING
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-sky-400">
+            <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin" />
+            <span>Downloading</span>
           </span>
         );
       case "queued":
         return (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-white/[0.05] text-neutral-400 border border-white/[0.08]">
-            <span className="w-1.5 h-1.5 rounded-full bg-neutral-500" />
-            QUEUED
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-amber-300">
+            <Clock className="w-3.5 h-3.5 shrink-0" />
+            <span>Queued</span>
           </span>
         );
       case "failed":
         return (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold font-mono bg-rose-500/10 text-rose-300 border border-rose-500/25">
-            <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
-            FAILED
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-rose-400">
+            <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+            <span>Failed</span>
           </span>
         );
       default:
         return (
-          <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-white/[0.05] text-neutral-400">
-            {status.toUpperCase()}
+          <span className="text-xs font-mono text-[#949bb0] capitalize">
+            {status}
           </span>
         );
     }
   };
 
+  const filterTabs = [
+    { id: "all", label: "All" },
+    { id: "queued", label: "Queued" },
+    { id: "downloading", label: "Downloading" },
+    { id: "staged", label: "Staged" },
+    { id: "encoding", label: "Encoding" },
+    { id: "completed", label: "Completed" },
+    { id: "failed", label: "Failed" },
+  ];
+
   return (
-    <div className="rounded-3xl bg-[#161723] overflow-hidden border border-white/[0.08] shadow-2xl">
+    <div className="surface-panel rounded-xl overflow-hidden">
       {/* Control Header */}
-      <div className="p-4 sm:p-5 border-b border-white/[0.06] flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <h2 className="text-sm font-bold text-white tracking-wide uppercase font-sans">
+      <div className="px-5 py-4 border-b border-[#1e2230] flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <h2 className="text-sm font-semibold text-[#f3f4f8]">
             Pipeline Encoding Jobs
           </h2>
-          <span className="text-xs text-neutral-500 font-mono">
-            ({filteredJobs.length} {filteredJobs.length === 1 ? "job" : "jobs"})
+          <span className="text-xs text-[#636b82] font-mono tabular-nums">
+            · {filteredJobs.length} {filteredJobs.length === 1 ? "entry" : "entries"}
           </span>
         </div>
 
-        <div className="flex items-center gap-2.5">
-          {/* Status Tab Pills */}
-          <div className="hidden lg:flex items-center bg-[#10111a] p-1 rounded-full border border-white/[0.06] text-xs">
-            {["all", "queued", "downloading", "staged", "encoding", "completed", "failed"].map(
-              (st) => (
-                <button
-                  key={st}
-                  onClick={() => setStatusFilter(st)}
-                  className={`px-3 py-1 rounded-full capitalize font-medium transition-all duration-200 cursor-pointer ${
-                    statusFilter === st
-                      ? "bg-white/[0.12] text-white font-bold shadow-sm border border-white/15"
-                      : "text-neutral-400 hover:text-white"
-                  }`}
-                >
-                  {st}
-                </button>
-              )
-            )}
+        <div className="flex flex-wrap items-center gap-2.5">
+          {/* Interactive Segmented Filter Controls */}
+          <div className="hidden xl:flex items-center bg-[#0c0e14] p-1 rounded-lg border border-[#1e2230] text-xs">
+            {filterTabs.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setStatusFilter(tab.id)}
+                className={`px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                  statusFilter === tab.id
+                    ? "bg-[#1c202e] text-white"
+                    : "text-[#949bb0] hover:text-white"
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
           </div>
 
-          {/* Quick Search */}
+          {/* Mobile/Tablet Status Select */}
+          <select
+            aria-label="Filter jobs by status"
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            className="xl:hidden bg-[#0c0e14] border border-[#1e2230] rounded-lg px-2.5 py-1.5 text-xs text-[#f3f4f8] focus:outline-none focus:border-indigo-500"
+          >
+            {filterTabs.map((tab) => (
+              <option key={tab.id} value={tab.id}>
+                Status: {tab.label}
+              </option>
+            ))}
+          </select>
+
+          {/* Search Input */}
           <div className="relative">
-            <Search className="w-3.5 h-3.5 absolute left-3.5 top-2.5 text-neutral-500" />
+            <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-[#636b82]" />
             <input
               type="text"
-              placeholder="Search AniList ID, Title..."
+              aria-label="Search jobs by AniList ID, Tsukihime ID, or title"
+              placeholder="Search ID, title, release..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="pl-9 pr-3 py-1.5 rounded-full bg-[#10111a] border border-white/[0.08] text-xs text-neutral-200 placeholder-neutral-500 focus:outline-none focus:border-white/40 transition-all w-52 sm:w-60"
+              className="pl-8 pr-3 py-1.5 rounded-lg bg-[#0c0e14] border border-[#1e2230] text-xs text-[#f3f4f8] placeholder-[#636b82] focus:outline-none focus:border-indigo-500/60 transition-colors w-48 sm:w-60"
             />
           </div>
 
           <button
+            type="button"
             onClick={fetchJobs}
-            className="button-liquid-glass p-2 rounded-full text-neutral-300 hover:text-white transition-colors cursor-pointer"
+            aria-label="Refresh jobs table"
+            className="btn-secondary p-1.5 rounded-lg text-[#949bb0] hover:text-white cursor-pointer"
             title="Refresh jobs table"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
@@ -188,23 +234,38 @@ export function JobTable() {
       {/* Table Body */}
       <div className="overflow-x-auto">
         <table className="w-full text-left text-xs">
-          <thead className="bg-[#10111a]/80 text-neutral-400 font-semibold border-b border-white/[0.06] tracking-wider uppercase text-[10px]">
+          <thead className="bg-[#0c0e14] text-[#636b82] font-medium border-b border-[#1e2230]">
             <tr>
-              <th className="py-3.5 px-4 sm:px-5 font-mono">Job ID</th>
-              <th className="py-3.5 px-4 sm:px-5">AniList ID / Title</th>
-              <th className="py-3.5 px-4 sm:px-5 font-mono">Internal IDs</th>
-              <th className="py-3.5 px-4 sm:px-5">Episode</th>
-              <th className="py-3.5 px-4 sm:px-5">Status</th>
-              <th className="py-3.5 px-4 sm:px-5">Torrent / Release Title</th>
-              <th className="py-3.5 px-4 sm:px-5 font-mono">Size</th>
-              <th className="py-3.5 px-4 sm:px-5 text-right">Actions</th>
+              <th className="py-2.5 px-4 font-mono">Job</th>
+              <th className="py-2.5 px-4">Anime & AniList ID</th>
+              <th className="py-2.5 px-4 font-mono">Provider IDs</th>
+              <th className="py-2.5 px-4">Episode</th>
+              <th className="py-2.5 px-4">Status</th>
+              <th className="py-2.5 px-4">Release / Diagnostic</th>
+              <th className="py-2.5 px-4 text-right font-mono">Size</th>
+              <th className="py-2.5 px-4 text-right">Actions</th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-white/[0.04]">
+          <tbody className="divide-y divide-[#1e2230]">
             {filteredJobs.length === 0 ? (
               <tr>
-                <td colSpan={8} className="py-12 text-center text-neutral-500">
-                  No encoding jobs match the selected filter.
+                <td colSpan={8} className="py-12 px-6 text-center">
+                  <p className="text-xs font-medium text-[#f3f4f8]">
+                    No encoding jobs match the current filter
+                  </p>
+                  <p className="text-xs text-[#636b82] mt-1">
+                    Enqueue an anime episode by AniList ID to initiate Tsukihime & AnimeTosho discovery.
+                  </p>
+                  {onOpenEnqueue && (
+                    <button
+                      type="button"
+                      onClick={onOpenEnqueue}
+                      className="btn-primary mt-3 px-3.5 py-1.5 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Enqueue First Episode</span>
+                    </button>
+                  )}
                 </td>
               </tr>
             ) : (
@@ -212,128 +273,141 @@ export function JobTable() {
                 const animeTitle =
                   job.metadata?.primaryTitle ||
                   (job.knownTitles && job.knownTitles[0]) ||
-                  "Anime";
+                  `AniList #${job.anilistId || job.id}`;
+                const tsukihimeId = job.metadata?.tsukihimeId;
 
                 return (
                   <tr
                     key={job.id}
-                    className="hover:bg-white/[0.02] transition-colors group cursor-pointer"
+                    className="hover:bg-[#151822]/70 transition-colors cursor-pointer"
                     onClick={() => setSelectedJob(job)}
                   >
-                    {/* Job ID */}
-                    <td className="py-3 px-4 sm:px-5 font-mono text-neutral-400 font-semibold">
+                    <td className="py-3 px-4 font-mono tabular-nums text-[#949bb0] font-semibold">
                       #{job.id}
                     </td>
 
-                    {/* AniList ID & Title (Prominently displayed) */}
-                    <td className="py-3 px-4 sm:px-5">
+                    <td className="py-3 px-4">
                       <div className="flex flex-col">
-                        <div className="flex items-center gap-1.5">
+                        <span className="text-xs font-medium text-[#f3f4f8] truncate max-w-xs">
+                          {animeTitle}
+                        </span>
+                        <div className="flex items-center gap-2 mt-0.5 text-[11px] font-mono tabular-nums text-[#636b82]">
                           {job.anilistId ? (
                             <a
                               href={`https://anilist.co/anime/${job.anilistId}`}
                               target="_blank"
                               rel="noreferrer"
                               onClick={(e) => e.stopPropagation()}
-                              className="inline-flex items-center gap-1 font-mono font-bold text-white hover:text-neutral-300 hover:underline"
+                              className="text-indigo-400 hover:underline inline-flex items-center gap-1"
                             >
-                              AniList #{job.anilistId}
+                              <span>AniList #{job.anilistId}</span>
                               <ExternalLink className="w-2.5 h-2.5" />
                             </a>
                           ) : (
-                            <span className="font-mono text-neutral-500">AniList -</span>
+                            <span>AniList —</span>
                           )}
                         </div>
-                        <span className="text-[11px] text-neutral-200 font-medium truncate max-w-xs block mt-0.5">
-                          {animeTitle}
-                        </span>
                       </div>
                     </td>
 
-                    {/* Internal IDs (AniDB & AnimeId) */}
-                    <td className="py-3 px-4 sm:px-5 font-mono">
-                      <div className="flex flex-col gap-0.5 text-[11px]">
-                        <span
-                          className="text-neutral-400"
-                          title="AniDB ID used internally for torrent queries"
-                        >
-                          AniDB: <strong className="text-neutral-300">{job.anidbId || "-"}</strong>
+                    <td className="py-3 px-4 font-mono tabular-nums text-[11px] text-[#949bb0]">
+                      <div className="flex flex-col">
+                        <span>
+                          AniDB: <strong className="text-[#d5d9e6]">{job.anidbId || "—"}</strong>
+                          {tsukihimeId ? ` · Tsuki: #${tsukihimeId}` : ""}
                         </span>
                         {job.animeId && (
-                          <span className="text-neutral-500 text-[10px]">
-                            MainId: #{job.animeId}
-                          </span>
+                          <span className="text-[#636b82]">Main DB: #{job.animeId}</span>
                         )}
                       </div>
                     </td>
 
-                    {/* Episode & Audio Types */}
-                    <td className="py-3 px-4 sm:px-5">
-                      <div className="flex items-center gap-2">
-                        <span className="font-bold text-white font-mono">
-                          Ep {job.episodeNumber}
-                        </span>
-                        <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase bg-white/[0.05] text-neutral-300 border border-white/[0.06]">
-                          {job.types?.join("/") || "SUB"}
-                        </span>
-                      </div>
+                    <td className="py-3 px-4 font-mono tabular-nums">
+                      <span className="font-semibold text-[#f3f4f8]">Ep {job.episodeNumber}</span>
+                      <span className="text-[#636b82] mx-1.5">·</span>
+                      <span className="text-[11px] text-[#949bb0] uppercase">
+                        {job.types?.join("/") || "SUB"}
+                      </span>
                     </td>
 
-                    {/* Status Badge */}
-                    <td className="py-3 px-4 sm:px-5">{getStatusBadge(job.status)}</td>
+                    <td className="py-3 px-4">{renderStatus(job.status)}</td>
 
-                    {/* Torrent / Error */}
                     <td
-                      className="py-3 px-4 sm:px-5 max-w-xs truncate text-neutral-300"
+                      className="py-3 px-4 max-w-xs truncate"
                       title={job.torrentTitle || job.lastError || ""}
                     >
                       {job.torrentTitle ? (
-                        <span className="text-neutral-300 truncate block text-[11px]">
+                        <span className="text-[#d5d9e6] truncate block text-[11px] font-mono">
                           {job.torrentTitle}
                         </span>
                       ) : job.lastError ? (
-                        <span className="text-rose-400 text-[11px] truncate flex items-center gap-1">
+                        <span className="text-rose-400 text-[11px] truncate flex items-center gap-1 font-mono">
                           <AlertCircle className="w-3 h-3 shrink-0" />
-                          {job.lastError}
+                          <span className="truncate">{job.lastError}</span>
                         </span>
                       ) : (
-                        <span className="text-neutral-600">-</span>
+                        <span className="text-[#636b82] text-[11px]">Awaiting candidate selection</span>
                       )}
                     </td>
 
-                    {/* File Size */}
-                    <td className="py-3 px-4 sm:px-5 font-mono text-neutral-400">
-                      {job.sizeBytes ? `${(job.sizeBytes / (1024 * 1024)).toFixed(1)} MB` : "-"}
+                    <td className="py-3 px-4 text-right font-mono tabular-nums text-[#949bb0]">
+                      {job.sizeBytes ? `${(job.sizeBytes / (1024 * 1024)).toFixed(1)} MB` : "—"}
                     </td>
 
-                    {/* Actions */}
                     <td
-                      className="py-3 px-4 sm:px-5 text-right space-x-1.5"
+                      className="py-3 px-4 text-right whitespace-nowrap"
                       onClick={(e) => e.stopPropagation()}
                     >
-                      {job.status === "failed" && (
-                        <button
-                          onClick={() => handleRetry(job.id)}
-                          className="button-liquid-glass p-1.5 rounded-full text-white hover:text-neutral-300 transition-colors cursor-pointer"
-                          title="Retry failed job"
-                        >
-                          <RefreshCw className="w-3 h-3" />
-                        </button>
+                      {confirmDeleteId === job.id ? (
+                        <div className="inline-flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => handleDelete(job.id)}
+                            className="px-2 py-1 rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 text-[11px] font-medium hover:bg-rose-500/30 cursor-pointer"
+                          >
+                            Confirm
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteId(null)}
+                            className="px-2 py-1 rounded bg-[#151822] text-[#949bb0] text-[11px] hover:text-white cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="inline-flex items-center gap-1">
+                          {job.status === "failed" && (
+                            <button
+                              type="button"
+                              onClick={() => handleRetry(job.id)}
+                              className="btn-secondary p-1.5 rounded-md text-[#d5d9e6] hover:text-white cursor-pointer"
+                              title={`Retry Job #${job.id}`}
+                              aria-label={`Retry Job #${job.id}`}
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => setSelectedJob(job)}
+                            className="btn-secondary p-1.5 rounded-md text-[#949bb0] hover:text-white cursor-pointer"
+                            title={`Inspect Job #${job.id}`}
+                            aria-label={`Inspect Job #${job.id}`}
+                          >
+                            <Info className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteId(job.id)}
+                            className="btn-secondary p-1.5 rounded-md text-[#949bb0] hover:text-rose-400 cursor-pointer"
+                            title={`Delete Job #${job.id}`}
+                            aria-label={`Delete Job #${job.id}`}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       )}
-                      <button
-                        onClick={() => setSelectedJob(job)}
-                        className="button-liquid-glass p-1.5 rounded-full text-neutral-400 hover:text-white transition-colors cursor-pointer"
-                        title="View job details"
-                      >
-                        <Info className="w-3 h-3" />
-                      </button>
-                      <button
-                        onClick={() => handleDelete(job.id)}
-                        className="button-liquid-glass p-1.5 rounded-full text-neutral-400 hover:text-rose-400 transition-colors cursor-pointer"
-                        title="Delete job from pipeline"
-                      >
-                        <Trash2 className="w-3 h-3" />
-                      </button>
                     </td>
                   </tr>
                 );
@@ -343,7 +417,6 @@ export function JobTable() {
         </table>
       </div>
 
-      {/* Job Details Modal */}
       {selectedJob && (
         <JobDetailsModal job={selectedJob} onClose={() => setSelectedJob(null)} />
       )}

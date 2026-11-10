@@ -1,0 +1,1681 @@
+{
+  "total": 409,
+  "start": 0,
+  "limit": 50,
+  "error": false,
+  "results": [
+    {
+      "id": 36567,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 0,
+      "sukebei_id": 0,
+      "nekobt_id": 14738508864780,
+      "tt_id": 0,
+      "name": "[Mythicore] Bleach: Thousand-Year Blood War - S04E10 (720p WEBRip 10-bit HEVC AAC)",
+      "btih": "c535f6f98d3c811ceb98a332c3fdb969fd57a2ea",
+      "is_adult": 0,
+      "totalsize": 186984201,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "ms",
+        "th",
+        "vi",
+        "zh",
+        "si"
+      ],
+      "episode_no": 10,
+      "source_date": 1793261900,
+      "added_date": 1793262106,
+      "group": {
+        "id": 1172,
+        "name": "Mythicore",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36308,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179597,
+      "sukebei_id": 0,
+      "nekobt_id": 14712232145667,
+      "tt_id": 0,
+      "name": "[Feibanyama] BLEACH Thousand Year Blood War S01E50 [IQIYI WebRip 2160p H265 Veryslow AAC Multi-Subs] (BLEACH: Sennen Kessen-hen)",
+      "btih": "8654da9f5efdb8c8ec7c828d88a2b35a274b90b3",
+      "is_adult": 0,
+      "totalsize": 2172085143,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "zh-Hans",
+        "zh-Hant",
+        "en",
+        "id",
+        "ms",
+        "th",
+        "vi"
+      ],
+      "episode_no": 10,
+      "source_date": 1793159170,
+      "added_date": 1793159277,
+      "group": {
+        "id": 6,
+        "name": "Feibanyama",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36298,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2179577,
+      "sukebei_id": 0,
+      "nekobt_id": 14710570887428,
+      "tt_id": 0,
+      "name": "[Feibanyama] BLEACH Thousand Year Blood War S01E50 [CR WebRip 1080p H265 Veryslow AAC Multi-Subs] (BLEACH: Sennen Kessen-hen)",
+      "btih": "2eb679f35153e56db1038af245fbec16b2f16645",
+      "is_adult": 0,
+      "totalsize": 869896502,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "zh-Hans",
+        "zh-Hant",
+        "en",
+        "id",
+        "ms",
+        "th",
+        "vi"
+      ],
+      "episode_no": 10,
+      "source_date": 1793152767,
+      "added_date": 1793152798,
+      "group": {
+        "id": 6,
+        "name": "Feibanyama",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36146,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179284,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "Bleach S17E50 Thousand-Year Blood War DEATH and STRAWBERRY 1080p DSNP WEB-DL AAC2.0 H 264-NTb",
+      "btih": "4be50c31c46be995276c5c3decfe32a7178141a0",
+      "is_adult": 0,
+      "totalsize": 885100413,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "ms",
+        "th",
+        "zh-Hant"
+      ],
+      "episode_no": 10,
+      "source_date": 1793104071,
+      "added_date": 1793104560,
+      "group": {
+        "id": 996,
+        "name": "NTb",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36145,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179283,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "Bleach S17E50 Thousand-Year Blood War DEATH and STRAWBERRY 720p DSNP WEB-DL AAC2.0 H 264-NTb",
+      "btih": "c7797b3a6b40cb4837fcf2087c9b1f8b6d2126aa",
+      "is_adult": 0,
+      "totalsize": 496519234,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "ms",
+        "th",
+        "zh-Hant"
+      ],
+      "episode_no": 10,
+      "source_date": 1793103996,
+      "added_date": 1793104080,
+      "group": {
+        "id": 996,
+        "name": "NTb",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36139,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 0,
+      "sukebei_id": 0,
+      "nekobt_id": 14693871719177,
+      "tt_id": 0,
+      "name": "[Onalrie] Bleach S17E50 (Sennen Kessen Hen - Kashin Tan) [1080p WEBRip AV1]",
+      "btih": "057819529a856ce39eb4ed903590c5690fbb0bdd",
+      "is_adult": 0,
+      "totalsize": 378428122,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "pt",
+        "es",
+        "de",
+        "fr",
+        "it"
+      ],
+      "episode_no": 50,
+      "source_date": 1793087536,
+      "added_date": 1793087759,
+      "group": {
+        "id": 199,
+        "name": "Onalrie",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36128,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179219,
+      "sukebei_id": 0,
+      "nekobt_id": 14689902182668,
+      "tt_id": 0,
+      "name": "BLEACH Thousand Year Blood War S01E50 1080p NF WEB-DL AAC2.0 H.264-VARYG (BLEACH: Sennen Kessen-hen, Multi-Subs)",
+      "btih": "265e744a8e319b4e6d4b6db2085c72f40bdf5588",
+      "is_adult": 0,
+      "totalsize": 886861138,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "ms",
+        "th",
+        "vi",
+        "zh-Hans",
+        "zh-Hant"
+      ],
+      "episode_no": 10,
+      "source_date": 1793072034,
+      "added_date": 1793072156,
+      "group": {
+        "id": 7,
+        "name": "VARYG",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36118,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2179276,
+      "sukebei_id": 0,
+      "nekobt_id": 14687405090569,
+      "tt_id": 0,
+      "name": "[Knight-Subs] Bleach Thousand-Year Blood War - E50 - Death & Strawberry (1080p CR WEB-DL DDP2.0 H.264) [Eng-Subs].mkv",
+      "btih": "90d4d0b2d63ef6ce2b1428ecb68508abf8f5ca26",
+      "is_adult": 0,
+      "totalsize": 1482915299,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "enm"
+      ],
+      "episode_no": 10,
+      "source_date": 1793062276,
+      "added_date": 1793062449,
+      "group": {
+        "id": 1003,
+        "name": "Knight-Subs",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36117,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179191,
+      "sukebei_id": 0,
+      "nekobt_id": 14687102761478,
+      "tt_id": 0,
+      "name": "[Erai-raws] Bleach: Sennen Kessen Hen - Kashin Tan - 10 [1080p DSNP WEBRip HEVC AAC][MultiSub][C1513C37]",
+      "btih": "8dba36d813022e907c3b2814cd7c5f9f29d48cd8",
+      "is_adult": 0,
+      "totalsize": 533719617,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "pt-BR",
+        "es-419",
+        "de",
+        "fr",
+        "it"
+      ],
+      "episode_no": 10,
+      "source_date": 1793061094,
+      "added_date": 1793061248,
+      "group": {
+        "id": 3,
+        "name": "Erai-raws",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36106,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2179169,
+      "sukebei_id": 0,
+      "nekobt_id": 14685112673295,
+      "tt_id": 0,
+      "name": "[Erai-raws] Bleach S17E50 (Sennen Kessen Hen - Kashin Tan) [1080p DSNP WEB-DL AVC AAC][MultiSub][459C54CE]",
+      "btih": "ec50378da48f68ed8725040fdcb778a482f6b262",
+      "is_adult": 0,
+      "totalsize": 884592505,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "pt-BR",
+        "es-419",
+        "de",
+        "fr",
+        "it"
+      ],
+      "episode_no": 10,
+      "source_date": 1793053321,
+      "added_date": 1793053339,
+      "group": {
+        "id": 3,
+        "name": "Erai-raws",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36105,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2179168,
+      "sukebei_id": 0,
+      "nekobt_id": 14685111917323,
+      "tt_id": 0,
+      "name": "[Erai-raws] Bleach S17E50 (Sennen Kessen Hen - Kashin Tan) [720p DSNP WEB-DL AVC AAC][MultiSub][4E6FDDB2]",
+      "btih": "98d9b5512ac75fd1ef286f21b7c846d4273da94a",
+      "is_adult": 0,
+      "totalsize": 505409471,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "pt-BR",
+        "es-419",
+        "de",
+        "fr",
+        "it"
+      ],
+      "episode_no": 10,
+      "source_date": 1793053318,
+      "added_date": 1793053335,
+      "group": {
+        "id": 3,
+        "name": "Erai-raws",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36104,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2179167,
+      "sukebei_id": 0,
+      "nekobt_id": 14685111659786,
+      "tt_id": 0,
+      "name": "[Erai-raws] Bleach S17E50 (Sennen Kessen Hen - Kashin Tan) [480p DSNP WEB-DL AVC AAC][MultiSub][290BDCAE]",
+      "btih": "abda54632bef647c8bdc178108078b308bb4fe12",
+      "is_adult": 0,
+      "totalsize": 339286039,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "pt-BR",
+        "es-419",
+        "de",
+        "fr",
+        "it"
+      ],
+      "episode_no": 10,
+      "source_date": 1793053317,
+      "added_date": 1793053332,
+      "group": {
+        "id": 3,
+        "name": "Erai-raws",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36103,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179166,
+      "sukebei_id": 0,
+      "nekobt_id": 14684701086470,
+      "tt_id": 0,
+      "name": "[AnoZu] Bleach S17E41-E50 1080p CR WEB-DL DDP 2.0 H.264 | Bleach: Thousand-Year Blood War - The Calamity | Bleach: Sennen Kessen-hen - Kashin-tan",
+      "btih": "f251882a4eac6e0dcaddb522719b9d1c7aaf4b56",
+      "is_adult": 0,
+      "totalsize": 16759014819,
+      "filecount": 10,
+      "audiolangs": [
+        "ja-JP"
+      ],
+      "sublangs": [
+        "en-US",
+        "id-ID",
+        "ms-MY",
+        "th-TH",
+        "vi-VN",
+        "zh-Hans",
+        "zh-Hant"
+      ],
+      "episode_no": 41,
+      "source_date": 1793051714,
+      "added_date": 1793051891,
+      "group": {
+        "id": 139,
+        "name": "AnoZu",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36099,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179160,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "[Anime Time] Bleach: Thousand-Year Blood War - S01E50 [1080p][HEVC 10bit x265][AAC][Multi Sub] [Weekly] Bleach Sennen Kessen hen",
+      "btih": "882088e03c4667bfe412e616e7c05e21e9f65d43",
+      "is_adult": 0,
+      "totalsize": 654139241,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "fr",
+        "de",
+        "it",
+        "pt",
+        "es"
+      ],
+      "episode_no": 10,
+      "source_date": 1793047967,
+      "added_date": 1793048288,
+      "group": {
+        "id": 2,
+        "name": "Anime Time",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36096,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2179144,
+      "sukebei_id": 0,
+      "nekobt_id": 14682494229005,
+      "tt_id": 0,
+      "name": "[Lazier] Bleach Thousand-Year Blood War - 50 (WEB 1080p AAC)",
+      "btih": "ffd68eb7945f8b63c1ef0b07fdbd4c3febe05b09",
+      "is_adult": 0,
+      "totalsize": 1460944237,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "enm"
+      ],
+      "episode_no": 10,
+      "source_date": 1793043093,
+      "added_date": 1793043248,
+      "group": {
+        "id": 926,
+        "name": "Lazier",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36092,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179138,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "[Judas] Bleach - Thousand Year Blood War - S17E50 [1080p][HEVC x265 10bit][Multi-Subs] (Weekly)",
+      "btih": "c14ca56f24acbec20bce11513498fb186c823ea5",
+      "is_adult": 0,
+      "totalsize": 553984609,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "fr",
+        "de",
+        "it",
+        "es-419",
+        "pt-BR"
+      ],
+      "episode_no": 10,
+      "source_date": 1793039419,
+      "added_date": 1793039651,
+      "group": {
+        "id": 8,
+        "name": "Judas",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36090,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179131,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "[DKB] Bleach - Sennen Kessen-hen Kashin-tan - 50 [1080p][END][HEVC x265 10bit][Multi-Subs][weekly]",
+      "btih": "8648e5a13b99af66fbb351fcc8c44045ee41b4d5",
+      "is_adult": 0,
+      "totalsize": 582453561,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "de",
+        "es-419",
+        "fr-FR",
+        "it",
+        "pt-BR"
+      ],
+      "episode_no": null,
+      "source_date": 1793037186,
+      "added_date": 1793037488,
+      "group": {
+        "id": 5,
+        "name": "DKB",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36086,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179105,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "[ASW] Bleach - Sennen Kessen Hen - 50 [1080p HEVC x265 10Bit][AAC]",
+      "btih": "f2741c3e61faeb3f3cf8740c526b90f8a8eae872",
+      "is_adult": 0,
+      "totalsize": 592398238,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en"
+      ],
+      "episode_no": 10,
+      "source_date": 1793032739,
+      "added_date": 1793032928,
+      "group": {
+        "id": 9,
+        "name": "ASW",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36085,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 0,
+      "sukebei_id": 0,
+      "nekobt_id": 14679725183494,
+      "tt_id": 0,
+      "name": "[Omar] Bleach.Thousand-Year.Blood.War.S01E50.1080p.Shahid.WEB-DL.DUAL.AAC2.0.H.264 (Bleach: Sennen Kessen-hen, Dual-Audio)",
+      "btih": "9e8fe26fb7b68b6559bea287b19bd62ddfa6682e",
+      "is_adult": 0,
+      "totalsize": 467245001,
+      "filecount": 1,
+      "audiolangs": [
+        "ar",
+        "ja"
+      ],
+      "sublangs": [
+        "ar",
+        "en",
+        "fr"
+      ],
+      "episode_no": 10,
+      "source_date": 1793032276,
+      "added_date": 1793032448,
+      "group": {
+        "id": 1057,
+        "name": "Omar",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36082,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179098,
+      "sukebei_id": 0,
+      "nekobt_id": 14679265617156,
+      "tt_id": 0,
+      "name": "BLEACH Thousand Year Blood War S04E50 DEATH and STRAWBERRY 1080p CR WEB-DL AAC2.0 H.264-VARYG (BLEACH: Sennen Kessen-hen - Kashin-tan, Multi-Subs)",
+      "btih": "d8ee7e5f857ad2bb6a6c97516bc89231966221fc",
+      "is_adult": 0,
+      "totalsize": 1461873832,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "ms",
+        "th",
+        "vi",
+        "zh-Hans",
+        "zh-Hant"
+      ],
+      "episode_no": null,
+      "source_date": 1793030472,
+      "added_date": 1793030529,
+      "group": {
+        "id": 7,
+        "name": "VARYG",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36080,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179094,
+      "sukebei_id": 0,
+      "nekobt_id": 14679219651087,
+      "tt_id": 0,
+      "name": "BLEACH Thousand Year Blood War S01E50 DEATH and STRAWBERRY 1080p AMZN WEB-DL DDP2.0 H.264-VARYG (BLEACH: Sennen Kessen-hen, Multi-Subs)",
+      "btih": "59250d1e6b8b08797efdca8fddc8afe1669cee7a",
+      "is_adult": 0,
+      "totalsize": 1351807617,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "ms",
+        "th",
+        "vi"
+      ],
+      "episode_no": 10,
+      "source_date": 1793030305,
+      "added_date": 1793030528,
+      "group": {
+        "id": 7,
+        "name": "VARYG",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36079,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2179093,
+      "sukebei_id": 0,
+      "nekobt_id": 14679098776834,
+      "tt_id": 0,
+      "name": "[VARYG] BLEACH Thousand Year Blood War S01E50 DEATH and STRAWBERRY 1080p DSNP WEB-DL AAC2.0 H.264 (Bleach: Sennen Kessen-hen - Soukoku-tan, Multi-Subs)",
+      "btih": "2fa12cdc1281d0e6877a294ba791e06cb5f5c728",
+      "is_adult": 0,
+      "totalsize": 884286410,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "de",
+        "es-419",
+        "fr-FR",
+        "it",
+        "pt-BR"
+      ],
+      "episode_no": 10,
+      "source_date": 1793029829,
+      "added_date": 1793030052,
+      "group": {
+        "id": 7,
+        "name": "VARYG",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36078,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2179092,
+      "sukebei_id": 0,
+      "nekobt_id": 14679096672270,
+      "tt_id": 0,
+      "name": "[AnoZu] Bleach S17E50 1080p CR WEB-DL DDP 2.0 H.264",
+      "btih": "7dfa5b80a25beabcac487529f53c75c720d81f1a",
+      "is_adult": 0,
+      "totalsize": 1466473358,
+      "filecount": 1,
+      "audiolangs": [
+        "ja-JP"
+      ],
+      "sublangs": [
+        "en-US",
+        "id-ID",
+        "ms-MY",
+        "th-TH",
+        "vi-VN",
+        "zh-Hans",
+        "zh-Hant"
+      ],
+      "episode_no": 10,
+      "source_date": 1793029821,
+      "added_date": 1793030052,
+      "group": {
+        "id": 139,
+        "name": "AnoZu",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36077,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179091,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "[SubsPlease] Bleach - Sennen Kessen Hen - 50 (1080p) [22C2464E].mkv",
+      "btih": "237a0acc5015676389194be3356e17f118b6d505",
+      "is_adult": 0,
+      "totalsize": 1416889110,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en"
+      ],
+      "episode_no": 10,
+      "source_date": 1793029741,
+      "added_date": 1793030048,
+      "group": {
+        "id": 10,
+        "name": "SubsPlease",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36074,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2179090,
+      "sukebei_id": 0,
+      "nekobt_id": 14679070518029,
+      "tt_id": 0,
+      "name": "[ToonsHub] BLEACH Thousand-Year Blood War S01E50 1080p CR WEB-DL AAC2.0 H.264 (Multi-Subs)",
+      "btih": "801580f06d5ae392c5b852a7b8d1c97549507c88",
+      "is_adult": 0,
+      "totalsize": 1461015417,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "zh-Hans",
+        "zh-Hant",
+        "id",
+        "ms",
+        "th",
+        "vi"
+      ],
+      "episode_no": 10,
+      "source_date": 1793029719,
+      "added_date": 1793029808,
+      "group": {
+        "id": 1,
+        "name": "ToonsHub",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36076,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179089,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "[SubsPlease] Bleach - Sennen Kessen Hen - 50 (720p) [FA4028BC].mkv",
+      "btih": "6b4ae497d3663f7a9a3cffd770e86da596d79923",
+      "is_adult": 0,
+      "totalsize": 721953983,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en"
+      ],
+      "episode_no": 10,
+      "source_date": 1793029696,
+      "added_date": 1793030048,
+      "group": {
+        "id": 10,
+        "name": "SubsPlease",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36075,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179088,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "[SubsPlease] Bleach - Sennen Kessen Hen - 50 (480p) [71E5F002].mkv",
+      "btih": "2aff6468c1eb6d03122e562ec906f14d22a207d7",
+      "is_adult": 0,
+      "totalsize": 375020944,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en"
+      ],
+      "episode_no": 10,
+      "source_date": 1793029647,
+      "added_date": 1793030048,
+      "group": {
+        "id": 10,
+        "name": "SubsPlease",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36073,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2179085,
+      "sukebei_id": 0,
+      "nekobt_id": 14678828699916,
+      "tt_id": 0,
+      "name": "[ToonsHub] BLEACH Thousand-Year Blood War S01E50 1080p AMZN WEB-DL DDP2.0 H.264 (Multi-Subs)",
+      "btih": "d8a27cf59f4eb5cc2ae63702474c58933512e209",
+      "is_adult": 0,
+      "totalsize": 1352257934,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "zh-Hans",
+        "zh-Hant",
+        "id",
+        "ms",
+        "th",
+        "vi"
+      ],
+      "episode_no": 10,
+      "source_date": 1793028774,
+      "added_date": 1793028849,
+      "group": {
+        "id": 1,
+        "name": "ToonsHub",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36072,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2179083,
+      "sukebei_id": 0,
+      "nekobt_id": 14678810669059,
+      "tt_id": 0,
+      "name": "[ToonsHub] BLEACH Thousand-Year Blood War S01E50 1080p DSNP WEB-DL AAC2.0 H.264 (Multi-Subs)",
+      "btih": "92e2e0f0dbd9521c520835ece61ee81f0a0d6f95",
+      "is_adult": 0,
+      "totalsize": 884285148,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "fr",
+        "de",
+        "it",
+        "pt-BR",
+        "es-419"
+      ],
+      "episode_no": 10,
+      "source_date": 1793028704,
+      "added_date": 1793028848,
+      "group": {
+        "id": 1,
+        "name": "ToonsHub",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 36071,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2179081,
+      "sukebei_id": 0,
+      "nekobt_id": 14678794858242,
+      "tt_id": 0,
+      "name": "[ToonsHub] Bleach Thousand-Year Blood War S01E50 1080p BILI WEB-DL AAC2.0 H.265 (BLEACH: Sennen Kessen-hen, Multi-Subs)",
+      "btih": "ff77bacc445c4a9df57d05ec4c614cbc66651d6a",
+      "is_adult": 0,
+      "totalsize": 439078550,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "th"
+      ],
+      "episode_no": 10,
+      "source_date": 1793028641,
+      "added_date": 1793028848,
+      "group": {
+        "id": 1,
+        "name": "ToonsHub",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 35089,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2177123,
+      "sukebei_id": 0,
+      "nekobt_id": 14578315593220,
+      "tt_id": 0,
+      "name": "[Feibanyama] BLEACH Thousand Year Blood War S01E49 [IQIYI WebRip 2160p H265 Veryslow AAC Multi-Subs] (BLEACH: Sennen Kessen-hen)",
+      "btih": "8ed09a491b5d0501a27053870603a3e9ada313d7",
+      "is_adult": 0,
+      "totalsize": 1826099300,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "zh-Hans",
+        "zh-Hant",
+        "en",
+        "id",
+        "ms"
+      ],
+      "episode_no": 9,
+      "source_date": 1792636026,
+      "added_date": 1792636290,
+      "group": {
+        "id": 6,
+        "name": "Feibanyama",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 35087,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2177114,
+      "sukebei_id": 0,
+      "nekobt_id": 14577252307211,
+      "tt_id": 0,
+      "name": "[Feibanyama] BLEACH Thousand Year Blood War S01E49 [CR WebRip 1080p H265 Veryslow AAC Multi-Subs] (BLEACH: Sennen Kessen-hen)",
+      "btih": "1868f125ffdc032a5dd4a008b000ba20109e71c8",
+      "is_adult": 0,
+      "totalsize": 815099532,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "zh-Hans",
+        "zh-Hant",
+        "en",
+        "id",
+        "ms"
+      ],
+      "episode_no": 9,
+      "source_date": 1792631991,
+      "added_date": 1792632001,
+      "group": {
+        "id": 6,
+        "name": "Feibanyama",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34845,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2176750,
+      "sukebei_id": 0,
+      "nekobt_id": 14553290971146,
+      "tt_id": 0,
+      "name": "[Knight-Subs] Bleach Thousand-Year Blood War - E49v2 - THE BLADE (1080p CR WEB-DL DDP2.0 H.264) [Eng-Subs].mkv",
+      "btih": "d33febaa572a6c3febebda8c47ff2cde9d02f078",
+      "is_adult": 0,
+      "totalsize": 1696283481,
+      "filecount": 1,
+      "audiolangs": [
+        "ja-JP"
+      ],
+      "sublangs": [
+        "en",
+        "enm"
+      ],
+      "episode_no": 9,
+      "source_date": 1792538392,
+      "added_date": 1792538609,
+      "group": {
+        "id": 1003,
+        "name": "Knight-Subs",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34842,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2176719,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "Bleach S17E49 Thousand-Year Blood War THE BLADE 1080p DSNP WEB-DL AAC2.0 H 264-NTb",
+      "btih": "a8fd818c88d033e236bab8c08aa818bf44736a37",
+      "is_adult": 0,
+      "totalsize": 1249189106,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "ms",
+        "th",
+        "zh-Hant"
+      ],
+      "episode_no": 9,
+      "source_date": 1792534956,
+      "added_date": 1792535015,
+      "group": {
+        "id": 996,
+        "name": "NTb",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34841,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2176718,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "Bleach S17E49 Thousand-Year Blood War THE BLADE 720p DSNP WEB-DL AAC2.0 H 264-NTb",
+      "btih": "71e5201973881d15125a624a5e1e76b8c1e56e6c",
+      "is_adult": 0,
+      "totalsize": 705946669,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "ms",
+        "th",
+        "zh-Hant"
+      ],
+      "episode_no": 9,
+      "source_date": 1792534881,
+      "added_date": 1792535012,
+      "group": {
+        "id": 996,
+        "name": "NTb",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34804,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2176708,
+      "sukebei_id": 0,
+      "nekobt_id": 14548603707403,
+      "tt_id": 0,
+      "name": "[Knight-Subs] Bleach Thousand-Year Blood War - E49 - THE BLADE (1080p CR WEB-DL DDP2.0 H.264) [Eng-Subs].mkv",
+      "btih": "e7ea898168ed9fedd148e21cd719cf488e7b5f4e",
+      "is_adult": 0,
+      "totalsize": 1695852049,
+      "filecount": 1,
+      "audiolangs": [
+        "ja-JP"
+      ],
+      "sublangs": [
+        "en",
+        "enm"
+      ],
+      "episode_no": 9,
+      "source_date": 1792520083,
+      "added_date": 1792520129,
+      "group": {
+        "id": 1003,
+        "name": "Knight-Subs",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34658,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2176415,
+      "sukebei_id": 0,
+      "nekobt_id": 14537724016908,
+      "tt_id": 0,
+      "name": "[VARYG] BLEACH Thousand Year Blood War S01E49 1080p NF WEB-DL AAC2.0 H.264 (Bleach: Sennen Kessen-hen - Soukoku-tan, Multi-Subs)",
+      "btih": "72af33332bf289a5612599a82de356f9e5c033b7",
+      "is_adult": 0,
+      "totalsize": 1195058089,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "ms",
+        "th",
+        "vi",
+        "zh-Hans",
+        "zh-Hant"
+      ],
+      "episode_no": 9,
+      "source_date": 1792477584,
+      "added_date": 1792477633,
+      "group": {
+        "id": 7,
+        "name": "VARYG",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34652,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2176397,
+      "sukebei_id": 0,
+      "nekobt_id": 14535015658496,
+      "tt_id": 0,
+      "name": "[VARYG] BLEACH Thousand Year Blood War S01E49 540p NF WEB-DL AAC2.0 H.264 (Bleach: Sennen Kessen-hen - Soukoku-tan, Multi-Subs)",
+      "btih": "fe881e21422c5baeea9491691c4e81487421487f",
+      "is_adult": 0,
+      "totalsize": 309926955,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "ms",
+        "th",
+        "vi",
+        "zh-Hans",
+        "zh-Hant"
+      ],
+      "episode_no": 9,
+      "source_date": 1792467004,
+      "added_date": 1792467073,
+      "group": {
+        "id": 7,
+        "name": "VARYG",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34649,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2176389,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "[Judas] Bleach - Thousand Year Blood War - S17E49 [1080p][HEVC x265 10bit][Multi-Subs] (Weekly)",
+      "btih": "efdbbd27b8f820e59a322bcf200f22367bb5de26",
+      "is_adult": 0,
+      "totalsize": 572026625,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "fr",
+        "de",
+        "it",
+        "es-419",
+        "pt-BR"
+      ],
+      "episode_no": 9,
+      "source_date": 1792459485,
+      "added_date": 1792459752,
+      "group": {
+        "id": 8,
+        "name": "Judas",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34642,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2176369,
+      "sukebei_id": 0,
+      "nekobt_id": 14531535646991,
+      "tt_id": 0,
+      "name": "[Erai-raws] Bleach S17E49 (Sennen Kessen Hen - Kashin Tan) [1080p DSNP WEBRip HEVC AAC][MultiSub][9B162A32]",
+      "btih": "2c63e4f9cce3a550c83c6e2eaecac403fc556abf",
+      "is_adult": 0,
+      "totalsize": 609974442,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "pt-BR",
+        "es-419",
+        "de",
+        "fr",
+        "it"
+      ],
+      "episode_no": 9,
+      "source_date": 1792453411,
+      "added_date": 1792453636,
+      "group": {
+        "id": 3,
+        "name": "Erai-raws",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34634,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 0,
+      "sukebei_id": 0,
+      "nekobt_id": 14529362425354,
+      "tt_id": 0,
+      "name": "[Onalrie] Bleach S17E49 (Sennen Kessen Hen - Kashin Tan) [1080p WEBRip AV1]",
+      "btih": "66685d96d1cc33983cb5fceaeae181d2cc312053",
+      "is_adult": 0,
+      "totalsize": 367668026,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "pt",
+        "es",
+        "de",
+        "fr",
+        "it"
+      ],
+      "episode_no": 9,
+      "source_date": 1792444921,
+      "added_date": 1792444995,
+      "group": {
+        "id": 199,
+        "name": "Onalrie",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34630,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2176348,
+      "sukebei_id": 0,
+      "nekobt_id": 14528947548165,
+      "tt_id": 0,
+      "name": "[Erai-raws] Bleach S17E49 (Sennen Kessen Hen - Kashin Tan) [720p DSNP WEB-DL AVC AAC][MultiSub][D68C5630]",
+      "btih": "4da0af0fe9e4b279c63dac0713b35266de097490",
+      "is_adult": 0,
+      "totalsize": 707844536,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "pt-BR",
+        "es-419",
+        "de",
+        "fr",
+        "it"
+      ],
+      "episode_no": 9,
+      "source_date": 1792443301,
+      "added_date": 1792443322,
+      "group": {
+        "id": 3,
+        "name": "Erai-raws",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34629,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2176347,
+      "sukebei_id": 0,
+      "nekobt_id": 14528946482180,
+      "tt_id": 0,
+      "name": "[Erai-raws] Bleach S17E49 (Sennen Kessen Hen - Kashin Tan) [1080p DSNP WEB-DL AVC AAC][MultiSub][9896BE87]",
+      "btih": "34a646177ed9516dc02d710f0257d819ca0aa3ae",
+      "is_adult": 0,
+      "totalsize": 1224891407,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "pt-BR",
+        "es-419",
+        "de",
+        "fr",
+        "it"
+      ],
+      "episode_no": 9,
+      "source_date": 1792443297,
+      "added_date": 1792443319,
+      "group": {
+        "id": 3,
+        "name": "Erai-raws",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34628,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2176346,
+      "sukebei_id": 0,
+      "nekobt_id": 14528946163459,
+      "tt_id": 0,
+      "name": "[Erai-raws] Bleach S17E49 (Sennen Kessen Hen - Kashin Tan) [480p DSNP WEB-DL AVC AAC][MultiSub][3850FF2D]",
+      "btih": "b2e566815d9a0b6f2abe456d6e7171f6ec9d2c53",
+      "is_adult": 0,
+      "totalsize": 397253974,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "pt-BR",
+        "es-419",
+        "de",
+        "fr",
+        "it"
+      ],
+      "episode_no": 9,
+      "source_date": 1792443295,
+      "added_date": 1792443316,
+      "group": {
+        "id": 3,
+        "name": "Erai-raws",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34624,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2176342,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "[Anime Time] Bleach: Thousand-Year Blood War - S01E49 [1080p][HEVC 10bit x265][AAC][Multi Sub] [Weekly] Bleach Sennen Kessen hen",
+      "btih": "1cfcaf09fdc292016a3c8bfd37333bd873f5413d",
+      "is_adult": 0,
+      "totalsize": 672979581,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "fr",
+        "de",
+        "it",
+        "pt",
+        "es"
+      ],
+      "episode_no": 9,
+      "source_date": 1792441936,
+      "added_date": 1792442231,
+      "group": {
+        "id": 2,
+        "name": "Anime Time",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34616,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 0,
+      "sukebei_id": 0,
+      "nekobt_id": 14527757242380,
+      "tt_id": 0,
+      "name": "[Mythicore] Bleach: Thousand-Year Blood War - S04E09 (720p WEBRip 10-bit HEVC AAC)",
+      "btih": "a0cb655199156d10ade35043a06b1b9ac032957b",
+      "is_adult": 0,
+      "totalsize": 232275454,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "id",
+        "ms",
+        "zh",
+        "si"
+      ],
+      "episode_no": 9,
+      "source_date": 1792438651,
+      "added_date": 1792438753,
+      "group": {
+        "id": 1172,
+        "name": "Mythicore",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34615,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 2176366,
+      "sukebei_id": 0,
+      "nekobt_id": 14527499808769,
+      "tt_id": 0,
+      "name": "[Lazier] Bleach Thousand-Year Blood War - 49 (WEB 1080p AAC)",
+      "btih": "9e51a3f91e318e7155544826a9e4659e19f7be61",
+      "is_adult": 0,
+      "totalsize": 1697596435,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "enm"
+      ],
+      "episode_no": 9,
+      "source_date": 1792437646,
+      "added_date": 1792437793,
+      "group": {
+        "id": 926,
+        "name": "Lazier",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34614,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 3,
+      "nyaa_id": 0,
+      "sukebei_id": 0,
+      "nekobt_id": 14527454657540,
+      "tt_id": 0,
+      "name": "[Omar] Bleach.Thousand-Year.Blood.War.S01E49.1080p.Shahid.WEB-DL.DUAL.AAC2.0.H.264 (Bleach: Sennen Kessen-hen, Dual-Audio)",
+      "btih": "2a259f45a6e106559d1b8e6a87132bfcd37d54b0",
+      "is_adult": 0,
+      "totalsize": 625533591,
+      "filecount": 1,
+      "audiolangs": [
+        "ar",
+        "ja"
+      ],
+      "sublangs": [
+        "ar",
+        "en"
+      ],
+      "episode_no": 9,
+      "source_date": 1792437469,
+      "added_date": 1792437553,
+      "group": {
+        "id": 1057,
+        "name": "Omar",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34607,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2176310,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "[DKB] Bleach - Sennen Kessen-hen - 49 [1080p][HEVC x265 10bit][Multi-Subs][weekly]",
+      "btih": "1c5d4b05638697c0b7b99452424beac3eb352cb5",
+      "is_adult": 0,
+      "totalsize": 770304879,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en",
+        "de",
+        "es-419",
+        "fr-FR",
+        "it",
+        "pt-BR"
+      ],
+      "episode_no": 9,
+      "source_date": 1792434206,
+      "added_date": 1792434309,
+      "group": {
+        "id": 5,
+        "name": "DKB",
+        "is_fansub": 0
+      }
+    },
+    {
+      "id": 34603,
+      "state": "completed",
+      "has_nzb": 1,
+      "main_source": 1,
+      "nyaa_id": 2176297,
+      "sukebei_id": 0,
+      "nekobt_id": 0,
+      "tt_id": 0,
+      "name": "[ASW] Bleach - Sennen Kessen Hen - 49 [1080p HEVC x265 10Bit][AAC]",
+      "btih": "fb41180a2bb546e23cbd8edd645e05e723d2ee59",
+      "is_adult": 0,
+      "totalsize": 562088447,
+      "filecount": 1,
+      "audiolangs": [
+        "ja"
+      ],
+      "sublangs": [
+        "en"
+      ],
+      "episode_no": 9,
+      "source_date": 1792429828,
+      "added_date": 1792430229,
+      "group": {
+        "id": 9,
+        "name": "ASW",
+        "is_fansub": 0
+      }
+    }
+  ],
+  "anime": {
+    "id": 9403,
+    "title": "BLEACH: Sennen Kessen-hen - Kashin-tan",
+    "english_title": "BLEACH: Thousand-Year Blood War - The Calamity",
+    "thumbnail": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/medium/bx185874-aU3e6tBT6wwA.jpg",
+    "synopsis": "Destruction looms at the end of the Thousand-Year Blood War between the Soul Reapers and Quincies… as the death of the Soul King mirrors the collapse of the Three Worlds, distortions and omens of destruction start to appear in all realms. \n<br><br>\nFierce battles erupt throughout the Wahr Welt between the Thirteen Court Guard Squads and the Royal Guard. Ichigo learns about Uryuu's true intentions and renews his determination to protect the world together, as friends who trust each other. Yhwach has surpassed even his own ability, The Almighty...\n<br><br>\nThe fierce battle for the survival of the Three Worlds approaches its end. Beyond the chaos of calamity, what lies in wait—despair or hope?\n<br><br>\n(Source: VIZ Media, edited)",
+    "genres": [
+      "Action",
+      "Adventure",
+      "Supernatural"
+    ],
+    "studios": [
+      "PIERROT FILMS"
+    ],
+    "release_year": 2026,
+    "anilist": 185874,
+    "mal": 60636,
+    "anidb": 19079,
+    "is_movie": 0,
+    "total_episodes": 10,
+    "air_status": 2
+  }
+}
+Response headers

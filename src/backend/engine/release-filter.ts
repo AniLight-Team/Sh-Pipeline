@@ -74,6 +74,7 @@ export class ReleaseFilter {
   public static parseTitle(
     title: string,
     knownTitles?: (string | null | undefined)[],
+    item?: AnimeToshoItem,
   ): ParsedReleaseTitle {
     const titleClean = title.trim();
     const lower = titleClean.toLowerCase();
@@ -82,9 +83,11 @@ export class ReleaseFilter {
     const groupMatch = titleClean.match(/^\s*\[([^\]]+)\]/);
     if (groupMatch) {
       group = groupMatch[1].trim();
+    } else if (item?.group_name) {
+      group = item.group_name.trim();
     }
 
-    const isDualAudio = Array.from(this.DUAL_AUDIO_TAGS).some((tag) =>
+    let isDualAudio = Array.from(this.DUAL_AUDIO_TAGS).some((tag) =>
       lower.includes(tag),
     );
     let isEnglishDub =
@@ -110,6 +113,44 @@ export class ReleaseFilter {
       const subLangs = tagMatch[1].toLowerCase().split(",");
       const hasEnglishSub = subLangs.some((l) => l === "en" || l === "eng" || l === "multi");
       if (!hasEnglishSub && !lower.includes("multi") && !lower.includes("eng") && !lower.includes("dual")) {
+        isForeign = true;
+      }
+    }
+
+    // Use explicit audio/subtitle language arrays from Tsukihime when available
+    if (Array.isArray(item?.audiolangs) && item.audiolangs.length > 0) {
+      const audioLangs = item.audiolangs.map((l) => String(l).toLowerCase().trim());
+      const hasJaAudio = audioLangs.some(
+        (l) => l === "ja" || l === "jp" || l === "jpn" || l.startsWith("ja-") || l.startsWith("jpn"),
+      );
+      const hasEnAudio = audioLangs.some(
+        (l) => l === "en" || l === "eng" || l.startsWith("en-") || l.startsWith("eng"),
+      );
+      if (hasJaAudio && hasEnAudio) {
+        isDualAudio = true;
+        isEnglishDub = true;
+        isForeign = false;
+      } else if (hasEnAudio && !hasJaAudio) {
+        isDualAudio = false;
+        isEnglishDub = true;
+        isForeign = false;
+      } else if (hasJaAudio && !hasEnAudio) {
+        // E.g. ["ja"] or ["ar", "ja"] (Arabic+Japanese DUAL is not English Dub)
+        isDualAudio = false;
+        isEnglishDub = false;
+      } else {
+        isDualAudio = false;
+        isEnglishDub = false;
+        isForeign = true;
+      }
+    }
+
+    if (Array.isArray(item?.sublangs) && item.sublangs.length > 0) {
+      const subLangs = item.sublangs.map((l) => String(l).toLowerCase().trim());
+      const hasEnSub = subLangs.some(
+        (l) => l === "en" || l === "eng" || l === "multi" || l.startsWith("en-") || l.startsWith("eng"),
+      );
+      if (!hasEnSub && !isEnglishDub && !isDualAudio) {
         isForeign = true;
       }
     }
@@ -220,13 +261,19 @@ export class ReleaseFilter {
     langType: string,
     knownTitles?: (string | null | undefined)[],
   ): boolean {
-    const parsed = this.parseTitle(item.title || "", knownTitles);
+    const parsed = this.parseTitle(item.title || "", knownTitles, item);
     if (parsed.isWeirdOrPromo || parsed.isUnsupportedContainer) return false;
     const seeders = item.seeders || 0;
     const isTier1 = this.TRUSTED_GROUPS_TIER_1.has(parsed.groupLower);
     const isTier2 = this.TRUSTED_GROUPS_TIER_2.has(parsed.groupLower);
     const isSeadex = Boolean(item.is_seadex);
     const isDub = String(langType).toLowerCase() === "dub";
+    const isSingleEpTarget = String(targetEp).toLowerCase() !== "all";
+
+    // When searching for a single episode, do not stop pagination early on a non-SeaDex batch
+    if (isSingleEpTarget && (parsed.isBatch || (item.num_files || 1) > 1) && !isSeadex) {
+      return false;
+    }
 
     if (isDub) {
       if (isSeadex && seeders >= 1) return true;
@@ -235,6 +282,10 @@ export class ReleaseFilter {
       if (isTier2 && (parsed.isDualAudio || parsed.isEnglishDub) && seeders >= 3) return true;
       return false;
     }
+
+    // When searching for sub or all (sub+dub), do not treat a Dub-only release as a high-quality stop signal
+    if (parsed.isEnglishDub && !parsed.isDualAudio) return false;
+    if (parsed.isForeign && !parsed.isDualAudio) return false;
 
     if (isSeadex && seeders >= 1) return true;
     if (isTier1 && seeders >= 5) return true;
@@ -250,6 +301,7 @@ export class ReleaseFilter {
     langType: string,
     numFiles = 1,
     totalExpectedEps?: number | null,
+    item?: AnimeToshoItem,
   ): boolean {
     if (parsed.isWeirdOrPromo || parsed.isUnsupportedContainer) return false;
     if (parsed.isCam && !ALLOW_CAM) return false;
@@ -264,6 +316,9 @@ export class ReleaseFilter {
     } else if (lang === "sub") {
       if (parsed.isForeign && !parsed.isDualAudio) return false;
       if (parsed.isEnglishDub && !parsed.isDualAudio) return false;
+    } else {
+      // lang === "all"
+      if (parsed.isForeign && !parsed.isEnglishDub && !parsed.isDualAudio) return false;
     }
 
     if (String(targetEp).toLowerCase() === "all") {
@@ -283,6 +338,16 @@ export class ReleaseFilter {
 
     const targetEpNum = Number(targetEp);
     if (Number.isNaN(targetEpNum)) return false;
+
+    // Tsukihime curates relative episode_no per anime even when release titles use cumulative episode numbers
+    if (
+      typeof item?.tsukihime_episode_no === "number" &&
+      item.tsukihime_episode_no === targetEpNum &&
+      !parsed.isBatch &&
+      numFiles === 1
+    ) {
+      return true;
+    }
 
     if (parsed.singleEp === targetEpNum) return true;
 
@@ -313,12 +378,12 @@ export class ReleaseFilter {
     knownTitles?: (string | null | undefined)[],
     totalExpectedEps?: number | null,
   ): number {
-    const parsed = this.parseTitle(item.title || "", knownTitles);
+    const parsed = this.parseTitle(item.title || "", knownTitles, item);
     const numFiles = item.num_files || 1;
     const seeders = item.seeders || 0;
     const isSeadex = Boolean(item.is_seadex);
 
-    if (!this.matchesTarget(parsed, targetEp, langType, numFiles, totalExpectedEps)) {
+    if (!this.matchesTarget(parsed, targetEp, langType, numFiles, totalExpectedEps, item)) {
       return -10000;
     }
 
@@ -341,11 +406,15 @@ export class ReleaseFilter {
     else if (parsed.isAv1) score -= 15;
     if (parsed.isCam) score -= 50;
 
+    const langLower = String(langType).toLowerCase();
     if (parsed.isDualAudio) {
       score += 40;
-      if (String(langType).toLowerCase() === "all") score += 35;
-    } else if (String(langType).toLowerCase() === "dub" && parsed.isEnglishDub) {
+      if (langLower === "all") score += 35;
+    } else if (langLower === "dub" && parsed.isEnglishDub) {
       score += 35;
+    } else if (langLower === "all" && parsed.isEnglishDub && !parsed.isDualAudio) {
+      // Dub-only release lacks Japanese audio when both sub+dub ("all") are desired
+      score -= 35;
     }
 
     if (seeders >= 100) score += 45;
@@ -361,14 +430,125 @@ export class ReleaseFilter {
       if (totalExpectedEps && numFiles >= totalExpectedEps) score += 25;
     } else {
       const targetEpNum = Number(targetEp);
-      if (parsed.singleEp === targetEpNum) {
+      const isTsukihimeEpMatch =
+        typeof item.tsukihime_episode_no === "number" &&
+        item.tsukihime_episode_no === targetEpNum &&
+        !parsed.isBatch &&
+        numFiles === 1;
+      if (parsed.singleEp === targetEpNum || isTsukihimeEpMatch) {
         score += 60;
+        if (isTsukihimeEpMatch) score += 10;
       } else if (parsed.isBatch) {
         score -= 20;
       }
     }
 
     return score;
+  }
+
+  public static readonly VALID_COUR_OFFSETS = new Set([
+    10, 11, 12, 13, 14, 15, 16,
+    21, 22, 23, 24, 25, 26, 27, 28,
+    34, 35, 36, 37, 38, 39, 40,
+    47, 48, 49, 50, 51, 52,
+    60, 61, 62, 63, 64, 65,
+  ]);
+
+  /**
+   * Infers cumulative episode offsets (e.g. +12, +24, +26, +40, +392) from both
+   * cour/season batch ranges (e.g. S01E27-E40, S17E41-E50, 393-406) and contiguous
+   * single-episode clusters in the feed.
+   */
+  public static inferCumulativeOffsets(
+    torrentList: AnimeToshoItem[],
+    targetEpNum: number,
+    knownTitles?: (string | null | undefined)[],
+    totalExpectedEps?: number | null,
+  ): number[] {
+    if (Number.isNaN(targetEpNum) || targetEpNum <= 0) return [];
+
+    const offsets = new Set<number>();
+    const singleEps = new Set<number>();
+
+    for (const t of torrentList) {
+      if ((t.seeders || 0) <= 0) continue;
+      const parsed = this.parseTitle(t.title || "", knownTitles);
+      if (parsed.isBonusOrExtra || parsed.seasonNum === 0 || parsed.isWeirdOrPromo || parsed.isUnsupportedContainer) {
+        continue;
+      }
+
+      if (parsed.singleEp !== null && parsed.singleEp > 0) {
+        singleEps.add(parsed.singleEp);
+      }
+
+      if (parsed.epRange) {
+        const [rStart, rEnd] = parsed.epRange;
+        const span = rEnd - rStart + 1;
+        // Cour or season batch with cumulative numbering (e.g. 27-40, 41-50, 393-406)
+        if (rStart > 1 && span >= 3 && span <= 60) {
+          const offset = rStart - 1;
+          if (rStart + targetEpNum - 1 <= rEnd) {
+            offsets.add(offset);
+          }
+        }
+      }
+    }
+
+    if (singleEps.size > 0) {
+      const sorted = Array.from(singleEps).sort((a, b) => a - b);
+      // Group into contiguous episode clusters (allowing gaps up to 3 episodes)
+      const clusters: number[][] = [];
+      for (const ep of sorted) {
+        if (clusters.length === 0) {
+          clusters.push([ep]);
+        } else {
+          const cur = clusters[clusters.length - 1];
+          if (ep - cur[cur.length - 1] <= 3) {
+            cur.push(ep);
+          } else {
+            clusters.push([ep]);
+          }
+        }
+      }
+
+      // 1. Compare relative cluster max (<= 26) against cumulative cluster max (> 20)
+      // Because AnimeTosho feeds are sorted newest-first, cluster maximums represent the latest
+      // episode in both relative and cumulative numbering (invariant to page cutoffs).
+      const relClusters = clusters.filter((c) => c[0] >= 1 && c[c.length - 1] <= 26);
+      const cumClusters = clusters.filter((c) => c[0] > 11);
+      if (relClusters.length > 0 && cumClusters.length > 0) {
+        const relMax = relClusters[0][relClusters[0].length - 1];
+        for (const cum of cumClusters) {
+          const cumMax = cum[cum.length - 1];
+          const diff = cumMax - relMax;
+          if (this.VALID_COUR_OFFSETS.has(diff)) {
+            offsets.add(diff);
+          }
+        }
+      }
+
+      // 2. Check cumulative clusters against totalExpectedEps or valid cour-start boundaries
+      for (const cluster of cumClusters) {
+        const cMin = cluster[0];
+        const cMax = cluster[cluster.length - 1];
+        if (totalExpectedEps && totalExpectedEps >= 4 && totalExpectedEps <= 30) {
+          const expectedOffset = cMax - totalExpectedEps;
+          if (this.VALID_COUR_OFFSETS.has(expectedOffset)) {
+            offsets.add(expectedOffset);
+          }
+        }
+        const candidateOffset = cMin - 1;
+        if (
+          cluster.length >= 3 &&
+          this.VALID_COUR_OFFSETS.has(candidateOffset) &&
+          singleEps.has(candidateOffset + targetEpNum)
+        ) {
+          offsets.add(candidateOffset);
+        }
+      }
+    }
+
+    return Array.from(offsets);
   }
 
   public static selectTopCandidates(
@@ -397,35 +577,36 @@ export class ReleaseFilter {
       const tNum = Number(targetEp);
       if (episodeOffset && episodeOffset > 0) {
         candidatesToTry.unshift(tNum + episodeOffset);
-      } else {
-        const singleEps = new Set<number>();
-        for (const t of torrentList) {
-          if ((t.seeders || 0) > 0) {
-            const parsed = this.parseTitle(t.title || "", knownTitles);
-            if (parsed.singleEp !== null) singleEps.add(parsed.singleEp);
-          }
-        }
-        if (singleEps.size > 0 && !singleEps.has(tNum)) {
-          const minEp = Math.min(...Array.from(singleEps));
-          const courOffsets = new Set([11, 12, 13, 23, 24, 25, 26, 36, 37, 48, 49, 50]);
-          if (minEp > 1 && courOffsets.has(minEp - 1)) {
-            const inferred = minEp - 1 + tNum;
-            if (singleEps.has(inferred)) {
-              log.info(
-                "ReleaseFilter",
-                `Cumulative numbering offset +${minEp - 1} detected (Ep ${tNum} -> Ep ${inferred})`,
-              );
-              candidatesToTry.push(inferred);
-            }
-          }
+      }
+      const inferredOffsets = this.inferCumulativeOffsets(
+        torrentList,
+        tNum,
+        knownTitles,
+        totalExpectedEps,
+      );
+      for (const off of inferredOffsets) {
+        const mappedEp = tNum + off;
+        if (!candidatesToTry.includes(mappedEp)) {
+          log.info(
+            "ReleaseFilter",
+            `Cumulative numbering offset +${off} detected (Ep ${tNum} -> Ep ${mappedEp})`,
+          );
+          candidatesToTry.push(mappedEp);
         }
       }
     }
 
+    // Pool scored candidates across all candidate episode numbers (direct + cumulative offsets)
+    // so a high-quality Dual-Audio / WEB-DL release at S01E27 or S01E41 isn't shadowed by a poor Ep 1 match
+    const bestByItemKey = new Map<
+      string | number,
+      { score: number; item: AnimeToshoItem; effectiveEp: number | string }
+    >();
+
     for (const candidateEp of candidatesToTry) {
-      const ranked: { score: number; item: AnimeToshoItem }[] = [];
+      const isDirectMatch = candidateEp === targetEp;
       for (const t of torrentList) {
-        const score = this.scoreTorrent(
+        let score = this.scoreTorrent(
           t,
           candidateEp,
           langType,
@@ -433,62 +614,78 @@ export class ReleaseFilter {
           totalExpectedEps,
         );
         if (score > 0) {
-          ranked.push({ score, item: t });
-        }
-      }
-
-      if (ranked.length > 0) {
-        ranked.sort((a, b) => b.score - a.score);
-
-        let candidatePool = ranked;
-        if (String(targetEp).toLowerCase() !== "all") {
-          const isSoloCandidate = (t: AnimeToshoItem): boolean => {
-            const p = this.parseTitle(t.title || "", knownTitles);
-            const nFiles = t.num_files || 1;
-            return !p.isBatch && p.epRange === null && nFiles === 1;
-          };
-
-          const soloCandidates = ranked.filter((r) => isSoloCandidate(r.item));
-          const batchCandidates = ranked.filter((r) => !isSoloCandidate(r.item));
-
-          const hasSeaDexBatch = batchCandidates.some((b) => Boolean(b.item.is_seadex));
-          if (hasSeaDexBatch) {
-            candidatePool = ranked;
-          } else if (soloCandidates.length > 0) {
-            candidatePool = soloCandidates;
-          } else if (batchCandidates.length > 0) {
-            candidatePool = batchCandidates;
+          if (isDirectMatch) {
+            score += 15;
           }
-        }
-
-        const topRanked = candidatePool.slice(0, maxCandidates);
-
-        const viable: [AnimeToshoItem, number | string, number, number][] = [];
-        for (let idx = 0; idx < topRanked.length; idx++) {
-          const entry = topRanked[idx];
-          const sCount = entry.item.seeders || 0;
-          if (sCount >= minSeeders) {
-            viable.push([entry.item, candidateEp, entry.score, idx + 1]);
-          }
-        }
-
-        if (viable.length === 0) {
-          for (let idx = 0; idx < topRanked.length; idx++) {
-            const entry = topRanked[idx];
-            const sCount = entry.item.seeders || 0;
-            if (sCount >= 1) {
-              viable.push([entry.item, candidateEp, entry.score, idx + 1]);
+          let effectiveEpForFile: number | string = candidateEp;
+          if (
+            String(candidateEp).toLowerCase() !== "all" &&
+            typeof t.tsukihime_episode_no === "number" &&
+            t.tsukihime_episode_no === Number(candidateEp)
+          ) {
+            const p = this.parseTitle(t.title || "", knownTitles, t);
+            if (p.singleEp !== null && p.singleEp !== Number(candidateEp)) {
+              effectiveEpForFile = p.singleEp;
             }
           }
-        }
-
-        if (viable.length > 0) {
-          return viable.map(([t, ep]) => [t, ep]);
+          const key = (t.info_hash ? t.info_hash.toLowerCase() : null) || t.id || t.title;
+          const existing = bestByItemKey.get(key);
+          if (!existing || score > existing.score) {
+            bestByItemKey.set(key, { score, item: t, effectiveEp: effectiveEpForFile });
+          }
         }
       }
     }
 
-    return [];
+    const ranked = Array.from(bestByItemKey.values());
+    if (ranked.length === 0) {
+      return [];
+    }
+
+    ranked.sort((a, b) => b.score - a.score);
+
+    let candidatePool = ranked;
+    if (String(targetEp).toLowerCase() !== "all") {
+      const isSoloCandidate = (t: AnimeToshoItem): boolean => {
+        const p = this.parseTitle(t.title || "", knownTitles, t);
+        const nFiles = t.num_files || 1;
+        return !p.isBatch && p.epRange === null && nFiles === 1;
+      };
+
+      const soloCandidates = ranked.filter((r) => isSoloCandidate(r.item));
+      const batchCandidates = ranked.filter((r) => !isSoloCandidate(r.item));
+
+      const hasSeaDexBatch = batchCandidates.some((b) => Boolean(b.item.is_seadex));
+      if (hasSeaDexBatch) {
+        candidatePool = ranked;
+      } else if (soloCandidates.length > 0) {
+        // Keep solo candidates first, but append top batch candidates as fallback
+        candidatePool = [...soloCandidates, ...batchCandidates];
+      } else if (batchCandidates.length > 0) {
+        candidatePool = batchCandidates;
+      }
+    }
+
+    const topRanked = candidatePool.slice(0, maxCandidates);
+
+    const viable: [AnimeToshoItem, number | string][] = [];
+    for (const entry of topRanked) {
+      const sCount = entry.item.seeders || 0;
+      if (sCount >= minSeeders) {
+        viable.push([entry.item, entry.effectiveEp]);
+      }
+    }
+
+    if (viable.length === 0) {
+      for (const entry of topRanked) {
+        const sCount = entry.item.seeders || 0;
+        if (sCount >= 1) {
+          viable.push([entry.item, entry.effectiveEp]);
+        }
+      }
+    }
+
+    return viable;
   }
 
   public static selectBest(
@@ -566,8 +763,13 @@ export class ReleaseFilter {
           effectiveEp !== undefined &&
           String(targetEp).toLowerCase() !== "all"
         ) {
-          if (epN === Number(effectiveEp)) {
-            epN = Number(targetEp);
+          const targetNum = Number(targetEp);
+          const effectiveNum = Number(effectiveEp);
+          if (epN === effectiveNum) {
+            epN = targetNum;
+          } else if (effectiveNum > targetNum && epN > effectiveNum - targetNum) {
+            // Also normalize sibling episodes in the same cumulative batch
+            epN = epN - (effectiveNum - targetNum);
           }
         }
 
@@ -576,6 +778,26 @@ export class ReleaseFilter {
         const existLen = existing ? files[existing[0]]?.length || 0 : 0;
         if (!existing || curLen > existLen) {
           epMap.set(epN, [vf.idx, vf.relPath]);
+        }
+      }
+    }
+
+    // If a batch torrent had cumulative file numbering (e.g. 27..40 or 393..406) and targetEp wasn't mapped yet
+    if (
+      targetEp !== null &&
+      targetEp !== undefined &&
+      String(targetEp).toLowerCase() !== "all" &&
+      !epMap.has(Number(targetEp)) &&
+      epMap.size > 1
+    ) {
+      const tNum = Number(targetEp);
+      const positiveKeys = Array.from(epMap.keys())
+        .filter((k) => k > 0)
+        .sort((a, b) => a - b);
+      if (positiveKeys.length > 0 && positiveKeys[0] > 1) {
+        const inferredKey = positiveKeys[0] - 1 + tNum;
+        if (epMap.has(inferredKey)) {
+          epMap.set(tNum, epMap.get(inferredKey)!);
         }
       }
     }
