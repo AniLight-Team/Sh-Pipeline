@@ -160,42 +160,66 @@ async function runAutonomousReconciliationTick() {
           id: `pipeline-batch-${bId}-${Date.now()}`,
           data: { batchId: bId },
         })
-        .catch(() => {});
+        .catch(() => {
+          PipelineEngineService.executeBatch(bId).catch(() => {});
+        });
     }
 
-    // 4. Find any orphaned "queued" jobs (>90s old) and dispatch them
-    const ninetySecsAgo = new Date(Date.now() - 90 * 1000);
-    const stuckQueuedJobs = await db
-      .select()
-      .from(schema.pipelineJob)
-      .where(
-        and(
-          eq(schema.pipelineJob.status, "queued"),
-          lt(schema.pipelineJob.updatedAt, ninetySecsAgo),
-        ),
-      )
-      .limit(10);
+    // 4. Find any orphaned "queued" jobs (>90s old) and dispatch them ONLY if staging capacity (<56 GB) allows
+    const cap = await PipelineEngineService.checkStorageCapacityForDownload();
+    if (cap.allowed) {
+      const ninetySecsAgo = new Date(Date.now() - 90 * 1000);
+      const stuckQueuedJobs = await db
+        .select()
+        .from(schema.pipelineJob)
+        .where(
+          and(
+            eq(schema.pipelineJob.status, "queued"),
+            lt(schema.pipelineJob.updatedAt, ninetySecsAgo),
+          ),
+        )
+        .limit(4);
 
-    for (const j of stuckQueuedJobs) {
-      await db
-        .update(schema.pipelineJob)
-        .set({ updatedAt: new Date() })
-        .where(eq(schema.pipelineJob.id, j.id));
-      await inngest
-        .send({
-          name: "pipeline/job.discover",
-          id: `pipe-job-${j.id}-auto-${Date.now()}`,
-          data: {
-            jobId: j.id,
-            anilistId: j.anilistId,
-            animeId: j.animeId,
-            anidbId: j.anidbId,
-            episodeNumber: j.episodeNumber,
-            types: j.types,
-            knownTitles: j.knownTitles || [],
-          },
-        })
-        .catch(() => {});
+      for (const j of stuckQueuedJobs) {
+        await db
+          .update(schema.pipelineJob)
+          .set({ updatedAt: new Date() })
+          .where(eq(schema.pipelineJob.id, j.id));
+        await inngest
+          .send({
+            name: "pipeline/job.discover",
+            id: `pipe-job-${j.id}-auto-${Date.now()}`,
+            data: {
+              jobId: j.id,
+              anilistId: j.anilistId,
+              animeId: j.animeId,
+              anidbId: j.anidbId,
+              episodeNumber: j.episodeNumber,
+              types: j.types,
+              knownTitles: j.knownTitles || [],
+            },
+          })
+          .catch(() => {
+            PipelineEngineService.discoverAndStageJob(j.id).catch(() => {});
+          });
+      }
+    } else {
+      // If at 56 GB capacity, ensure any staged jobs are flushed into batches to free disk space
+      const capSealed = await PipelineEngineService.sealAvailableBatches({
+        forceFlush: true,
+        triggerReason: "storage_limit_56gb",
+      });
+      for (const bId of capSealed) {
+        await inngest
+          .send({
+            name: "pipeline/batch.execute",
+            id: `pipeline-batch-${bId}-cap-${Date.now()}`,
+            data: { batchId: bId },
+          })
+          .catch(() => {
+            PipelineEngineService.executeBatch(bId).catch(() => {});
+          });
+      }
     }
   } catch (err: any) {
     log.warn("Server", `Autonomous background heartbeat warning: ${err?.message || err}`);

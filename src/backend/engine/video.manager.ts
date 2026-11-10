@@ -1,5 +1,10 @@
 import fs from "fs";
+import os from "os";
+import path from "path";
+import crypto from "crypto";
 import https from "https";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import type {
   KaggleAccount,
   HuggingFaceAccount,
@@ -8,9 +13,13 @@ import type {
   KiraBatchManifestItem,
   KiraBatchKernelOutput,
   KiraBatchHfRecord,
+  VideoResolutionQuality,
 } from "./types.js";
-import { loadAccountsFromEnv } from "../config.js";
+import { inspectMkvStreamsSync } from "./subtitles.manager.js";
+import { loadAccountsFromEnv, KIRA_VM_FFMPEG_THREADS } from "../config.js";
 import { log } from "../utils/logger.js";
+
+const execFileAsync = promisify(execFile);
 
 export class VideoEncodingManager {
   private kaggleAccounts: KaggleAccount[];
@@ -145,6 +154,288 @@ export class VideoEncodingManager {
       return [["dub", isDual ? enIdx : jpIdx]];
     }
     return [["sub", jpIdx]];
+  }
+
+  private async computeFileSha256(filePath: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const hash = crypto.createHash("sha256");
+      const stream = fs.createReadStream(filePath);
+      stream.on("data", (chunk) => hash.update(chunk));
+      stream.on("end", () => resolve(hash.digest("hex")));
+      stream.on("error", (err) => reject(err));
+    });
+  }
+
+  /**
+   * Uploads local MP4 files directly from the VM to a Hugging Face Storage Bucket
+   * using huggingface_hub.batch_bucket_files (auto-provisioning a cached Python venv if needed).
+   */
+  public async uploadFilesToHfBucket(
+    hf: HuggingFaceAccount,
+    addItems: [string, string][],
+  ): Promise<void> {
+    if (addItems.length === 0) return;
+
+    const payloadJson = JSON.stringify({
+      bucketId: `${hf.owner}/${hf.bucket}`,
+      token: hf.token,
+      addItems,
+    });
+    const payloadB64 = Buffer.from(payloadJson, "utf8").toString("base64");
+
+    const pyScript = `
+import sys, json, base64, subprocess, os
+
+data = json.loads(base64.b64decode("${payloadB64}").decode("utf-8"))
+try:
+    from huggingface_hub import batch_bucket_files
+except ImportError:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub"], check=False)
+    from huggingface_hub import batch_bucket_files
+
+pairs = [(item[0], item[1]) for item in data["addItems"]]
+batch_bucket_files(
+    bucket_id=data["bucketId"],
+    add=pairs,
+    token=data["token"],
+)
+print("HF_UPLOAD_OK")
+`;
+
+    const venvDir = path.join(os.tmpdir(), "kira-hf-venv");
+    const venvPy = path.join(venvDir, "bin", "python");
+
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      try {
+        const pyBin = fs.existsSync(venvPy) ? venvPy : "python3";
+        const { stdout } = await execFileAsync(pyBin, ["-c", pyScript], {
+          timeout: 1800_000,
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        if (stdout.includes("HF_UPLOAD_OK")) {
+          return;
+        }
+      } catch (err: any) {
+        const errMsg = String(err?.stderr || err?.message || err);
+        // If PEP 668 externally-managed-environment prevented system pip install, bootstrap cached venv once
+        if (!fs.existsSync(venvPy) && (errMsg.includes("huggingface_hub") || errMsg.includes("externally-managed"))) {
+          try {
+            await execFileAsync("python3", ["-m", "venv", venvDir], { timeout: 120_000 });
+            await execFileAsync(venvPy, ["-m", "pip", "install", "-q", "-U", "huggingface_hub"], { timeout: 300_000 });
+            continue;
+          } catch {}
+        }
+        if (attempt === 4) {
+          throw new Error(`VM Hugging Face Bucket upload failed after 4 attempts: ${errMsg.slice(0, 300)}`);
+        }
+        log.warn("VM:Remux", `HF bucket upload attempt ${attempt}/4 warning: ${errMsg.slice(0, 180)}`);
+        await new Promise((r) => setTimeout(r, 3500 * attempt));
+      }
+    }
+  }
+
+  /**
+   * Direct Container & Audio Conversion on the VM (ZERO video re-encoding!).
+   * - Copies H.264 video stream losslessly (-c:v copy) into faststart MP4 container.
+   * - Copies audio (-c:a copy) if already stereo AAC, or converts ONLY audio (-c:a aac -b:a 192k -ar 48000 -ac 2).
+   * - Strictly throttled to KIRA_VM_FFMPEG_THREADS (default 2 threads) and nice priority so VM resources are protected.
+   */
+  public async remuxAndUploadJobOnVm(params: {
+    jobId: number;
+    animeId: number;
+    episodeNumber: number;
+    stagedQualities: Partial<Record<VideoResolutionQuality, string>>;
+    tracks: [string, number][];
+    hf: HuggingFaceAccount;
+    workBaseDir: string;
+    onProgress?: () => Promise<void>;
+  }): Promise<KiraBatchHfRecord[]> {
+    const {
+      jobId,
+      animeId,
+      episodeNumber,
+      stagedQualities,
+      tracks,
+      hf,
+      workBaseDir,
+      onProgress,
+    } = params;
+
+    const workDir = path.join(workBaseDir, `vm_remux_${jobId}_${crypto.randomUUID().slice(0, 6)}`);
+    await fs.promises.mkdir(workDir, { recursive: true });
+
+    const validQualities = (["1080p", "720p", "480p"] as VideoResolutionQuality[]).filter(
+      (q) => Boolean(stagedQualities[q] && fs.existsSync(stagedQualities[q]!)),
+    );
+
+    if (validQualities.length === 0) {
+      await fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
+      throw new Error(`Job #${jobId} has no existing staged quality files on disk for VM direct remux`);
+    }
+
+    const normalizedTracks: [string, number][] =
+      tracks.length > 0
+        ? tracks.filter((t) => t[0] === "sub" || t[0] === "dub")
+        : [["sub", 0]];
+
+    const records: KiraBatchHfRecord[] = [];
+    const addItems: [string, string][] = [];
+    const startTime = Date.now();
+
+    try {
+      // Pre-allocate remote folder UUIDs per track ("sub" / "dub")
+      const trackRemoteFolders = new Map<string, { f1: string; f2: string }>();
+      for (const [tName] of normalizedTracks) {
+        trackRemoteFolders.set(tName, {
+          f1: crypto.randomUUID().replace(/-/g, ""),
+          f2: crypto.randomUUID().replace(/-/g, ""),
+        });
+      }
+
+      for (const qName of validQualities) {
+        const inputPath = stagedQualities[qName]!;
+        let probe: MkvStreamProbe | null = null;
+        try {
+          probe = await inspectMkvStreamsSync(inputPath);
+        } catch {}
+
+        for (const [trackName, fallbackAudioIdx] of normalizedTracks) {
+          let targetAudioIdx = fallbackAudioIdx;
+          if (probe) {
+            if (trackName === "dub" && probe.englishStreamIndex !== null) {
+              targetAudioIdx = probe.englishStreamIndex;
+            } else if (trackName === "sub") {
+              targetAudioIdx = probe.japaneseStreamIndex ?? fallbackAudioIdx;
+            }
+          }
+
+          const audioInfo = probe?.classifiedAudio.find((a) => a.audioIndex === targetAudioIdx);
+          const isAlreadyStereoAac =
+            audioInfo &&
+            audioInfo.codec === "aac" &&
+            audioInfo.channels > 0 &&
+            audioInfo.channels <= 2;
+
+          const outMp4Path = path.join(workDir, `${trackName}_${qName}.mp4`);
+
+          const runFfmpegRemux = async (copyAudio: boolean, mapAudioSpec: string) => {
+            const audioArgs = copyAudio
+              ? ["-c:a", "copy"]
+              : ["-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2"];
+
+            const ffArgs = [
+              "-hide_banner",
+              "-y",
+              "-v",
+              "warning",
+              "-analyzeduration",
+              "50M",
+              "-probesize",
+              "25M",
+              "-fflags",
+              "+genpts+igndts",
+              "-threads",
+              String(KIRA_VM_FFMPEG_THREADS),
+              "-i",
+              inputPath,
+              "-map",
+              "0:v:0",
+              "-map",
+              mapAudioSpec,
+              "-sn",
+              "-dn",
+              "-map_chapters",
+              "-1",
+              "-c:v",
+              "copy",
+              ...audioArgs,
+              "-metadata",
+              "title=AniLight",
+              "-metadata",
+              "comment=AniLight",
+              "-avoid_negative_ts",
+              "make_zero",
+              "-max_muxing_queue_size",
+              "4096",
+              "-movflags",
+              "+faststart",
+              outMp4Path,
+            ];
+
+            if (process.platform === "linux") {
+              await execFileAsync("nice", ["-n", "10", "ffmpeg", ...ffArgs], {
+                timeout: 600_000,
+              });
+            } else {
+              await execFileAsync("ffmpeg", ffArgs, { timeout: 600_000 });
+            }
+          };
+
+          try {
+            await runFfmpegRemux(Boolean(isAlreadyStereoAac), `0:a:${targetAudioIdx}`);
+          } catch {
+            try {
+              await runFfmpegRemux(false, `0:a:${targetAudioIdx}`);
+            } catch {
+              await runFfmpegRemux(false, "0:a:0");
+            }
+          }
+
+          if (!fs.existsSync(outMp4Path) || fs.statSync(outMp4Path).size < 10_240) {
+            throw new Error(`VM direct remux produced empty MP4 for Job #${jobId} (${trackName} ${qName})`);
+          }
+
+          const sha256 = await this.computeFileSha256(outMp4Path);
+          const outSize = fs.statSync(outMp4Path).size;
+          const folders = trackRemoteFolders.get(trackName)!;
+          const remotePath = `${folders.f1}/${folders.f2}/${qName}.mp4`;
+          const downloadUrl = `https://huggingface.co/buckets/${hf.owner}/${hf.bucket}/resolve/${remotePath}`;
+
+          records.push({
+            job_id: jobId,
+            anime_id: animeId,
+            episode_number: episodeNumber,
+            type: trackName,
+            quality: qName,
+            sha256,
+            metadata: {
+              container: "mp4",
+              size: outSize,
+              watermarked: false,
+              remuxedOnVm: true,
+              audioMode: isAlreadyStereoAac ? "copy" : "aac_192k",
+            },
+            huggingface: {
+              owner: hf.owner,
+              repo: hf.bucket,
+              path: remotePath,
+              downloadUrl,
+            },
+          });
+
+          addItems.push([outMp4Path, remotePath]);
+          if (onProgress) {
+            await onProgress().catch(() => {});
+          }
+        }
+      }
+
+      log.info(
+        "VM:Remux",
+        `Job #${jobId}: Direct-converted ${addItems.length} MP4 file(s) (${validQualities.join(", ")}) in ${((Date.now() - startTime) / 1000).toFixed(1)}s. Uploading to HF ${hf.owner}/${hf.bucket}...`,
+      );
+
+      await this.uploadFilesToHfBucket(hf, addItems);
+
+      log.success(
+        "VM:Remux",
+        `Job #${jobId}: Uploaded ${addItems.length} direct-remuxed MP4 stream(s) to Hugging Face!`,
+      );
+
+      return records;
+    } finally {
+      await fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 
   /**
@@ -678,7 +969,7 @@ def check_ffmpeg_caps():
     return dav1d, fdk_aac, has_fps_mode, has_p5, has_p4, has_tune_hq, has_multipass, has_b_ref, has_nonref_p
 
 has_libdav1d, has_fdk_aac, has_fps_mode, has_p5, has_p4, has_tune_hq, has_multipass, has_b_ref, has_nonref_p = check_ffmpeg_caps()
-selected_preset = "p5" if has_p5 else ("p4" if has_p4 else "slow")
+selected_preset = "p4" if has_p4 else ("p5" if has_p5 else "fast")
 print(
     f"GPU Verified: count={gpu_count}, preset={selected_preset}, fps_mode={has_fps_mode}, tune_hq={has_tune_hq}, "
     f"multipass={has_multipass}, b_ref_mode={has_b_ref}, libdav1d={has_libdav1d}, fdk_aac={has_fdk_aac}",
@@ -1091,8 +1382,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
 
     preset_flags = (
         ["-preset", selected_preset] +
-        (["-tune", "hq"] if has_tune_hq else []) +
-        (["-multipass", "qres"] if has_multipass else [])
+        (["-tune", "hq"] if has_tune_hq else [])
     )
     bframe_extra = (["-b_ref_mode", "middle"] if has_b_ref else []) + (["-nonref_p", "1"] if has_nonref_p else [])
     fps_sync_flags = ["-fps_mode", "cfr"] if has_fps_mode else ["-vsync", "cfr"]
@@ -1101,7 +1391,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
         ["-c:v", "h264_nvenc"] + preset_flags +
         ["-profile:v", "high", "-rc:v", "vbr", "-b:v", "0",
          "-spatial-aq", "1", "-temporal-aq", "1", "-aq-strength", "8",
-         "-rc-lookahead", "24", "-bf", "3"] + bframe_extra +
+         "-rc-lookahead", "10", "-bf", "3"] + bframe_extra +
         ["-g", "240", "-forced-idr", "1", "-pix_fmt", "yuv420p",
          "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
          "-c:a", "copy",
@@ -1118,7 +1408,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
     nvenc_720 = ["-cq", "21", "-maxrate", "3500k", "-bufsize", "7000k"] + nvenc_common + [primary_files["720p"]]
     nvenc_480 = ["-cq", "23", "-maxrate", "1600k", "-bufsize", "3200k"] + nvenc_common + [primary_files["480p"]]
 
-    lanczos_flags = "lanczos+accurate_rnd+full_chroma_int"
+    lanczos_flags = "bicubic"
     v1080_scale = "format=yuv420p" if in_height == 1080 else f"scale=-2:1080:flags={lanczos_flags},format=yuv420p"
 
     wm_input_1080 = ["-framerate", str(in_fps), "-loop", "1", "-t", "30", "-i", wm_1080_png]
@@ -1130,25 +1420,25 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
     fc_1080_only = (
         f"[0:v:0]setpts=PTS-STARTPTS,{v1080_scale}[b1080];"
         "[1:v:0]format=rgba[wm1080];"
-        "[b1080][wm1080]overlay=x=20:y=18:eof_action=pass:format=auto,format=yuv420p[out1080]"
+        "[b1080][wm1080]overlay=x=20:y=18:enable='between(t,0,30)':eof_action=pass:format=auto,format=yuv420p[out1080]"
     )
     fc_720_only = (
         f"[0:v:0]setpts=PTS-STARTPTS,scale=-2:720:flags={lanczos_flags},format=yuv420p[b720];"
         "[1:v:0]format=rgba[wm720];"
-        "[b720][wm720]overlay=x=14:y=12:eof_action=pass:format=auto,format=yuv420p[out720]"
+        "[b720][wm720]overlay=x=14:y=12:enable='between(t,0,30)':eof_action=pass:format=auto,format=yuv420p[out720]"
     )
     fc_480_only = (
         f"[0:v:0]setpts=PTS-STARTPTS,scale=-2:480:flags={lanczos_flags},format=yuv420p[b480];"
         "[1:v:0]format=rgba[wm480];"
-        "[b480][wm480]overlay=x=10:y=8:eof_action=pass:format=auto,format=yuv420p[out480]"
+        "[b480][wm480]overlay=x=10:y=8:enable='between(t,0,30)':eof_action=pass:format=auto,format=yuv420p[out480]"
     )
     fc_lower_2 = (
         f"[0:v:0]setpts=PTS-STARTPTS,scale=-2:720:flags={lanczos_flags},format=yuv420p,split=2[b720][s720];"
         f"[s720]scale=-2:480:flags={lanczos_flags},format=yuv420p[b480];"
         "[1:v:0]format=rgba[wm720];"
         "[2:v:0]format=rgba[wm480];"
-        "[b720][wm720]overlay=x=14:y=12:eof_action=pass:format=auto,format=yuv420p[out720];"
-        "[b480][wm480]overlay=x=10:y=8:eof_action=pass:format=auto,format=yuv420p[out480]"
+        "[b720][wm720]overlay=x=14:y=12:enable='between(t,0,30)':eof_action=pass:format=auto,format=yuv420p[out720];"
+        "[b480][wm480]overlay=x=10:y=8:enable='between(t,0,30)':eof_action=pass:format=auto,format=yuv420p[out480]"
     )
     fc_all_3 = (
         f"[0:v:0]setpts=PTS-STARTPTS,{v1080_scale},split=2[b1080][s1080];"
@@ -1157,9 +1447,9 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
         "[1:v:0]format=rgba[wm1080];"
         "[2:v:0]format=rgba[wm720];"
         "[3:v:0]format=rgba[wm480];"
-        "[b1080][wm1080]overlay=x=20:y=18:eof_action=pass:format=auto,format=yuv420p[out1080];"
-        "[b720][wm720]overlay=x=14:y=12:eof_action=pass:format=auto,format=yuv420p[out720];"
-        "[b480][wm480]overlay=x=10:y=8:eof_action=pass:format=auto,format=yuv420p[out480]"
+        "[b1080][wm1080]overlay=x=20:y=18:enable='between(t,0,30)':eof_action=pass:format=auto,format=yuv420p[out1080];"
+        "[b720][wm720]overlay=x=14:y=12:enable='between(t,0,30)':eof_action=pass:format=auto,format=yuv420p[out720];"
+        "[b480][wm480]overlay=x=10:y=8:enable='between(t,0,30)':eof_action=pass:format=auto,format=yuv420p[out480]"
     )
 
     encode_ok = False

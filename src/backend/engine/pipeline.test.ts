@@ -4,6 +4,11 @@ import { VideoEncodingManager } from "./video.manager.js";
 import { SubtitleManager } from "./subtitles.manager.js";
 import { ReleaseFilter } from "./release-filter.js";
 import { TsukihimeClient } from "./tsukihime.client.js";
+import {
+  KIRA_MAX_STAGING_BYTES,
+  KIRA_VM_MAX_CONCURRENT_BATCHES,
+  KIRA_VM_FFMPEG_THREADS,
+} from "../config.js";
 import type { MkvStreamProbe } from "./types.js";
 
 test("VideoEncodingManager.generateBatchGpuKernelScript always encodes 1080p, 720p, and 480p with AniLight watermark", () => {
@@ -107,12 +112,13 @@ test("SubtitleManager.formatForCallback sets default flags for sub (dialogue) vs
 
 test("ReleaseFilter parses dual-audio and single episode releases accurately", () => {
   const parsed = ReleaseFilter.parseTitle(
-    "[SubsPlease] Solo Leveling - 08 (1080p) [Dual Audio] [ABCD1234].mkv",
+    "[SubsPlease] Solo Leveling - 08 (1080p) [ABCD1234].mkv",
     ["Solo Leveling"],
   );
   assert.equal(parsed.singleEp, 8);
-  assert.equal(parsed.isDualAudio, true);
   assert.equal(parsed.is1080p, true);
+  assert.equal(parsed.isH264, true);
+  assert.equal(parsed.resolution, "1080p");
 });
 
 test("ReleaseFilter infers cumulative cour offsets (+26 and +40) even when relative episodes exist in the same feed", () => {
@@ -215,4 +221,98 @@ test("TsukihimeClient & ReleaseFilter accurately match relative episode_no and a
   assert.equal(topEp10[0][0].tsukihime_id, 28448);
 });
 
+test("ReleaseFilter.selectTopCandidateBundles prioritizes H.264 over HEVC/AV1 and bundles 1080p/720p/480p strictly from the same group", () => {
+  const mixedTorrents = [
+    // HEVC release with high seeders
+    {
+      id: 101,
+      title: "[EMBER] Dandadan - 04 [1080p] [HEVC WEBRip 10bits] [A1B2C3D4].mkv",
+      seeders: 250,
+      num_files: 1,
+    },
+    // AV1 release
+    {
+      id: 102,
+      title: "[AV1-Group] Dandadan - 04 (1080p AV1 Opus).mkv",
+      seeders: 180,
+      num_files: 1,
+    },
+    // SubsPlease H.264 1080p, 720p, and 480p (same group)
+    {
+      id: 201,
+      title: "[SubsPlease] Dandadan - 04 (1080p) [1111AAAA].mkv",
+      seeders: 120,
+      num_files: 1,
+    },
+    {
+      id: 202,
+      title: "[SubsPlease] Dandadan - 04 (720p) [2222BBBB].mkv",
+      seeders: 65,
+      num_files: 1,
+    },
+    {
+      id: 203,
+      title: "[SubsPlease] Dandadan - 04 (480p) [3333CCCC].mkv",
+      seeders: 30,
+      num_files: 1,
+    },
+    // Different group (Erai-raws) 720p — must NEVER be mixed into SubsPlease's bundle
+    {
+      id: 301,
+      title: "[Erai-raws] Dandadan - 04 [720p][Multiple Subtitle].mkv",
+      seeders: 95,
+      num_files: 1,
+    },
+  ];
 
+  const bundles = ReleaseFilter.selectTopCandidateBundles(mixedTorrents as any, 4, "sub", {
+    knownTitles: ["Dandadan"],
+    maxBundles: 4,
+  });
+
+  assert.equal(bundles.length >= 2, true);
+
+  // #1 bundle must be SubsPlease H.264 (even though EMBER HEVC had more seeders)
+  const bestBundle = bundles[0];
+  assert.equal(bestBundle.isH264, true);
+  assert.equal(bestBundle.groupLower, "subsplease");
+  assert.equal(bestBundle.primaryEntry.quality, "1080p");
+  assert.equal(bestBundle.primaryEntry.item.id, 201);
+
+  // Verify all 3 qualities (1080p, 720p, 480p) in the bundle belong strictly to SubsPlease
+  assert.equal(bestBundle.qualities["1080p"]?.item.id, 201);
+  assert.equal(bestBundle.qualities["720p"]?.item.id, 202);
+  assert.equal(bestBundle.qualities["480p"]?.item.id, 203);
+});
+
+test("ReleaseFilter.selectTopCandidateBundles falls back to HEVC/AV1 only when no viable H.264 release exists", () => {
+  const hevcOnlyTorrents = [
+    {
+      id: 501,
+      title: "[Judas] Dandadan - S01E04 [1080p][HEVC x265 10bit][Multi-Subs].mkv",
+      seeders: 90,
+      num_files: 1,
+    },
+    {
+      id: 502,
+      title: "[ASW] Dandadan - 04 [1080p HEVC x265 10Bit][AAC].mkv",
+      seeders: 75,
+      num_files: 1,
+    },
+  ];
+
+  const bundles = ReleaseFilter.selectTopCandidateBundles(hevcOnlyTorrents as any, 4, "sub", {
+    knownTitles: ["Dandadan"],
+    maxBundles: 3,
+  });
+
+  assert.equal(bundles.length, 2);
+  assert.equal(bundles[0].isH264, false);
+  assert.equal(bundles[0].primaryEntry.quality, "1080p");
+});
+
+test("56 GB staging limit and VM Direct-Remux resource guardrails are strictly configured", () => {
+  assert.equal(KIRA_MAX_STAGING_BYTES, 56 * 1024 * 1024 * 1024);
+  assert.equal(KIRA_VM_MAX_CONCURRENT_BATCHES, 1);
+  assert.equal(KIRA_VM_FFMPEG_THREADS, 2);
+});

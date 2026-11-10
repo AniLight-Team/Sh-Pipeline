@@ -1,6 +1,10 @@
 import { gotScraping } from "got-scraping";
 import PQueue from "p-queue";
-import type { AnimeToshoItem } from "./types.js";
+import type {
+  AnimeToshoItem,
+  ReleaseCandidateBundle,
+  VideoResolutionQuality,
+} from "./types.js";
 import type { FetchTorrentsOptions } from "./animetosho.client.js";
 import { ReleaseFilter } from "./release-filter.js";
 import { log } from "../utils/logger.js";
@@ -491,5 +495,53 @@ export class TsukihimeClient {
       hydrated.push([item, effectiveEp]);
     }
     return hydrated;
+  }
+
+  /**
+   * Hydrates all quality entries (1080p, 720p, 480p) inside each ReleaseCandidateBundle
+   * when sourced from Tsukihime.
+   */
+  public static async hydrateCandidateBundles(
+    bundles: ReleaseCandidateBundle[],
+  ): Promise<ReleaseCandidateBundle[]> {
+    const out: ReleaseCandidateBundle[] = [];
+    for (const bundle of bundles) {
+      const nextQualities: ReleaseCandidateBundle["qualities"] = {};
+      for (const qKey of ["1080p", "720p", "480p"] as VideoResolutionQuality[]) {
+        const entry = bundle.qualities[qKey];
+        if (!entry) continue;
+        const item = entry.item;
+        if (item.provider === "tsukihime" && item.tsukihime_id) {
+          const detail = await this.requestJson<TsukihimeTorrentEntry>(
+            `/torrents/${item.tsukihime_id}`,
+          );
+          if (detail) {
+            const enriched = this.toAnimeToshoItem(detail);
+            nextQualities[qKey] = {
+              ...entry,
+              item: {
+                ...item,
+                ...enriched,
+                tsukihime_episode_no:
+                  item.tsukihime_episode_no ?? enriched.tsukihime_episode_no,
+              },
+            };
+            continue;
+          }
+        }
+        nextQualities[qKey] = entry;
+      }
+      const primaryEntry =
+        nextQualities["1080p"] ||
+        nextQualities["720p"] ||
+        nextQualities["480p"] ||
+        bundle.primaryEntry;
+      out.push({
+        ...bundle,
+        primaryEntry,
+        qualities: nextQualities,
+      });
+    }
+    return out;
   }
 }

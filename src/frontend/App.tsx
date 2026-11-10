@@ -10,7 +10,7 @@ import { KaggleAccountsModal } from "./components/KaggleAccountsModal.js";
 import { HuggingFaceModal } from "./components/HuggingFaceModal.js";
 import { MobileBottomDock } from "./components/MobileBottomDock.js";
 import { usePipelineStream } from "./hooks/usePipelineStream.js";
-import { Plus, Cpu, Cloud, CheckCircle2, Zap } from "lucide-react";
+import { Plus, Cpu, Cloud, CheckCircle2 } from "lucide-react";
 
 export default function App() {
   const { stats, logs, connected } = usePipelineStream();
@@ -20,6 +20,8 @@ export default function App() {
   const [isKaggleOpen, setIsKaggleOpen] = useState(false);
   const [isHfOpen, setIsHfOpen] = useState(false);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [externalJobStatusFilter, setExternalJobStatusFilter] =
+    useState<string>("all");
 
   const queuedCount =
     (stats?.queue?.queued ?? 0) +
@@ -122,11 +124,23 @@ export default function App() {
                 onOpenKaggleDetails={() => setIsKaggleOpen(true)}
                 onOpenHfDetails={() => setIsHfOpen(true)}
                 onForceFlush={handleForceFlush}
+                onSelectStatusFilter={(status) => {
+                  setExternalJobStatusFilter(status);
+                  showNotice(`Filtered multimedia jobs by status: ${status}`);
+                }}
               />
 
-              <BatchViewer onForceFlush={handleForceFlush} stagedCount={stagedCount} />
+              <BatchViewer
+                onForceFlush={handleForceFlush}
+                stagedCount={stagedCount}
+                onNotice={showNotice}
+              />
 
-              <JobTable onOpenEnqueue={() => setIsEnqueueOpen(true)} />
+              <JobTable
+                onOpenEnqueue={() => setIsEnqueueOpen(true)}
+                externalStatusFilter={externalJobStatusFilter}
+                onNotice={showNotice}
+              />
             </>
           )}
 
@@ -135,10 +149,10 @@ export default function App() {
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <h1 className="text-lg font-bold text-[#f3f4f8] tracking-tight">
-                    Pipeline Encoding Queue
+                    Multimedia Pipeline Manager
                   </h1>
                   <p className="text-xs text-[#636b82] mt-0.5">
-                    End-to-end episode tracking across Tsukihime & AnimeTosho discovery, R2 subtitle extraction, and Kaggle GPU batches
+                    Multi-select batch controls, stream previewing, same-group H.264 VM Remux (-c:v copy), and Kaggle GPU batches
                   </p>
                 </div>
                 <button
@@ -150,7 +164,11 @@ export default function App() {
                   <span>Enqueue Episode</span>
                 </button>
               </div>
-              <JobTable onOpenEnqueue={() => setIsEnqueueOpen(true)} />
+              <JobTable
+                onOpenEnqueue={() => setIsEnqueueOpen(true)}
+                externalStatusFilter={externalJobStatusFilter}
+                onNotice={showNotice}
+              />
             </div>
           )}
 
@@ -159,10 +177,10 @@ export default function App() {
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <h1 className="text-lg font-bold text-[#f3f4f8] tracking-tight">
-                    GPU Batches & Cluster Infrastructure
+                    VM Direct-Remux & GPU Batches
                   </h1>
                   <p className="text-xs text-[#636b82] mt-0.5">
-                    Kaggle Dual-T4 GPU notebook execution history, slot allocation, and Hugging Face / R2 storage targets
+                    Local VM Direct-Remux (-c:v copy, concurrency 1) and Kaggle Dual-T4 GPU notebook execution history
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
@@ -196,7 +214,8 @@ export default function App() {
                       </h2>
                     </div>
                     <span className="text-xs font-mono tabular-nums text-[#949bb0]">
-                      {stats?.concurrency?.active ?? 0} / {stats?.concurrency?.max ?? 2} slots active
+                      {stats?.concurrency?.active ?? 0} /{" "}
+                      {stats?.concurrency?.max ?? 2} slots active
                     </span>
                   </div>
                   <div className="mt-3 space-y-2">
@@ -210,11 +229,17 @@ export default function App() {
                           key={acc.username || i}
                           className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex items-center justify-between text-xs font-mono"
                         >
-                          <span className="text-[#f3f4f8] font-medium">@{acc.username}</span>
+                          <span className="text-[#f3f4f8] font-medium">
+                            @{acc.username}
+                          </span>
                           <div className="flex items-center gap-3 text-[#949bb0] tabular-nums">
-                            <span>Slot 1: {acc.slots?.[0] ? "Running" : "Idle"}</span>
+                            <span>
+                              Slot 1: {acc.slots?.[0] ? "Running" : "Idle"}
+                            </span>
                             <span>·</span>
-                            <span>Slot 2: {acc.slots?.[1] ? "Running" : "Idle"}</span>
+                            <span>
+                              Slot 2: {acc.slots?.[1] ? "Running" : "Idle"}
+                            </span>
                           </div>
                         </div>
                       ))
@@ -247,7 +272,9 @@ export default function App() {
                         >
                           <div className="flex items-center gap-2">
                             <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                            <span className="text-[#f3f4f8] font-medium">{hf.owner}</span>
+                            <span className="text-[#f3f4f8] font-medium">
+                              {hf.owner}
+                            </span>
                           </div>
                           <span className="text-[#949bb0]">
                             datasets/{hf.owner}/{hf.bucket}
@@ -259,7 +286,11 @@ export default function App() {
                 </div>
               </div>
 
-              <BatchViewer onForceFlush={handleForceFlush} stagedCount={stagedCount} />
+              <BatchViewer
+                onForceFlush={handleForceFlush}
+                stagedCount={stagedCount}
+                onNotice={showNotice}
+              />
             </div>
           )}
 
@@ -270,7 +301,7 @@ export default function App() {
                   Live Telemetry Console
                 </h1>
                 <p className="text-xs text-[#636b82] mt-0.5">
-                  Real-time SSE event log stream from Tsukihime, AnimeTosho, Transmission, R2 Subtitles, and Kaggle GPU kernels
+                  Real-time SSE event log stream from Tsukihime, AnimeTosho, Transmission, R2 Subtitles, VM Remux, and Kaggle GPU kernels
                 </p>
               </div>
               <LiveTerminal logs={logs} />
@@ -282,7 +313,7 @@ export default function App() {
         <footer className="border-t border-[#1e2230] py-4 px-6 text-xs text-[#636b82] flex flex-wrap items-center justify-between max-w-[1400px] mx-auto w-full mb-12 md:mb-0">
           <span>AniLight Kira Pipeline Operations Console</span>
           <span className="font-mono text-[11px] tabular-nums">
-            Providers: Tsukihime v1 · AnimeTosho · Kaggle Dual-GPU · Cloudflare R2
+            Providers: Tsukihime v1 · AnimeTosho · VM Direct-Remux (-c:v copy) · Kaggle Dual-GPU · Cloudflare R2
           </span>
         </footer>
       </div>
@@ -300,7 +331,11 @@ export default function App() {
       <EnqueueModal
         isOpen={isEnqueueOpen}
         onClose={() => setIsEnqueueOpen(false)}
-        onSuccess={() => showNotice("Episode(s) enqueued for Tsukihime & AnimeTosho discovery.")}
+        onSuccess={() =>
+          showNotice(
+            "Episode(s) enqueued for Tsukihime & AnimeTosho discovery.",
+          )
+        }
       />
 
       <KaggleAccountsModal

@@ -31,6 +31,8 @@ export interface AnimeToshoItem {
   group_name?: string;
 }
 
+export type VideoResolutionQuality = "1080p" | "720p" | "480p";
+
 export interface ParsedReleaseTitle {
   group: string;
   groupLower: string;
@@ -46,14 +48,35 @@ export interface ParsedReleaseTitle {
   isBluray: boolean;
   isWeb: boolean;
   isHevcOrAv1: boolean;
+  isH264?: boolean;
   isHevc?: boolean;
   isAv1?: boolean;
   is1080p?: boolean;
   is720p?: boolean;
+  is480p?: boolean;
+  resolution?: VideoResolutionQuality;
   isBonusOrExtra: boolean;
   isWeirdOrPromo: boolean;
   isUnsupportedContainer: boolean;
   titleRaw?: string;
+}
+
+export interface ReleaseQualityEntry {
+  quality: VideoResolutionQuality;
+  item: AnimeToshoItem;
+  effectiveEp: number | string;
+  score: number;
+}
+
+export interface ReleaseCandidateBundle {
+  group: string;
+  groupLower: string;
+  isH264: boolean;
+  isDualAudio: boolean;
+  isEnglishDub: boolean;
+  bundleScore: number;
+  primaryEntry: ReleaseQualityEntry;
+  qualities: Partial<Record<VideoResolutionQuality, ReleaseQualityEntry>>;
 }
 
 export interface ClassifiedAudioTrack {
@@ -75,6 +98,11 @@ export interface MkvStreamProbe {
   classifiedAudio: ClassifiedAudioTrack[];
   japaneseStreamIndex: number;
   englishStreamIndex: number | null;
+  videoCodec?: string;
+  pixelFormat?: string;
+  width?: number;
+  height?: number;
+  isBrowserCompatibleH264?: boolean;
 }
 
 export interface R2SubtitleRecord {
@@ -121,6 +149,8 @@ export interface KiraBatchManifestItem {
   episodeNumber: number;
   tracks: [string, number][];
   hf: HuggingFaceAccount;
+  mode?: "remux" | "transcode";
+  qualityFiles?: Partial<Record<VideoResolutionQuality, string>>;
 }
 
 export interface KiraBatchHfRecord extends HfStoreRecord {
@@ -197,6 +227,7 @@ export interface ActiveBatchSummary {
   totalBytes: number;
   elapsedSeconds: number;
   heartbeatAt: string;
+  mode?: "vm_remux" | "kaggle_gpu";
 }
 
 export interface KaggleAccountStatus {
@@ -215,6 +246,8 @@ export interface PipelineStats {
     max: number; // total kaggle accounts * 2
     accountsCount: number;
     maxPerAccount: number; // 2
+    vmActive?: number;
+    vmMax?: number;
   };
   queue: {
     queued: number;
@@ -225,6 +258,8 @@ export interface PipelineStats {
     failed: number;
     paused: number;
     total: number;
+    stagedRemux?: number;
+    stagedGpu?: number;
   };
   storage: {
     stagedBytes: number;
@@ -233,6 +268,7 @@ export interface PipelineStats {
     maxStagingBytes: number;
     minFreeBytes: number;
     stagingDir: string;
+    isAtCapacity?: boolean;
   };
   accounts: {
     kaggle: KaggleAccountStatus[];

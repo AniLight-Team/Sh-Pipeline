@@ -1,5 +1,11 @@
 import path from "path";
-import type { AnimeToshoItem, ParsedReleaseTitle } from "./types.js";
+import type {
+  AnimeToshoItem,
+  ParsedReleaseTitle,
+  ReleaseCandidateBundle,
+  ReleaseQualityEntry,
+  VideoResolutionQuality,
+} from "./types.js";
 import { DEFAULT_MIN_SEEDERS, ALLOW_CAM } from "../config.js";
 import { log } from "../utils/logger.js";
 
@@ -7,13 +13,18 @@ export class ReleaseFilter {
   public static readonly TRUSTED_GROUPS_TIER_1 = new Set([
     "vodes", "sokudo", "ember", "anime time", "judas", "notshroud",
     "kaleido", "beatrice-raws", "coalgirls", "commie", "smol", "chihiro",
-    "dkb", "gjm", "mtbb", "scum",
+    "dkb", "gjm", "mtbb", "scum", "subsplease", "erai-raws", "toonshub", "yameii",
   ]);
 
   public static readonly TRUSTED_GROUPS_TIER_2 = new Set([
-    "subsplease", "erai-raws", "asw", "kaizoku", "dubs-empire",
-    "blackrabbit", "minikaizoku", "anitsu", "jaaj", "toonshub",
-    "yameii", "varyg", "neohevc", "psa",
+    "asw", "kaizoku", "dubs-empire", "blackrabbit", "minikaizoku",
+    "anitsu", "jaaj", "varyg", "neohevc", "psa", "horriblesubs",
+  ]);
+
+  // Groups known to encode exclusively in HEVC/10-bit unless explicitly tagged H.264/x264
+  public static readonly HEVC_DEFAULT_GROUPS = new Set([
+    "judas", "ember", "psa", "neohevc", "asw", "anime time",
+    "sokudo", "vodes", "cleo", "raze", "hakata ramen", "yuii",
   ]);
 
   public static readonly NON_ENGLISH_TAGS = new Set([
@@ -65,7 +76,7 @@ export class ReleaseFilter {
     }
 
     s = s.replace(
-      /\b(?:2160p|1080p|720p|576p|480p|360p|4k|uhd|fhd|hd|hevc|av1|x264|x265|h\.?264|h\.?265|10\s*-?bit|8\s*-?bit|hi10p|aac\d*(?:\.\d)?|eac3|ac3|flac|opus|ddp\d*(?:\.\d)?|dts(?:-hd)?|web-dl|webrip|bluray|bdrip|bdremux|remux|hdtv|cr|amzn|nf|dsnp|hidive|b-global|dual[\s._-]*audio|multi[\s._-]*(?:audio|subs?)|(?:19|20)\d{2})\b/gi,
+      /\b(?:2160p|1080p|720p|576p|540p|480p|360p|4k|uhd|fhd|hd|sd|hevc|av1|x264|x265|h\.?264|h\.?265|avc1?|10\s*-?bit|8\s*-?bit|hi10p|aac\d*(?:\.\d)?|eac3|ac3|flac|opus|ddp\d*(?:\.\d)?|dts(?:-hd)?|web-dl|webrip|bluray|bdrip|bdremux|remux|hdtv|cr|amzn|nf|dsnp|hidive|b-global|dual[\s._-]*audio|multi[\s._-]*(?:audio|subs?)|(?:19|20)\d{2})\b/gi,
       " ",
     );
     return s;
@@ -86,6 +97,7 @@ export class ReleaseFilter {
     } else if (item?.group_name) {
       group = item.group_name.trim();
     }
+    const groupLower = group.toLowerCase();
 
     let isDualAudio = Array.from(this.DUAL_AUDIO_TAGS).some((tag) =>
       lower.includes(tag),
@@ -135,7 +147,6 @@ export class ReleaseFilter {
         isEnglishDub = true;
         isForeign = false;
       } else if (hasJaAudio && !hasEnAudio) {
-        // E.g. ["ja"] or ["ar", "ja"] (Arabic+Japanese DUAL is not English Dub)
         isDualAudio = false;
         isEnglishDub = false;
       } else {
@@ -157,15 +168,32 @@ export class ReleaseFilter {
 
     const isCam = /\b(?:telesync|camrip|hdcam|ts-rip|tele-sync|cam(?:\s*v\d+)?)\b/.test(lower);
     const isBluray = /\b(?:bluray|bdrip|bd\s*1080p|bdremux|remux|bd)\b/.test(lower);
-    const isWeb = /\b(?:web-dl|webrip|cr|crunchyroll|web|amzn|nf|hidive)\b/.test(lower);
-    const isHevc = /\b(?:hevc|x265|h\.?265)\b/.test(lower);
-    const isAv1 = /\bav1\b/.test(lower);
-    const isHevcOrAv1 = isHevc || isAv1 || /\b(?:10bit|10-bit)\b/.test(lower);
-    const is1080p = /\b(?:1080p|fhd|1920x1080)\b/i.test(lower);
-    const is720p = /\b(?:720p|hd|1280x720)\b/i.test(lower);
+    const isWeb = /\b(?:web-dl|webrip|cr|crunchyroll|web|amzn|nf|hidive|dsnp|b-global)\b/.test(lower);
+
+    const explicitH264 = /\b(?:x264|h\.?264|avc1?)\b/i.test(lower);
+    const explicitHevc = /\b(?:hevc|x265|h\.?265)\b/i.test(lower);
+    const isAv1 = /\bav1\b/i.test(lower);
+    const is10Bit = /\b(?:10\s*-?bit|hi10p|yuv420p10)\b/i.test(lower);
+    const isHevcGroupDefault = !explicitH264 && this.HEVC_DEFAULT_GROUPS.has(groupLower);
+
+    const isHevc = explicitHevc || isHevcGroupDefault;
+    const isHevcOrAv1 = isHevc || isAv1 || is10Bit;
+    const isH264 = !isHevcOrAv1;
+
+    const is4k = /\b(?:2160p|4k|uhd|3840x2160)\b/i.test(lower);
+    const is480p = !is4k && /\b(?:480p|540p|576p|360p|sd|848x480|854x480|640x360)\b/i.test(lower);
+    const is720p = !is4k && !is480p && /\b(?:720p|hd|1280x720)\b/i.test(lower);
+    const is1080p = !is4k && !is480p && !is720p;
+
+    const resolution: VideoResolutionQuality = is480p
+      ? "480p"
+      : is720p
+        ? "720p"
+        : "1080p";
+
     const isBonusOrExtra = this.BONUS_OR_EXTRA_PATTERN.test(path.basename(titleClean));
     const isWeirdOrPromo = this.WEIRD_OR_PROMO_PATTERN.test(lower);
-    const isUnsupportedContainer = this.UNSUPPORTED_CONTAINER_PATTERN.test(lower);
+    const isUnsupportedContainer = this.UNSUPPORTED_CONTAINER_PATTERN.test(lower) || is4k;
 
     const cleaned = this.stripNoiseForEpisodeParsing(titleClean, knownTitles);
 
@@ -231,7 +259,7 @@ export class ReleaseFilter {
 
     return {
       group,
-      groupLower: group.toLowerCase(),
+      groupLower,
       singleEp,
       epRange,
       seasonNum,
@@ -244,10 +272,13 @@ export class ReleaseFilter {
       isBluray,
       isWeb,
       isHevcOrAv1,
+      isH264,
       isHevc,
       isAv1,
       is1080p,
       is720p,
+      is480p,
+      resolution,
       isBonusOrExtra: isBonusOrExtra || seasonNum === 0,
       isWeirdOrPromo,
       isUnsupportedContainer,
@@ -275,6 +306,11 @@ export class ReleaseFilter {
       return false;
     }
 
+    // Strongly prefer stopping early only when we have a viable H.264 1080p candidate
+    if (!parsed.isH264) {
+      return false;
+    }
+
     if (isDub) {
       if (isSeadex && seeders >= 1) return true;
       if (isTier1 && (parsed.isDualAudio || parsed.isEnglishDub) && seeders >= 2) return true;
@@ -283,13 +319,12 @@ export class ReleaseFilter {
       return false;
     }
 
-    // When searching for sub or all (sub+dub), do not treat a Dub-only release as a high-quality stop signal
     if (parsed.isEnglishDub && !parsed.isDualAudio) return false;
     if (parsed.isForeign && !parsed.isDualAudio) return false;
 
     if (isSeadex && seeders >= 1) return true;
-    if (isTier1 && seeders >= 5) return true;
-    if (isTier2 && seeders >= 8) return true;
+    if (isTier1 && parsed.is1080p && seeders >= 5) return true;
+    if (isTier2 && parsed.is1080p && seeders >= 8) return true;
     if (parsed.isDualAudio && parsed.is1080p && seeders >= 3) return true;
     if (parsed.is1080p && seeders >= 12) return true;
     return false;
@@ -400,10 +435,17 @@ export class ReleaseFilter {
     }
 
     if (parsed.isBluray) score += 30;
-    else if (parsed.isWeb) score += 15;
+    else if (parsed.isWeb) score += 20;
 
-    if (parsed.isHevc && !parsed.isAv1) score += 15;
-    else if (parsed.isAv1) score -= 15;
+    // Prefer H.264 releases strongly so they can be direct-remuxed without GPU re-encoding.
+    // Only fall back to HEVC/AV1 when no viable H.264 release exists.
+    if (parsed.isH264) {
+      score += 55;
+    } else if (parsed.isHevc && !parsed.isAv1) {
+      score += 5;
+    } else if (parsed.isAv1) {
+      score -= 20;
+    }
     if (parsed.isCam) score -= 50;
 
     const langLower = String(langType).toLowerCase();
@@ -484,7 +526,6 @@ export class ReleaseFilter {
       if (parsed.epRange) {
         const [rStart, rEnd] = parsed.epRange;
         const span = rEnd - rStart + 1;
-        // Cour or season batch with cumulative numbering (e.g. 27-40, 41-50, 393-406)
         if (rStart > 1 && span >= 3 && span <= 60) {
           const offset = rStart - 1;
           if (rStart + targetEpNum - 1 <= rEnd) {
@@ -496,7 +537,6 @@ export class ReleaseFilter {
 
     if (singleEps.size > 0) {
       const sorted = Array.from(singleEps).sort((a, b) => a - b);
-      // Group into contiguous episode clusters (allowing gaps up to 3 episodes)
       const clusters: number[][] = [];
       for (const ep of sorted) {
         if (clusters.length === 0) {
@@ -511,9 +551,6 @@ export class ReleaseFilter {
         }
       }
 
-      // 1. Compare relative cluster max (<= 26) against cumulative cluster max (> 20)
-      // Because AnimeTosho feeds are sorted newest-first, cluster maximums represent the latest
-      // episode in both relative and cumulative numbering (invariant to page cutoffs).
       const relClusters = clusters.filter((c) => c[0] >= 1 && c[c.length - 1] <= 26);
       const cumClusters = clusters.filter((c) => c[0] > 11);
       if (relClusters.length > 0 && cumClusters.length > 0) {
@@ -527,7 +564,6 @@ export class ReleaseFilter {
         }
       }
 
-      // 2. Check cumulative clusters against totalExpectedEps or valid cour-start boundaries
       for (const cluster of cumClusters) {
         const cMin = cluster[0];
         const cMax = cluster[cluster.length - 1];
@@ -551,7 +587,16 @@ export class ReleaseFilter {
     return Array.from(offsets);
   }
 
-  public static selectTopCandidates(
+  /**
+   * Selects top candidate bundles grouped by the SAME release group.
+   * - Strongly prioritizes H.264 releases (`isH264: true`) over HEVC/AV1 so re-encoding is only used
+   *   when no viable H.264 release exists.
+   * - For H.264 releases, collects all available quality versions (`1080p`, `720p`, `480p`) from the
+   *   EXACT same group, preferring groups with fuller multi-quality coverage and better encodes.
+   * - For HEVC/AV1 releases (fallback when no H.264 exists), selects only the best `1080p` release
+   *   for GPU transcoding.
+   */
+  public static selectTopCandidateBundles(
     torrentList: AnimeToshoItem[],
     targetEp: number | string,
     langType: string,
@@ -559,15 +604,15 @@ export class ReleaseFilter {
       knownTitles?: (string | null | undefined)[];
       totalExpectedEps?: number | null;
       episodeOffset?: number;
-      maxCandidates?: number;
+      maxBundles?: number;
       minSeeders?: number;
     } = {},
-  ): [AnimeToshoItem, number | string][] {
+  ): ReleaseCandidateBundle[] {
     const {
       knownTitles,
       totalExpectedEps,
       episodeOffset = 0,
-      maxCandidates = 3,
+      maxBundles = 4,
       minSeeders = DEFAULT_MIN_SEEDERS,
     } = options;
 
@@ -596,11 +641,14 @@ export class ReleaseFilter {
       }
     }
 
-    // Pool scored candidates across all candidate episode numbers (direct + cumulative offsets)
-    // so a high-quality Dual-Audio / WEB-DL release at S01E27 or S01E41 isn't shadowed by a poor Ep 1 match
     const bestByItemKey = new Map<
       string | number,
-      { score: number; item: AnimeToshoItem; effectiveEp: number | string }
+      {
+        score: number;
+        item: AnimeToshoItem;
+        effectiveEp: number | string;
+        parsed: ParsedReleaseTitle;
+      }
     >();
 
     for (const candidateEp of candidatesToTry) {
@@ -617,75 +665,175 @@ export class ReleaseFilter {
           if (isDirectMatch) {
             score += 15;
           }
+          const parsed = this.parseTitle(t.title || "", knownTitles, t);
           let effectiveEpForFile: number | string = candidateEp;
           if (
             String(candidateEp).toLowerCase() !== "all" &&
             typeof t.tsukihime_episode_no === "number" &&
             t.tsukihime_episode_no === Number(candidateEp)
           ) {
-            const p = this.parseTitle(t.title || "", knownTitles, t);
-            if (p.singleEp !== null && p.singleEp !== Number(candidateEp)) {
-              effectiveEpForFile = p.singleEp;
+            if (parsed.singleEp !== null && parsed.singleEp !== Number(candidateEp)) {
+              effectiveEpForFile = parsed.singleEp;
             }
           }
           const key = (t.info_hash ? t.info_hash.toLowerCase() : null) || t.id || t.title;
           const existing = bestByItemKey.get(key);
           if (!existing || score > existing.score) {
-            bestByItemKey.set(key, { score, item: t, effectiveEp: effectiveEpForFile });
+            bestByItemKey.set(key, {
+              score,
+              item: t,
+              effectiveEp: effectiveEpForFile,
+              parsed,
+            });
           }
         }
       }
     }
 
-    const ranked = Array.from(bestByItemKey.values());
-    if (ranked.length === 0) {
-      return [];
+    const allScored = Array.from(bestByItemKey.values());
+    if (allScored.length === 0) return [];
+
+    // Filter by minimum seeders (or fallback to seeders >= 1 if none meet minSeeders)
+    let eligibleScored = allScored.filter((e) => (e.item.seeders || 0) >= minSeeders);
+    if (eligibleScored.length === 0) {
+      eligibleScored = allScored.filter((e) => (e.item.seeders || 0) >= 1);
     }
+    if (eligibleScored.length === 0) return [];
 
-    ranked.sort((a, b) => b.score - a.score);
+    // Group into same-group bundles: (groupKey, codecClass, audioClass, soloVsBatch)
+    const bundleMap = new Map<
+      string,
+      {
+        group: string;
+        groupLower: string;
+        isH264: boolean;
+        isDualAudio: boolean;
+        isEnglishDub: boolean;
+        isSolo: boolean;
+        isSeadex: boolean;
+        qualities: Partial<Record<VideoResolutionQuality, ReleaseQualityEntry>>;
+      }
+    >();
 
-    let candidatePool = ranked;
-    if (String(targetEp).toLowerCase() !== "all") {
-      const isSoloCandidate = (t: AnimeToshoItem): boolean => {
-        const p = this.parseTitle(t.title || "", knownTitles, t);
-        const nFiles = t.num_files || 1;
-        return !p.isBatch && p.epRange === null && nFiles === 1;
-      };
+    for (const entry of eligibleScored) {
+      const { item, score, effectiveEp, parsed } = entry;
+      const isH264 = Boolean(parsed.isH264);
+      const quality: VideoResolutionQuality = parsed.resolution || "1080p";
+      const nFiles = item.num_files || 1;
+      const isSolo = !parsed.isBatch && parsed.epRange === null && nFiles === 1;
+      const itemUniqueId = (item.info_hash || item.id || item.title).toString().toLowerCase();
 
-      const soloCandidates = ranked.filter((r) => isSoloCandidate(r.item));
-      const batchCandidates = ranked.filter((r) => !isSoloCandidate(r.item));
+      // Only merge qualities when they share a non-empty release group name
+      const groupKey = parsed.groupLower ? parsed.groupLower : `ungrouped_${itemUniqueId}`;
+      const audioKey = parsed.isDualAudio ? "dual" : parsed.isEnglishDub ? "dub" : "sub";
+      const bundleKey = `${groupKey}::${isH264 ? "h264" : "hevc"}::${audioKey}::${isSolo ? "solo" : "batch"}`;
 
-      const hasSeaDexBatch = batchCandidates.some((b) => Boolean(b.item.is_seadex));
-      if (hasSeaDexBatch) {
-        candidatePool = ranked;
-      } else if (soloCandidates.length > 0) {
-        // Keep solo candidates first, but append top batch candidates as fallback
-        candidatePool = [...soloCandidates, ...batchCandidates];
-      } else if (batchCandidates.length > 0) {
-        candidatePool = batchCandidates;
+      let b = bundleMap.get(bundleKey);
+      if (!b) {
+        b = {
+          group: parsed.group || "Unknown",
+          groupLower: parsed.groupLower,
+          isH264,
+          isDualAudio: parsed.isDualAudio,
+          isEnglishDub: parsed.isEnglishDub,
+          isSolo,
+          isSeadex: Boolean(item.is_seadex),
+          qualities: {},
+        };
+        bundleMap.set(bundleKey, b);
+      } else if (item.is_seadex) {
+        b.isSeadex = true;
+      }
+
+      const existingQ = b.qualities[quality];
+      if (!existingQ || score > existingQ.score) {
+        b.qualities[quality] = {
+          quality,
+          item,
+          effectiveEp,
+          score,
+        };
       }
     }
 
-    const topRanked = candidatePool.slice(0, maxCandidates);
+    const bundles: ReleaseCandidateBundle[] = [];
 
-    const viable: [AnimeToshoItem, number | string][] = [];
-    for (const entry of topRanked) {
-      const sCount = entry.item.seeders || 0;
-      if (sCount >= minSeeders) {
-        viable.push([entry.item, entry.effectiveEp]);
+    for (const b of bundleMap.values()) {
+      const q1080 = b.qualities["1080p"];
+      const q720 = b.qualities["720p"];
+      const q480 = b.qualities["480p"];
+
+      const primaryEntry = q1080 || q720 || q480;
+      if (!primaryEntry) continue;
+
+      // For HEVC/AV1 bundles (which will be GPU transcoded from 1080p into 1080p/720p/480p),
+      // only keep the primary (1080p) entry so we never waste bandwidth downloading 720p/480p HEVC.
+      const effectiveQualities: Partial<Record<VideoResolutionQuality, ReleaseQualityEntry>> = b.isH264
+        ? b.qualities
+        : { [primaryEntry.quality]: primaryEntry };
+
+      let bundleScore = primaryEntry.score;
+
+      // Strongly prefer having a 1080p master (for 1080p stream + canonical R2 subtitle extraction)
+      if (q1080) {
+        bundleScore += 50;
+      } else {
+        bundleScore -= 80;
       }
-    }
 
-    if (viable.length === 0) {
-      for (const entry of topRanked) {
-        const sCount = entry.item.seeders || 0;
-        if (sCount >= 1) {
-          viable.push([entry.item, entry.effectiveEp]);
+      // CRITICAL RULE: Re-encoding is ONLY required when no viable H.264 release exists!
+      // Any viable H.264 bundle with a 1080p stream outranks HEVC/AV1 bundles.
+      if (b.isH264 && q1080) {
+        bundleScore += 250;
+        // Same-group multi-quality completeness bonus (rewards groups providing 1080p + 720p + 480p)
+        if (q720) bundleScore += 45;
+        if (q480) bundleScore += 45;
+      } else if (b.isH264) {
+        // H.264 without 1080p (e.g. only 720p exists) still gets a moderate H.264 bonus
+        bundleScore += 120;
+      }
+
+      if (String(targetEp).toLowerCase() !== "all") {
+        if (b.isSolo) {
+          bundleScore += 35;
+        } else if (!b.isSeadex) {
+          bundleScore -= 25;
         }
       }
+
+      bundles.push({
+        group: b.group,
+        groupLower: b.groupLower,
+        isH264: b.isH264,
+        isDualAudio: b.isDualAudio,
+        isEnglishDub: b.isEnglishDub,
+        bundleScore,
+        primaryEntry,
+        qualities: effectiveQualities,
+      });
     }
 
-    return viable;
+    bundles.sort((a, b) => b.bundleScore - a.bundleScore);
+    return bundles.slice(0, maxBundles);
+  }
+
+  public static selectTopCandidates(
+    torrentList: AnimeToshoItem[],
+    targetEp: number | string,
+    langType: string,
+    options: {
+      knownTitles?: (string | null | undefined)[];
+      totalExpectedEps?: number | null;
+      episodeOffset?: number;
+      maxCandidates?: number;
+      minSeeders?: number;
+    } = {},
+  ): [AnimeToshoItem, number | string][] {
+    const bundles = this.selectTopCandidateBundles(torrentList, targetEp, langType, {
+      ...options,
+      maxBundles: options.maxCandidates || 3,
+    });
+    return bundles.map((b) => [b.primaryEntry.item, b.primaryEntry.effectiveEp]);
   }
 
   public static selectBest(
@@ -768,7 +916,6 @@ export class ReleaseFilter {
           if (epN === effectiveNum) {
             epN = targetNum;
           } else if (effectiveNum > targetNum && epN > effectiveNum - targetNum) {
-            // Also normalize sibling episodes in the same cumulative batch
             epN = epN - (effectiveNum - targetNum);
           }
         }
@@ -782,7 +929,6 @@ export class ReleaseFilter {
       }
     }
 
-    // If a batch torrent had cumulative file numbering (e.g. 27..40 or 393..406) and targetEp wasn't mapped yet
     if (
       targetEp !== null &&
       targetEp !== undefined &&
@@ -828,4 +974,3 @@ export class ReleaseFilter {
     return epMap;
   }
 }
-

@@ -8,10 +8,9 @@ import {
   Layers,
   Terminal,
   CheckCircle2,
-  AlertTriangle,
   Clock,
-  Play,
   Plus,
+  ArrowRight,
 } from "lucide-react";
 
 interface DashboardChartsProps {
@@ -22,6 +21,7 @@ interface DashboardChartsProps {
   onOpenKaggleDetails: () => void;
   onOpenHfDetails: () => void;
   onForceFlush?: () => void;
+  onSelectStatusFilter?: (status: string) => void;
 }
 
 export function DashboardCharts({
@@ -32,6 +32,7 @@ export function DashboardCharts({
   onOpenKaggleDetails,
   onOpenHfDetails,
   onForceFlush,
+  onSelectStatusFilter,
 }: DashboardChartsProps) {
   const activeBatches = stats?.activeBatches || [];
   const latestBatch = activeBatches[0] || null;
@@ -39,6 +40,8 @@ export function DashboardCharts({
     queued: 0,
     downloading: 0,
     staged: 0,
+    stagedRemux: 0,
+    stagedGpu: 0,
     encoding: 0,
     completed: 0,
     failed: 0,
@@ -49,25 +52,27 @@ export function DashboardCharts({
     stagedBytes: 0,
     stagedCount: 0,
     maxBatchItems: 10,
-    maxStagingBytes: 60_000_000_000,
+    maxStagingBytes: 56 * 1024 * 1024 * 1024,
     minFreeBytes: 12_000_000_000,
     stagingDir: "/tmp/kira-staging",
+    isAtCapacity: false,
   };
   const concurrency = stats?.concurrency || {
     active: 0,
     max: 2,
     accountsCount: 1,
     maxPerAccount: 2,
+    vmActive: 0,
+    vmMax: 1,
   };
 
   const stagedGb = (storage.stagedBytes / (1024 * 1024 * 1024)).toFixed(2);
-  const maxStagingGb = (storage.maxStagingBytes / (1024 * 1024 * 1024)).toFixed(0);
+  const maxStagingGb = Math.round(storage.maxStagingBytes / (1024 * 1024 * 1024));
   const stagingPercent = Math.min(
     100,
     Math.round((storage.stagedBytes / Math.max(1, storage.maxStagingBytes)) * 100),
   );
 
-  // Batch seal thresholds: 10 items or 10 GB
   const batchSafeMaxBytes = 10 * 1024 * 1024 * 1024;
   const batchCountPct = Math.min(
     100,
@@ -91,7 +96,7 @@ export function DashboardCharts({
     {
       key: "queued",
       label: "Queued for Discovery",
-      sublabel: "Tsukihime & AnimeTosho torrent resolution",
+      sublabel: "Tsukihime & AnimeTosho H.264-priority resolution",
       count: queue.queued,
       barColor: "bg-amber-400",
       textColor: "text-amber-300",
@@ -99,7 +104,7 @@ export function DashboardCharts({
     {
       key: "downloading",
       label: "Downloading via Transmission",
-      sublabel: "Fetching highest-scored 1080p release",
+      sublabel: "Same-group 1080p/720p/480p · 56 GB hard cap enforced",
       count: queue.downloading,
       barColor: "bg-sky-400",
       textColor: "text-sky-300",
@@ -107,15 +112,15 @@ export function DashboardCharts({
     {
       key: "staged",
       label: "Staged on Local SSD",
-      sublabel: "Subtitles synced to R2 · awaiting GPU batch",
+      sublabel: `1080p R2 subtitles synced · ${queue.stagedRemux ?? 0} VM Remux / ${queue.stagedGpu ?? 0} GPU`,
       count: queue.staged,
       barColor: "bg-indigo-400",
       textColor: "text-indigo-300",
     },
     {
       key: "encoding",
-      label: "Encoding on Kaggle GPU",
-      sublabel: "NVENC 1080p / 720p / 480p + AniLight watermark",
+      label: "VM Direct Remux / Kaggle GPU",
+      sublabel: "H.264 direct MP4 remux (-c:v copy) · HEVC/AV1 GPU encode",
       count: queue.encoding,
       barColor: "bg-violet-400",
       textColor: "text-violet-300",
@@ -135,6 +140,44 @@ export function DashboardCharts({
       count: queue.failed,
       barColor: "bg-rose-400",
       textColor: "text-rose-300",
+    },
+  ];
+
+  const pipelineFlowSteps = [
+    {
+      index: "01",
+      title: "Torrent Discovery",
+      detail: "Tsukihime + AnimeTosho · H.264 priority",
+      metric: `${queue.queued} queued`,
+      filterKey: "queued",
+    },
+    {
+      index: "02",
+      title: "Same-Group Download",
+      detail: "1080p + 720p + 480p · 56 GB hard cap",
+      metric: `${queue.downloading} active`,
+      filterKey: "downloading",
+    },
+    {
+      index: "03",
+      title: "1080p R2 Subtitles & SSD",
+      detail: "Extract subs from 1080p only · ffprobe",
+      metric: `${queue.staged} staged (${stagedGb} GB)`,
+      filterKey: "staged",
+    },
+    {
+      index: "04",
+      title: "VM Remux / Kaggle GPU",
+      detail: "H.264 -> VM -c:v copy · HEVC -> GPU",
+      metric: `VM ${concurrency.vmActive || 0}/${concurrency.vmMax || 1} · GPU ${concurrency.active}/${concurrency.max}`,
+      filterKey: "encoding",
+    },
+    {
+      index: "05",
+      title: "HF Bucket & Callback",
+      detail: "Batch upload MP4s + Main DB webhook",
+      metric: `${queue.completed} published`,
+      filterKey: "completed",
     },
   ];
 
@@ -168,7 +211,7 @@ export function DashboardCharts({
           </div>
         </div>
 
-        {/* KPI 2: Local SSD Staging Buffer */}
+        {/* KPI 2: Local SSD Staging Buffer (56 GB Guardrail) */}
         <div className="surface-panel rounded-xl p-4 flex flex-col justify-between">
           <div>
             <div className="flex items-center justify-between text-xs text-[#949bb0]">
@@ -180,21 +223,35 @@ export function DashboardCharts({
                 {stagedGb} GB
               </span>
               <span className="text-xs font-mono tabular-nums text-[#636b82]">
-                / {maxStagingGb} GB cap
+                / {maxStagingGb} GB hard cap
               </span>
             </div>
+            <div className="mt-2.5 h-1.5 w-full bg-[#151822] rounded-full overflow-hidden">
+              <div
+                className={`h-full transition-all duration-300 ${
+                  storage.isAtCapacity || stagingPercent >= 90
+                    ? "bg-amber-400"
+                    : "bg-indigo-500"
+                }`}
+                style={{ width: `${stagingPercent}%` }}
+              />
+            </div>
           </div>
-          <div className="mt-4 pt-3 border-t border-[#1e2230] flex items-center justify-between text-xs font-mono tabular-nums">
-            <span className="text-[#949bb0]">{storage.stagedCount} MKV files staged</span>
-            <span className="text-[#636b82]">{stagingPercent}% disk</span>
+          <div className="mt-3 pt-2.5 border-t border-[#1e2230] flex items-center justify-between text-xs font-mono tabular-nums">
+            <span className={storage.isAtCapacity ? "text-amber-400" : "text-[#949bb0]"}>
+              {storage.isAtCapacity
+                ? "56 GB limit active (paused)"
+                : `${storage.stagedCount} jobs staged`}
+            </span>
+            <span className="text-[#636b82]">{stagingPercent}% cap</span>
           </div>
         </div>
 
-        {/* KPI 3: Kaggle GPU Cluster Load */}
+        {/* KPI 3: Kaggle GPU & VM Remux Cluster Load */}
         <div className="surface-panel rounded-xl p-4 flex flex-col justify-between">
           <div>
             <div className="flex items-center justify-between text-xs text-[#949bb0]">
-              <span className="font-medium">Kaggle GPU Cluster</span>
+              <span className="font-medium">Compute & Remux Pool</span>
               <button
                 type="button"
                 onClick={onOpenKaggleDetails}
@@ -209,12 +266,12 @@ export function DashboardCharts({
                 {concurrency.active} / {concurrency.max}
               </span>
               <span className="text-xs font-mono tabular-nums text-[#949bb0]">
-                slots ({gpuLoadPercent}%)
+                GPU · VM {concurrency.vmActive || 0}/{concurrency.vmMax || 1}
               </span>
             </div>
           </div>
           <div className="mt-4 pt-3 border-t border-[#1e2230] flex items-center justify-between gap-3 text-xs font-mono tabular-nums text-[#636b82]">
-            <span className="truncate">T4 ×2 NVENC</span>
+            <span className="truncate">VM Copy + T4 NVENC ({gpuLoadPercent}%)</span>
             <button
               type="button"
               onClick={onOpenHfDetails}
@@ -243,7 +300,7 @@ export function DashboardCharts({
           </div>
           <div className="mt-4 pt-3 border-t border-[#1e2230] flex items-center justify-between gap-3 text-xs">
             <span className="text-[#636b82] font-mono tabular-nums truncate">
-              10 files / 10 GB cap
+              {queue.stagedRemux ?? 0} H.264 VM · {queue.stagedGpu ?? 0} HEVC GPU
             </span>
             {storage.stagedCount > 0 && onForceFlush ? (
               <button
@@ -266,7 +323,53 @@ export function DashboardCharts({
         </div>
       </div>
 
-      {/* 2. Main Operational Split: Pipeline Stage Funnel (7 cols) + Live Activity & Batch Status (5 cols) */}
+      {/* 2. Interactive End-to-End Pipeline Architecture Flow Bar */}
+      <div className="surface-panel rounded-xl p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-3 mb-3 border-b border-[#1e2230]">
+          <div className="flex items-center gap-2">
+            <h2 className="text-xs font-semibold text-[#f3f4f8]">
+              Autonomous Pipeline Execution Flow
+            </h2>
+            <span className="text-xs text-[#636b82]">
+              · Minimal Re-Encoding Architecture (H.264 Same-Group Direct Remux + HEVC/AV1 GPU Fallback)
+            </span>
+          </div>
+          <span className="text-[11px] font-mono tabular-nums text-[#949bb0]">
+            Click any stage to filter queue
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
+          {pipelineFlowSteps.map((step, idx) => (
+            <button
+              key={step.index}
+              type="button"
+              onClick={() => onSelectStatusFilter?.(step.filterKey)}
+              className="text-left p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230] hover:border-indigo-500/50 transition-colors cursor-pointer flex flex-col justify-between group"
+            >
+              <div>
+                <div className="flex items-center justify-between text-[11px] font-mono tabular-nums text-[#636b82]">
+                  <span className="text-indigo-400 font-semibold">{step.index}. Stage</span>
+                  {idx < pipelineFlowSteps.length - 1 && (
+                    <ArrowRight className="w-3 h-3 text-[#636b82] group-hover:text-indigo-400 transition-colors hidden lg:inline" />
+                  )}
+                </div>
+                <div className="text-xs font-semibold text-[#f3f4f8] mt-1 truncate">
+                  {step.title}
+                </div>
+                <div className="text-[11px] text-[#636b82] mt-0.5 truncate">
+                  {step.detail}
+                </div>
+              </div>
+              <div className="mt-2.5 pt-2 border-t border-[#1e2230] text-[11px] font-mono tabular-nums text-[#d5d9e6]">
+                {step.metric}
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* 3. Main Operational Split: Pipeline Stage Funnel (7 cols) + Live Activity & Batch Status (5 cols) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
         {/* Left Column: Real 6-Stage Pipeline Distribution & Batch Packaging Thresholds */}
         <div className="lg:col-span-7 surface-panel rounded-xl p-5 flex flex-col justify-between">
@@ -277,7 +380,7 @@ export function DashboardCharts({
                   Pipeline Stage Distribution
                 </h2>
                 <p className="text-xs text-[#636b82] mt-0.5">
-                  Real-time job allocation across torrent discovery, local SSD staging, and Kaggle GPU transcoding
+                  Real-time job allocation across torrent discovery, 56 GB SSD staging, VM Direct Remux, and Kaggle GPU
                 </p>
               </div>
               <span className="font-mono text-xs tabular-nums text-[#949bb0] shrink-0">
@@ -313,9 +416,11 @@ export function DashboardCharts({
                 const pct =
                   queue.total > 0 ? Math.round((row.count / queue.total) * 100) : 0;
                 return (
-                  <div
+                  <button
                     key={row.key}
-                    className="py-2.5 flex items-center justify-between gap-4 text-xs"
+                    type="button"
+                    onClick={() => onSelectStatusFilter?.(row.key)}
+                    className="w-full py-2.5 flex items-center justify-between gap-4 text-xs text-left hover:bg-[#151822]/50 px-2 -mx-2 rounded-md transition-colors cursor-pointer"
                   >
                     <div className="flex items-center gap-3 min-w-0">
                       <span className={`w-2 h-2 rounded-xs shrink-0 ${row.barColor}`} />
@@ -341,7 +446,7 @@ export function DashboardCharts({
                         {row.count}
                       </span>
                     </div>
-                  </div>
+                  </button>
                 );
               })}
             </div>
@@ -381,17 +486,17 @@ export function DashboardCharts({
           </div>
         </div>
 
-        {/* Right Column: Active GPU Batch Status + Live Telemetry Event Stream */}
+        {/* Right Column: Active Batch Status + Live Telemetry Event Stream */}
         <div className="lg:col-span-5 surface-panel rounded-xl p-5 flex flex-col justify-between">
           <div>
             {/* Active Batch Section */}
             <div className="flex items-center justify-between pb-3 border-b border-[#1e2230]">
               <div>
                 <h2 className="text-sm font-semibold text-[#f3f4f8]">
-                  Active Kaggle GPU Execution
+                  Active Batch Execution
                 </h2>
                 <p className="text-xs text-[#636b82] mt-0.5">
-                  Concurrent dual-slot notebook runners
+                  VM Direct Remux (-c:v copy) & Kaggle Dual-T4 GPU
                 </p>
               </div>
               <button
@@ -409,7 +514,8 @@ export function DashboardCharts({
                 <div className="p-3.5 rounded-lg bg-[#151822] border border-[#232838] space-y-2">
                   <div className="flex items-center justify-between text-xs font-mono tabular-nums">
                     <span className="font-semibold text-[#f3f4f8]">
-                      Batch #{latestBatch.id} · {latestBatch.status.toUpperCase()}
+                      Batch #{latestBatch.id} ·{" "}
+                      {latestBatch.mode === "vm_remux" ? "VM DIRECT REMUX" : latestBatch.status.toUpperCase()}
                     </span>
                     <span className="text-[#949bb0] flex items-center gap-1">
                       <Clock className="w-3.5 h-3.5 text-indigo-400" />
@@ -417,14 +523,21 @@ export function DashboardCharts({
                     </span>
                   </div>
                   <div className="text-xs font-mono text-[#949bb0] truncate">
-                    Kernel: <span className="text-[#f3f4f8]">{latestBatch.kernelSlug || "provisioning..."}</span>
+                    Worker:{" "}
+                    <span className="text-[#f3f4f8]">
+                      {latestBatch.mode === "vm_remux"
+                        ? "ffmpeg -c:v copy (2 threads)"
+                        : latestBatch.kernelSlug || "provisioning..."}
+                    </span>
                   </div>
                   <div className="flex items-center justify-between text-[11px] font-mono tabular-nums text-[#636b82] pt-2 border-t border-[#1e2230]">
                     <span>
                       {latestBatch.jobCount} episodes ·{" "}
                       {(latestBatch.totalBytes / (1024 * 1024 * 1024)).toFixed(2)} GB
                     </span>
-                    <span className="text-indigo-400">@{latestBatch.kaggleUsername || "auto"}</span>
+                    <span className="text-indigo-400">
+                      @{latestBatch.kaggleUsername || "auto"}
+                    </span>
                   </div>
                 </div>
               ) : (
@@ -432,10 +545,12 @@ export function DashboardCharts({
                   <div className="min-w-0">
                     <div className="text-xs font-medium text-[#f3f4f8] flex items-center gap-1.5">
                       <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                      <span>All {concurrency.max} GPU Slots Ready</span>
+                      <span>
+                        VM Remux & {concurrency.max} GPU Slots Ready
+                      </span>
                     </div>
                     <p className="text-[11px] text-[#636b82] mt-0.5">
-                      No Kaggle kernels currently executing. Enqueue episodes to stage and dispatch.
+                      H.264 releases remux immediately on VM; HEVC/AV1 releases dispatch to Kaggle GPU.
                     </p>
                   </div>
                   <button

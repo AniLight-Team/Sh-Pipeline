@@ -61,19 +61,25 @@ export const KIRA_BATCH_WINDOW_MIN = Math.max(1, parseInt(process.env.KIRA_BATCH
 export const KIRA_BATCH_WINDOW_MS = KIRA_BATCH_WINDOW_MIN * 60 * 1000;
 export const KIRA_QUEUE_IDLE_SETTLE_MS = Math.max(10_000, parseInt(process.env.KIRA_QUEUE_IDLE_SETTLE_MS || "30000", 10));
 export const KIRA_BATCH_MAX_GB = Math.max(1, parseInt(process.env.KIRA_BATCH_MAX_GB || "10", 10));
-export const KIRA_BATCH_MAX_BYTES = Math.floor(KIRA_BATCH_MAX_GB * 1_000_000_000);
-export const KIRA_BATCH_SAFE_MAX_BYTES = Math.min(98_000_000_000, KIRA_BATCH_MAX_BYTES);
-export const KIRA_BATCH_MAX_ITEMS = Math.max(1, parseInt(process.env.KIRA_BATCH_MAX_ITEMS || "10", 10)); // Maximum 10 files per batch
-export const KIRA_MAX_STAGING_GB = Math.max(KIRA_BATCH_MAX_GB, parseInt(process.env.KIRA_MAX_STAGING_GB || "60", 10));
-export const KIRA_MAX_STAGING_BYTES = Math.floor(KIRA_MAX_STAGING_GB * 1_000_000_000);
-export const KIRA_MIN_FREE_SSD_BYTES = Math.floor(Math.max(5, parseInt(process.env.KIRA_MIN_FREE_SSD_GB || "12", 10)) * 1_000_000_000);
-export const KIRA_PER_DOWNLOAD_RESERVE_BYTES = 1_400_000_000; // 1.4 GB reserve per parallel download
+export const KIRA_BATCH_MAX_BYTES = Math.floor(KIRA_BATCH_MAX_GB * 1024 * 1024 * 1024);
+export const KIRA_BATCH_SAFE_MAX_BYTES = Math.min(98 * 1024 * 1024 * 1024, KIRA_BATCH_MAX_BYTES);
+export const KIRA_BATCH_MAX_ITEMS = Math.max(1, parseInt(process.env.KIRA_BATCH_MAX_ITEMS || "10", 10)); // Maximum 10 files per GPU batch
+export const KIRA_MAX_STAGING_GB = Math.max(KIRA_BATCH_MAX_GB, parseInt(process.env.KIRA_MAX_STAGING_GB || "56", 10));
+export const KIRA_MAX_STAGING_BYTES = Math.floor(KIRA_MAX_STAGING_GB * 1024 * 1024 * 1024); // Strict 56 GiB cap
+export const KIRA_MIN_FREE_SSD_BYTES = Math.floor(Math.max(5, parseInt(process.env.KIRA_MIN_FREE_SSD_GB || "12", 10)) * 1024 * 1024 * 1024);
+export const KIRA_PER_DOWNLOAD_RESERVE_BYTES = Math.floor(1.5 * 1024 * 1024 * 1024); // 1.5 GiB reserve per active torrent download
 export const KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT = 2; // Kaggle allows 2 concurrent GPU sessions per account
+
+// ── Local VM Direct-Remux Batch Guardrails (H.264 Container + Audio Copy/Convert) ──
+export const KIRA_VM_MAX_CONCURRENT_BATCHES = Math.max(1, parseInt(process.env.KIRA_VM_MAX_CONCURRENT_BATCHES || "1", 10));
+export const KIRA_VM_BATCH_MAX_ITEMS = Math.max(1, parseInt(process.env.KIRA_VM_BATCH_MAX_ITEMS || "5", 10));
+export const KIRA_VM_BATCH_SAFE_MAX_BYTES = Math.floor(Math.max(2, parseInt(process.env.KIRA_VM_BATCH_MAX_GB || "6", 10)) * 1024 * 1024 * 1024);
+export const KIRA_VM_FFMPEG_THREADS = Math.max(1, parseInt(process.env.KIRA_VM_FFMPEG_THREADS || "2", 10));
 
 export function getMaxConcurrentBatches(): number {
   const { kaggleAccounts } = loadAccountsFromEnv();
-  // Total concurrent tasks limit = total number of kaggle accounts * 2
-  return Math.max(2, kaggleAccounts.length * KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT);
+  // Total concurrent tasks limit = total number of kaggle accounts * 2 + VM direct-remux slot
+  return Math.max(2, kaggleAccounts.length * KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT) + KIRA_VM_MAX_CONCURRENT_BATCHES;
 }
 
 // Backward-compatible alias

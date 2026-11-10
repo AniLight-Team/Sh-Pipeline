@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import {
   X,
   Plus,
@@ -8,6 +8,7 @@ import {
   ChevronUp,
   ExternalLink,
   Film,
+  Grid,
 } from "lucide-react";
 
 interface EnqueueModalProps {
@@ -31,9 +32,51 @@ interface ResolvedPreview {
   source: string;
 }
 
+function parseEpisodeString(input: string): number[] {
+  const result = new Set<number>();
+  for (const part of input.split(",")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    if (trimmed.includes("-")) {
+      const [start, end] = trimmed.split("-").map((x) => parseInt(x.trim(), 10));
+      if (!isNaN(start) && !isNaN(end) && start > 0 && start <= end) {
+        const cappedEnd = Math.min(end, start + 200);
+        for (let n = start; n <= cappedEnd; n++) result.add(n);
+      }
+    } else {
+      const n = parseInt(trimmed, 10);
+      if (!isNaN(n) && n > 0) result.add(n);
+    }
+  }
+  return Array.from(result).sort((a, b) => a - b);
+}
+
+function formatEpisodeArray(nums: number[]): string {
+  const sorted = Array.from(new Set(nums))
+    .filter((n) => n > 0)
+    .sort((a, b) => a - b);
+  if (sorted.length === 0) return "";
+  const ranges: string[] = [];
+  let start = sorted[0];
+  let prev = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    const cur = sorted[i];
+    if (cur === prev + 1) {
+      prev = cur;
+    } else {
+      ranges.push(start === prev ? `${start}` : `${start}-${prev}`);
+      start = cur;
+      prev = cur;
+    }
+  }
+  ranges.push(start === prev ? `${start}` : `${start}-${prev}`);
+  return ranges.join(", ");
+}
+
 export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) {
   const [anilistInput, setAnilistInput] = useState("");
   const [episodes, setEpisodes] = useState("1");
+  const [showEpisodeGrid, setShowEpisodeGrid] = useState(true);
   const [isSub, setIsSub] = useState(true);
   const [isDub, setIsDub] = useState(true);
   const [loading, setLoading] = useState(false);
@@ -58,7 +101,27 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
     }
   }, [isOpen]);
 
+  const selectedEpisodeSet = useMemo(
+    () => new Set(parseEpisodeString(episodes)),
+    [episodes],
+  );
+
+  const gridCount = useMemo(() => {
+    const total = preview?.totalEpisodes || 12;
+    return Math.min(Math.max(total, 10), 36);
+  }, [preview?.totalEpisodes]);
+
   if (!isOpen) return null;
+
+  const toggleEpisodeNumber = (ep: number) => {
+    const next = new Set(selectedEpisodeSet);
+    if (next.has(ep)) {
+      next.delete(ep);
+    } else {
+      next.add(ep);
+    }
+    setEpisodes(formatEpisodeArray(Array.from(next)));
+  };
 
   const extractAnilistId = (raw: string): number | null => {
     const trimmed = raw.trim();
@@ -111,27 +174,19 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
     setError(null);
 
     const parsedAnilist = extractAnilistId(anilistInput);
-    const parsedAnidb = overrideAnidbId ? parseInt(overrideAnidbId.trim(), 10) : preview?.anidbId;
-    const parsedAnime = overrideAnimeId ? parseInt(overrideAnimeId.trim(), 10) : preview?.animeId;
+    const parsedAnidb = overrideAnidbId
+      ? parseInt(overrideAnidbId.trim(), 10)
+      : preview?.anidbId;
+    const parsedAnime = overrideAnimeId
+      ? parseInt(overrideAnimeId.trim(), 10)
+      : preview?.animeId;
 
     if (!parsedAnilist && !parsedAnidb) {
       setError("Please provide a valid AniList ID (or AniDB ID)");
       return;
     }
 
-    const epNums: number[] = [];
-    for (const part of episodes.split(",")) {
-      const trimmed = part.trim();
-      if (trimmed.includes("-")) {
-        const [start, end] = trimmed.split("-").map((x) => parseInt(x.trim(), 10));
-        if (!isNaN(start) && !isNaN(end) && start <= end) {
-          for (let n = start; n <= end; n++) epNums.push(n);
-        }
-      } else {
-        const n = parseInt(trimmed, 10);
-        if (!isNaN(n) && n > 0) epNums.push(n);
-      }
-    }
+    const epNums = parseEpisodeString(episodes);
 
     if (epNums.length === 0) {
       setError("Please specify at least one episode number (e.g. 1 or 1-10)");
@@ -203,7 +258,7 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
             Enqueue Anime Episodes
           </h3>
           <p className="text-xs text-[#636b82] mt-1">
-            Resolves Tsukihime & AnimeTosho releases, extracts subtitles to R2, and stages MKVs for Kaggle GPU encoding.
+            Resolves Tsukihime & AnimeTosho releases, downloads same-group H.264 qualities, extracts 1080p subtitles to R2, and routes to VM Remux or Kaggle GPU.
           </p>
         </div>
 
@@ -283,24 +338,33 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 </h4>
                 <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mt-1 text-[11px] font-mono tabular-nums text-[#949bb0]">
                   {preview.tsukihimeId && (
-                    <span className="text-indigo-400">Tsukihime #{preview.tsukihimeId}</span>
+                    <span className="text-indigo-400">
+                      Tsukihime #{preview.tsukihimeId}
+                    </span>
                   )}
                   {preview.anidbId && <span>· AniDB #{preview.anidbId}</span>}
                   {preview.malId && <span>· MAL #{preview.malId}</span>}
                   {preview.totalEpisodes && (
-                    <span className="text-[#f3f4f8]">· {preview.totalEpisodes} eps</span>
+                    <span className="text-[#f3f4f8]">
+                      · {preview.totalEpisodes} eps
+                    </span>
                   )}
                 </div>
               </div>
             </div>
           )}
 
-          {/* Episode Range */}
+          {/* Episode Range + Interactive Multi-Select Grid */}
           <div>
             <div className="flex items-center justify-between mb-1.5">
-              <label htmlFor="episodes-input" className="text-[#f3f4f8] font-medium">
-                Episode Numbers
-              </label>
+              <div className="flex items-center gap-2">
+                <label htmlFor="episodes-input" className="text-[#f3f4f8] font-medium">
+                  Episode Numbers
+                </label>
+                <span className="text-[11px] font-mono tabular-nums text-indigo-300">
+                  ({selectedEpisodeSet.size} selected)
+                </span>
+              </div>
               <div className="flex items-center gap-1.5 text-[11px] font-mono">
                 <button
                   type="button"
@@ -316,15 +380,26 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 >
                   1-10
                 </button>
-                {preview?.totalEpisodes && (
-                  <button
-                    type="button"
-                    onClick={() => setEpisodes(`1-${preview.totalEpisodes}`)}
-                    className="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-500/25 cursor-pointer"
-                  >
-                    All ({preview.totalEpisodes})
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setEpisodes(
+                      `1-${preview?.totalEpisodes || gridCount}`,
+                    )
+                  }
+                  className="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-500/25 cursor-pointer"
+                >
+                  All ({preview?.totalEpisodes || gridCount})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowEpisodeGrid(!showEpisodeGrid)}
+                  className="px-2 py-0.5 rounded bg-[#151822] text-[#949bb0] hover:text-white border border-[#232838] inline-flex items-center gap-1 cursor-pointer"
+                  title="Toggle interactive multi-select episode picker"
+                >
+                  <Grid className="w-3 h-3" />
+                  <span>{showEpisodeGrid ? "Hide Grid" : "Grid"}</span>
+                </button>
               </div>
             </div>
             <input
@@ -336,6 +411,58 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
               className="w-full px-3.5 py-2 rounded-lg bg-[#0c0e14] border border-[#1e2230] text-[#f3f4f8] placeholder-[#636b82] focus:outline-none focus:border-indigo-500 font-mono text-xs transition-colors"
               required
             />
+
+            {/* Interactive Visual Multi-Select Episode Grid */}
+            {showEpisodeGrid && (
+              <div className="mt-2.5 p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
+                <div className="flex items-center justify-between text-[11px] font-mono text-[#636b82] mb-2">
+                  <span>Click episodes to toggle multi-selection:</span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const inverted: number[] = [];
+                        for (let i = 1; i <= gridCount; i++) {
+                          if (!selectedEpisodeSet.has(i)) inverted.push(i);
+                        }
+                        setEpisodes(formatEpisodeArray(inverted));
+                      }}
+                      className="text-[#949bb0] hover:text-white underline cursor-pointer"
+                    >
+                      Invert
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEpisodes("")}
+                      className="text-[#949bb0] hover:text-white underline cursor-pointer"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-6 sm:grid-cols-10 gap-1.5">
+                  {Array.from({ length: gridCount }, (_, i) => i + 1).map(
+                    (epNum) => {
+                      const active = selectedEpisodeSet.has(epNum);
+                      return (
+                        <button
+                          key={epNum}
+                          type="button"
+                          onClick={() => toggleEpisodeNumber(epNum)}
+                          className={`py-1.5 rounded text-[11px] font-mono tabular-nums font-medium border transition-colors cursor-pointer ${
+                            active
+                              ? "bg-indigo-500/25 border-indigo-500/60 text-white"
+                              : "bg-[#12141c] border-[#1e2230] text-[#949bb0] hover:text-white hover:border-[#2e344a]"
+                          }`}
+                        >
+                          {epNum}
+                        </button>
+                      );
+                    },
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Audio Track Selection */}
@@ -359,7 +486,9 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 />
                 <div>
                   <div className="font-semibold text-xs">Sub (Japanese)</div>
-                  <div className="text-[11px] text-[#636b82]">Full dialogue VTT subtitles</div>
+                  <div className="text-[11px] text-[#636b82]">
+                    1080p VTT subtitles to R2
+                  </div>
                 </div>
               </label>
 
@@ -378,7 +507,9 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 />
                 <div>
                   <div className="font-semibold text-xs">Dub (English)</div>
-                  <div className="text-[11px] text-[#636b82]">Dual-audio + signs track</div>
+                  <div className="text-[11px] text-[#636b82]">
+                    Dual-audio + signs track
+                  </div>
                 </div>
               </label>
             </div>
@@ -396,7 +527,11 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
               ) : (
                 <ChevronDown className="w-3.5 h-3.5" />
               )}
-              <span>{showAdvanced ? "Hide Advanced Overrides" : "Show Advanced Overrides"}</span>
+              <span>
+                {showAdvanced
+                  ? "Hide Advanced Overrides"
+                  : "Show Advanced Overrides"}
+              </span>
             </button>
           </div>
 
@@ -472,7 +607,11 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
               className="btn-primary px-5 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>{loading ? "Dispatching..." : "Enqueue Episodes"}</span>
+              <span>
+                {loading
+                  ? "Dispatching..."
+                  : `Enqueue ${selectedEpisodeSet.size || 1} Episode${selectedEpisodeSet.size === 1 ? "" : "s"}`}
+              </span>
             </button>
           </div>
         </form>

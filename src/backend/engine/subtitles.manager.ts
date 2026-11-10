@@ -48,6 +48,11 @@ export interface MkvStreamProbe {
   classifiedAudio: ClassifiedAudioTrack[];
   japaneseStreamIndex: number;
   englishStreamIndex: number | null;
+  videoCodec: string;
+  pixelFormat: string;
+  width: number;
+  height: number;
+  isBrowserCompatibleH264: boolean;
 }
 
 export function inspectMkvStreamsSync(filepath: string): Promise<MkvStreamProbe> {
@@ -70,6 +75,17 @@ export function inspectMkvStreamsSync(filepath: string): Promise<MkvStreamProbe>
           );
           const audioStreams = streams.filter((s: any) => s.codec_type === "audio");
           const subtitleStreams = streams.filter((s: any) => s.codec_type === "subtitle");
+
+          const primaryVideo = (videoStreams.length > 0
+            ? videoStreams
+            : streams.filter((s: any) => s.codec_type === "video"))[0] || {};
+          const videoCodec = String(primaryVideo.codec_name || "h264").trim().toLowerCase();
+          const pixelFormat = String(primaryVideo.pix_fmt || "yuv420p").trim().toLowerCase();
+          const width = parseInt(String(primaryVideo.width || "1920"), 10) || 1920;
+          const height = parseInt(String(primaryVideo.height || "1080"), 10) || 1080;
+          const isHighBit = pixelFormat.includes("10") || pixelFormat.includes("12");
+          const isBrowserCompatibleH264 =
+            (videoCodec === "h264" || videoCodec === "avc" || videoCodec === "avc1") && !isHighBit;
 
           const classifiedAudio: ClassifiedAudioTrack[] = [];
           const originalCandidates: number[] = [];
@@ -99,7 +115,7 @@ export function inspectMkvStreamsSync(filepath: string): Promise<MkvStreamProbe>
               language: lang,
               title,
               channels: parseInt(a.channels || "2", 10),
-              codec: a.codec_name || "",
+              codec: (a.codec_name || "").toLowerCase(),
               isCommentary,
               isDefault: Boolean(disposition.default),
             };
@@ -169,6 +185,11 @@ export function inspectMkvStreamsSync(filepath: string): Promise<MkvStreamProbe>
             classifiedAudio,
             japaneseStreamIndex: japaneseStreamIdx,
             englishStreamIndex: englishStreamIdx,
+            videoCodec,
+            pixelFormat,
+            width,
+            height,
+            isBrowserCompatibleH264,
           });
         } catch (parseErr) {
           reject(parseErr);

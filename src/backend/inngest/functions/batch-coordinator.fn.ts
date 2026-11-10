@@ -33,8 +33,9 @@ export const batchCoordinatorFn = inngest.createFunction(
         }
 
         // If all downloads have finished (0 queued, 0 downloading), only wait for the brief idle settle window (e.g. 30s)
-        if (stats.activeDownloadsOrQueued === 0 && stats.newestStagedAt) {
-          const idleElapsedMs = Date.now() - stats.newestStagedAt.getTime();
+        const newestRef = stats.newestGpuStagedAt || stats.newestStagedAt;
+        if (stats.activeDownloadsOrQueued === 0 && newestRef) {
+          const idleElapsedMs = Date.now() - newestRef.getTime();
           const idleRemainingMs = Math.max(5000, KIRA_QUEUE_IDLE_SETTLE_MS - idleElapsedMs + 2000);
           return {
             shouldSkip: false,
@@ -44,7 +45,8 @@ export const batchCoordinatorFn = inngest.createFunction(
           };
         }
 
-        const elapsedMs = Date.now() - stats.oldestStagedAt.getTime();
+        const oldestRef = stats.oldestGpuStagedAt || stats.oldestStagedAt;
+        const elapsedMs = Date.now() - oldestRef.getTime();
         const remainingMs = Math.max(0, KIRA_BATCH_WINDOW_MS - elapsedMs);
         return {
           shouldSkip: false,
@@ -76,10 +78,10 @@ export const batchCoordinatorFn = inngest.createFunction(
     for (const bId of sealedBatchIds) {
       await step.sendEvent(`dispatch-batch-${bId}`, {
         name: "pipeline/batch.execute",
-        id: `pipeline-batch-${bId}-exec`,
+        id: `pipeline-batch-${bId}-exec-${Date.now()}`,
         data: { batchId: bId },
       });
-      log.info("BatchCoordinatorFn", `Dispatched Batch #${bId} to Kaggle GPU executor`);
+      log.info("BatchCoordinatorFn", `Dispatched Batch #${bId} to batch executor`);
     }
 
     return { sealedBatchIds, count: sealedBatchIds.length };

@@ -1,25 +1,112 @@
-import React from "react";
-import { X, ExternalLink, Copy, Check, Download, AlertTriangle } from "lucide-react";
+import React, { useState } from "react";
+import {
+  X,
+  ExternalLink,
+  Copy,
+  Check,
+  Download,
+  AlertTriangle,
+  Play,
+  RefreshCw,
+  Cpu,
+  HardDrive,
+  Film,
+  Subtitles,
+} from "lucide-react";
 
 interface JobDetailsModalProps {
   job: any | null;
   onClose: () => void;
+  onUpdated?: (message?: string) => void;
 }
 
-export function JobDetailsModal({ job, onClose }: JobDetailsModalProps) {
-  const [copied, setCopied] = React.useState(false);
+export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProps) {
+  const [copied, setCopied] = useState(false);
+  const [copiedUrls, setCopiedUrls] = useState(false);
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+
+  const allTrackPayloads = Array.isArray(job?.resultPayload?.allTrackPayloads)
+    ? job.resultPayload.allTrackPayloads
+    : job?.resultPayload
+    ? [job.resultPayload]
+    : [];
+
+  const availableAudioTracks: string[] =
+    allTrackPayloads.length > 0
+      ? allTrackPayloads.map((p: any) => p.type || "sub")
+      : Array.isArray(job?.types) && job.types.length > 0
+      ? job.types
+      : ["sub"];
+
+  const [selectedAudioType, setSelectedAudioType] = useState<string>(
+    availableAudioTracks[0] || "sub",
+  );
+  const [selectedQuality, setSelectedQuality] = useState<string>("1080p");
 
   if (!job) return null;
 
-  const handleCopy = (text: string) => {
-    navigator.clipboard.writeText(text);
+  const activeTrackPayload =
+    allTrackPayloads.find((p: any) => p.type === selectedAudioType) ||
+    allTrackPayloads[0] ||
+    job.resultPayload;
+
+  const sources: any[] = activeTrackPayload?.sources || job.resultPayload?.sources || [];
+  const subtitles: any[] =
+    activeTrackPayload?.subtitles ||
+    job.subtitlesPayload ||
+    job.resultPayload?.subtitles ||
+    [];
+
+  const activeStreamSource =
+    sources.find((s: any) => s.quality === selectedQuality) || sources[0] || null;
+  const activeStreamUrl = activeStreamSource?.downloadUrl || activeStreamSource?.url || "";
+
+  const tsukihimeId = job.metadata?.tsukihimeId;
+  const processingMode = job.metadata?.processingMode;
+  const releaseGroup = job.metadata?.releaseGroup;
+  const videoCodec = job.metadata?.videoCodec;
+  const stagedQualities = (job.metadata?.stagedQualities || {}) as Record<string, string>;
+  const stagedQualityKeys = Object.keys(stagedQualities);
+
+  const handleCopyJson = () => {
+    navigator.clipboard.writeText(JSON.stringify(job, null, 2));
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const sources = job.resultPayload?.sources || [];
-  const subtitles = job.subtitlesPayload || job.resultPayload?.subtitles || [];
-  const tsukihimeId = job.metadata?.tsukihimeId;
+  const handleCopyStreamUrls = () => {
+    const urls = sources
+      .map((s: any) => `${s.quality}: ${s.downloadUrl || s.url}`)
+      .join("\n");
+    navigator.clipboard.writeText(urls || job.torrentMagnet || "");
+    setCopiedUrls(true);
+    setTimeout(() => setCopiedUrls(false), 2000);
+  };
+
+  const runJobAction = async (
+    action: "retry" | "force_remux" | "force_gpu" | "sync_callbacks",
+  ) => {
+    setActionBusy(action);
+    try {
+      const res = await fetch("/api/jobs/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jobIds: [job.id],
+          action,
+        }),
+      });
+      const data = await res.json();
+      if (onUpdated) {
+        onUpdated(data.message || `Executed ${action} for Job #${job.id}`);
+      }
+      onClose();
+    } catch {
+      // Ignore transient errors
+    } finally {
+      setActionBusy(null);
+    }
+  };
 
   return (
     <div
@@ -28,11 +115,11 @@ export function JobDetailsModal({ job, onClose }: JobDetailsModalProps) {
       aria-labelledby="job-details-title"
       className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
     >
-      <div className="surface-panel rounded-xl max-w-2xl w-full p-6 shadow-2xl relative max-h-[90vh] overflow-y-auto">
+      <div className="surface-panel rounded-xl max-w-3xl w-full p-6 shadow-2xl relative max-h-[92vh] overflow-y-auto">
         {/* Header */}
         <div className="flex items-start justify-between pb-4 border-b border-[#1e2230]">
-          <div className="pr-8">
-            <div className="flex items-center gap-2 text-xs font-mono tabular-nums text-[#949bb0]">
+          <div className="pr-8 min-w-0">
+            <div className="flex flex-wrap items-center gap-2 text-xs font-mono tabular-nums text-[#949bb0]">
               <span>Job #{job.id}</span>
               <span>·</span>
               <span className="uppercase text-indigo-400 font-semibold">{job.status}</span>
@@ -40,8 +127,22 @@ export function JobDetailsModal({ job, onClose }: JobDetailsModalProps) {
               <span>Episode {job.episodeNumber}</span>
               <span>·</span>
               <span>{job.types?.join(" + ").toUpperCase() || "SUB"}</span>
+              {processingMode && (
+                <>
+                  <span>·</span>
+                  <span
+                    className={
+                      processingMode === "vm_remux" ? "text-emerald-400" : "text-violet-400"
+                    }
+                  >
+                    {processingMode === "vm_remux"
+                      ? "VM Direct Remux (-c:v copy)"
+                      : "Kaggle GPU Encode"}
+                  </span>
+                </>
+              )}
             </div>
-            <h3 id="job-details-title" className="text-base font-bold text-[#f3f4f8] mt-1">
+            <h3 id="job-details-title" className="text-base font-bold text-[#f3f4f8] mt-1 truncate">
               {job.metadata?.primaryTitle || job.torrentTitle || `Anime Job #${job.id}`}
             </h3>
           </div>
@@ -50,14 +151,63 @@ export function JobDetailsModal({ job, onClose }: JobDetailsModalProps) {
             type="button"
             onClick={onClose}
             aria-label="Close job details"
-            className="btn-secondary w-8 h-8 rounded-lg flex items-center justify-center text-[#949bb0] hover:text-white cursor-pointer"
+            className="btn-secondary w-8 h-8 rounded-lg flex items-center justify-center text-[#949bb0] hover:text-white cursor-pointer shrink-0"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Identifiers Row */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 my-4">
+        {/* Direct Job Action Toolbar */}
+        <div className="my-4 p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex flex-wrap items-center justify-between gap-2">
+          <span className="text-xs font-medium text-[#949bb0]">
+            Pipeline Controls
+          </span>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={actionBusy !== null}
+              onClick={() => runJobAction("retry")}
+              className="btn-secondary px-2.5 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className="w-3.5 h-3.5 text-indigo-400" />
+              <span>Retry Job</span>
+            </button>
+            <button
+              type="button"
+              disabled={actionBusy !== null}
+              onClick={() => runJobAction("force_remux")}
+              className="btn-secondary px-2.5 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              title="Force direct container & audio conversion on VM (-c:v copy)"
+            >
+              <HardDrive className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Route to VM Remux</span>
+            </button>
+            <button
+              type="button"
+              disabled={actionBusy !== null}
+              onClick={() => runJobAction("force_gpu")}
+              className="btn-secondary px-2.5 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              title="Route job to Kaggle Dual-T4 GPU batch transcoding"
+            >
+              <Cpu className="w-3.5 h-3.5 text-violet-400" />
+              <span>Route to GPU</span>
+            </button>
+            {job.status === "completed" && (
+              <button
+                type="button"
+                disabled={actionBusy !== null}
+                onClick={() => runJobAction("sync_callbacks")}
+                className="btn-secondary px-2.5 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <Play className="w-3.5 h-3.5 text-sky-400" />
+                <span>Sync Webhook</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Identifiers & Codec Metadata Row */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
           <div className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
             <span className="text-[11px] text-[#636b82] block mb-0.5">AniList ID</span>
             {job.anilistId ? (
@@ -76,42 +226,60 @@ export function JobDetailsModal({ job, onClose }: JobDetailsModalProps) {
           </div>
 
           <div className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
-            <span className="text-[11px] text-[#636b82] block mb-0.5">Tsukihime ID</span>
+            <span className="text-[11px] text-[#636b82] block mb-0.5">Tsukihime / AniDB</span>
             <span className="font-mono tabular-nums font-semibold text-xs text-[#f3f4f8]">
-              {tsukihimeId ? `#${tsukihimeId}` : "—"}
+              {tsukihimeId ? `Tsuki #${tsukihimeId}` : "—"} ·{" "}
+              {job.anidbId ? `AniDB #${job.anidbId}` : "—"}
             </span>
           </div>
 
           <div className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
-            <span className="text-[11px] text-[#636b82] block mb-0.5">AniDB ID</span>
-            {job.anidbId ? (
-              <a
-                href={`https://anidb.net/anime/${job.anidbId}`}
-                target="_blank"
-                rel="noreferrer"
-                className="font-mono tabular-nums font-semibold text-xs text-[#d5d9e6] hover:text-white inline-flex items-center gap-1"
-              >
-                <span>#{job.anidbId}</span>
-                <ExternalLink className="w-3 h-3" />
-              </a>
-            ) : (
-              <span className="text-xs font-mono text-[#636b82]">—</span>
-            )}
+            <span className="text-[11px] text-[#636b82] block mb-0.5">Release Group & Codec</span>
+            <span className="font-mono text-xs font-semibold text-[#d5d9e6] truncate block">
+              {releaseGroup || "auto"} · {(videoCodec || "h264").toUpperCase()}
+            </span>
           </div>
 
           <div className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
-            <span className="text-[11px] text-[#636b82] block mb-0.5">Main Anime ID</span>
+            <span className="text-[11px] text-[#636b82] block mb-0.5">Staged Payload</span>
             <span className="font-mono tabular-nums font-semibold text-xs text-[#d5d9e6]">
-              {job.animeId ? `#${job.animeId}` : "—"}
+              {job.sizeBytes
+                ? `${(job.sizeBytes / (1024 * 1024)).toFixed(1)} MB`
+                : "—"}
             </span>
           </div>
         </div>
 
-        {/* Selected Release Title */}
+        {/* Selected Release Title & Multi-Quality Staged Files */}
         {job.torrentTitle && (
-          <div className="mb-4 p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
-            <span className="text-[11px] text-[#636b82] block mb-1">Selected Release</span>
-            <div className="font-mono text-xs text-[#f3f4f8] break-all">{job.torrentTitle}</div>
+          <div className="mb-4 p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230] space-y-2">
+            <div>
+              <span className="text-[11px] text-[#636b82] block mb-1">
+                Selected Primary Release (1080p Subtitle Source)
+              </span>
+              <div className="font-mono text-xs text-[#f3f4f8] break-all">
+                {job.torrentTitle}
+              </div>
+            </div>
+
+            {stagedQualityKeys.length > 0 && (
+              <div className="pt-2 border-t border-[#1e2230]">
+                <span className="text-[11px] text-[#636b82] block mb-1">
+                  Same-Group Staged Quality Files ({stagedQualityKeys.join(" · ")})
+                </span>
+                <div className="space-y-1">
+                  {stagedQualityKeys.map((qKey) => (
+                    <div
+                      key={qKey}
+                      className="flex items-center justify-between text-[11px] font-mono text-[#949bb0]"
+                    >
+                      <span className="text-indigo-400 font-semibold">{qKey}</span>
+                      <span className="truncate max-w-md">{stagedQualities[qKey]}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -128,31 +296,121 @@ export function JobDetailsModal({ job, onClose }: JobDetailsModalProps) {
           </div>
         )}
 
-        {/* Encoded Video Streams */}
+        {/* Multimedia Video Stream Preview Player (When Completed / Sources Available) */}
         {sources.length > 0 && (
-          <div className="mb-4">
-            <h4 className="text-xs font-semibold text-[#949bb0] mb-2">
-              Encoded Video Streams ({sources.length} qualities)
-            </h4>
+          <div className="mb-4 p-3.5 rounded-lg bg-[#0c0e14] border border-[#1e2230] space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <Film className="w-4 h-4 text-indigo-400" />
+                <h4 className="text-xs font-semibold text-[#f3f4f8]">
+                  Multimedia Stream Inspector ({sources.length} qualities)
+                </h4>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Audio Track Switcher */}
+                {availableAudioTracks.length > 1 && (
+                  <div className="flex items-center bg-[#151822] p-0.5 rounded-md border border-[#232838] text-[11px] font-mono">
+                    {availableAudioTracks.map((aType) => (
+                      <button
+                        key={aType}
+                        type="button"
+                        onClick={() => setSelectedAudioType(aType)}
+                        className={`px-2 py-0.5 rounded uppercase cursor-pointer ${
+                          selectedAudioType === aType
+                            ? "bg-indigo-500 text-white font-semibold"
+                            : "text-[#949bb0] hover:text-white"
+                        }`}
+                      >
+                        {aType}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {/* Quality Switcher */}
+                <div className="flex items-center bg-[#151822] p-0.5 rounded-md border border-[#232838] text-[11px] font-mono">
+                  {sources.map((s: any) => (
+                    <button
+                      key={s.quality}
+                      type="button"
+                      onClick={() => setSelectedQuality(s.quality)}
+                      className={`px-2 py-0.5 rounded cursor-pointer ${
+                        (activeStreamSource?.quality || "") === s.quality
+                          ? "bg-[#232838] text-white font-semibold"
+                          : "text-[#949bb0] hover:text-white"
+                      }`}
+                    >
+                      {s.quality}
+                    </button>
+                  ))}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleCopyStreamUrls}
+                  className="btn-secondary px-2.5 py-1 rounded-md text-[11px] font-mono inline-flex items-center gap-1 cursor-pointer"
+                >
+                  {copiedUrls ? (
+                    <Check className="w-3 h-3 text-emerald-400" />
+                  ) : (
+                    <Copy className="w-3 h-3" />
+                  )}
+                  <span>{copiedUrls ? "Copied URLs" : "Copy URLs"}</span>
+                </button>
+              </div>
+            </div>
+
+            {activeStreamUrl && (
+              <div className="rounded-lg overflow-hidden bg-black border border-[#1e2230]">
+                <video
+                  key={activeStreamUrl}
+                  src={activeStreamUrl}
+                  controls
+                  preload="metadata"
+                  crossOrigin="anonymous"
+                  className="w-full max-h-64 bg-black"
+                >
+                  {subtitles.map((sub: any, idx: number) =>
+                    sub.url ? (
+                      <track
+                        key={idx}
+                        kind="subtitles"
+                        src={sub.url}
+                        srcLang={sub.language || "en"}
+                        label={sub.label || sub.language || `Track ${idx + 1}`}
+                        default={Boolean(sub.isDefault || sub.default_sub || idx === 0)}
+                      />
+                    ) : null,
+                  )}
+                </video>
+              </div>
+            )}
+
             <div className="space-y-1.5">
               {sources.map((s: any, idx: number) => (
                 <div
                   key={idx}
-                  className="p-2.5 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex items-center justify-between text-xs font-mono"
+                  className="p-2 rounded-md bg-[#131620] border border-[#1e2230] flex items-center justify-between text-xs font-mono"
                 >
                   <div className="flex items-center gap-2.5 min-w-0">
                     <span className="text-indigo-400 font-semibold">{s.quality}</span>
+                    {s.sizeBytes && (
+                      <span className="text-[#636b82] text-[11px]">
+                        {(s.sizeBytes / (1024 * 1024)).toFixed(1)} MB
+                      </span>
+                    )}
                     <span className="text-[#949bb0] text-[11px] truncate max-w-md">
                       {s.downloadUrl || s.url}
                     </span>
                   </div>
-                  {s.downloadUrl && (
+                  {(s.downloadUrl || s.url) && (
                     <a
-                      href={s.downloadUrl}
+                      href={s.downloadUrl || s.url}
                       target="_blank"
                       rel="noreferrer"
                       className="btn-secondary p-1.5 rounded-md text-[#949bb0] hover:text-white shrink-0"
-                      title="Download encoded video"
+                      title={`Open ${s.quality} MP4 stream`}
                     >
                       <Download className="w-3.5 h-3.5" />
                     </a>
@@ -163,11 +421,12 @@ export function JobDetailsModal({ job, onClose }: JobDetailsModalProps) {
           </div>
         )}
 
-        {/* Extracted Subtitles */}
+        {/* Extracted 1080p Subtitles */}
         {subtitles.length > 0 && (
           <div className="mb-4">
-            <h4 className="text-xs font-semibold text-[#949bb0] mb-2">
-              Extracted Subtitles ({subtitles.length} tracks)
+            <h4 className="text-xs font-semibold text-[#949bb0] mb-2 flex items-center gap-1.5">
+              <Subtitles className="w-3.5 h-3.5 text-sky-400" />
+              <span>Cloudflare R2 Subtitles — Extracted from 1080p ({subtitles.length} tracks)</span>
             </h4>
             <div className="space-y-1.5">
               {subtitles.map((sub: any, idx: number) => (
@@ -175,18 +434,23 @@ export function JobDetailsModal({ job, onClose }: JobDetailsModalProps) {
                   key={idx}
                   className="p-2.5 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex items-center justify-between text-xs font-mono"
                 >
-                  <div className="flex items-center gap-2.5">
+                  <div className="flex items-center gap-2.5 min-w-0">
                     <span className="text-sky-400 font-semibold uppercase">
                       {sub.language || "UND"}
                     </span>
-                    <span className="text-[#d5d9e6] text-[11px]">{sub.label || sub.path}</span>
+                    <span className="text-[#d5d9e6] text-[11px] truncate">
+                      {sub.label || sub.path}
+                    </span>
+                    {sub.role && (
+                      <span className="text-[#636b82] text-[10px]">· {sub.role}</span>
+                    )}
                   </div>
                   {sub.url && (
                     <a
                       href={sub.url}
                       target="_blank"
                       rel="noreferrer"
-                      className="btn-secondary p-1.5 rounded-md text-[#949bb0] hover:text-white"
+                      className="btn-secondary p-1.5 rounded-md text-[#949bb0] hover:text-white shrink-0"
                     >
                       <Download className="w-3.5 h-3.5" />
                     </a>
@@ -202,7 +466,7 @@ export function JobDetailsModal({ job, onClose }: JobDetailsModalProps) {
           <div>Created {new Date(job.createdAt).toLocaleString()}</div>
           <button
             type="button"
-            onClick={() => handleCopy(JSON.stringify(job, null, 2))}
+            onClick={handleCopyJson}
             className="btn-secondary flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs cursor-pointer"
           >
             {copied ? (
