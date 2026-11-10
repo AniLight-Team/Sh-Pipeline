@@ -499,7 +499,8 @@ export class TsukihimeClient {
 
   /**
    * Hydrates all quality entries (1080p, 720p, 480p) inside each ReleaseCandidateBundle
-   * when sourced from Tsukihime.
+   * when sourced from Tsukihime, drops dead 0-seeder lower qualities, and demotes 0-seeder
+   * bundles so live seeded torrents always run first.
    */
   public static async hydrateCandidateBundles(
     bundles: ReleaseCandidateBundle[],
@@ -517,6 +518,10 @@ export class TsukihimeClient {
           );
           if (detail) {
             const enriched = this.toAnimeToshoItem(detail);
+            // If this is a lower quality (720p/480p) and tracker hydration shows 0 seeders, skip it
+            if (qKey !== "1080p" && (enriched.seeders || 0) === 0) {
+              continue;
+            }
             nextQualities[qKey] = {
               ...entry,
               item: {
@@ -536,12 +541,22 @@ export class TsukihimeClient {
         nextQualities["720p"] ||
         nextQualities["480p"] ||
         bundle.primaryEntry;
+
+      const primarySeeders = primaryEntry.item.seeders ?? 0;
+      const adjustedScore =
+        primarySeeders <= 0
+          ? bundle.bundleScore - 15000
+          : bundle.bundleScore + Math.min(primarySeeders, 100);
+
       out.push({
         ...bundle,
+        bundleScore: adjustedScore,
         primaryEntry,
         qualities: nextQualities,
       });
     }
+
+    out.sort((a, b) => b.bundleScore - a.bundleScore);
     return out;
   }
 }

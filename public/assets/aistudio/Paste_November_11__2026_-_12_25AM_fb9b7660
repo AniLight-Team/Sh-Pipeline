@@ -1,0 +1,509 @@
+
+
+Reconcile
+
+Flush Batch (1)
+
+Enqueue Episode
+Live Telemetry Console
+Real-time SSE event log stream from Tsukihime, AnimeTosho, Transmission, R2 Subtitles, VM Remux, and Kaggle GPU kernels
+
+Pipeline Telemetry Stream
+· 251 events
+all
+info
+success
+warn
+error
+Filter logs...
+
+
+
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Removing Torrent 78 (deleteLocalData=true)...
+[Transmission]
+Torrent 78 removed.
+[PipelineEngine]
+[Job #2168] Bundle 2 ([MK] Orange - 08 [BD 720p][Hi10][Dual Audio]) failed: Timed out waiting for magnet metadata on Torrent 78
+[PipelineEngine]
+[Job #2168] Trying bundle 3/4 [tier=h264_single_1080p, pipeline=vm_remux, solo=false, group=CRUCiBLE, qualities=1080p]: [CRUCiBLE] Orange Season 1 (S01) (BD Remux 1080p FLAC H.264) [Dual Audio]
+[Transmission]
+Adding torrent to https://torrent.anilight.live/transmission/rpc...
+[Transmission]
+Torrent added: [CRUCiBLE] Orange Season 1 (S01) (BD Remux 1080p FLAC H.264) [Dual Audio] (ID: 82)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[7] (strictly excluded 12 other batch files)
+[Transmission]
+Removing Torrent 82 (deleteLocalData=true)...
+[Transmission]
+Torrent 82 removed.
+[Transmission]
+Removing Torrent 82 (deleteLocalData=true)...
+[Transmission]
+Torrent 82 removed.
+[PipelineEngine]
+[Job #2168] Bundle 3 ([CRUCiBLE] Orange Season 1 (S01) (BD Remux 1080p FLAC H.264) [Dual Audio]) failed: Matched file in batch '[CRUCiBLE] Orange Season 1 (S01) (BD Remux 1080p FLAC H.264) [Dual Audio]' is 6.93 GB (exceeds single-episode safety threshold)
+[PipelineEngine]
+[Job #2168] Trying bundle 4/4 [tier=h264_single_1080p, pipeline=vm_remux, solo=false, group=anime4life., qualities=1080p]: [anime4life.] Orange Complete BD_1080p Dolby TrueHD Dual Audio
+[Transmission]
+Adding torrent to https://torrent.anilight.live/transmission/rpc...
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Torrent added: [anime4life.] Orange Complete BD_1080p Dolby TrueHD Dual Audio (ID: 83)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[BatchExecuteFn]
+Starting durable multi-step GPU execution for Batch #28
+[PipelineEngine]
+Batch #28 Kernel 'enc-batch-28-e284a7' [@aditkumarsharma] -> running (running)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Watchdog]
+Reconciliation complete: jobs=16, batches=0, callbacks=0
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[7] (strictly excluded 16 other batch files)
+[Transmission]
+Monitoring download for Torrent ID 83 (Timeout: 30m)...
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[BatchExecuteFn]
+Starting durable multi-step GPU execution for Batch #28
+[PipelineEngine]
+Batch #28 Kernel 'enc-batch-28-e284a7' [@aditkumarsharma] -> running (running)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[9] (strictly excluded 11 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[16] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[23] (strictly excluded 23 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[21] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[22] (strictly excluded 25 other batch files)
+[Transmission]
+Selective single-episode extraction: wanted=[6] (strictly excluded 11 other batch files)

@@ -809,8 +809,9 @@ export class ReleaseFilter {
         tierBonus = q1080 ? 1000 : 600;
       }
 
-      // Solo vs Batch priority: Solo releases ALWAYS outrank batch torrents when targeting a single episode
-      const soloBonus = isSingleEpTarget ? (b.isSolo ? 10000 : 0) : 0;
+      // Solo vs Batch priority: Live solo releases ALWAYS outrank batch torrents when targeting a single episode
+      const hasLiveSeeders = (primaryEntry.item.seeders ?? 1) > 0;
+      const soloBonus = isSingleEpTarget && b.isSolo && hasLiveSeeders ? 10000 : 0;
       const bundleScore = soloBonus + tierBonus + primaryEntry.score;
 
       bundles.push({

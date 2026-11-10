@@ -419,3 +419,28 @@ test("High-concurrency Stage 1 discovery and 56 GB staging guardrails are config
   assert.equal(KIRA_VM_FFMPEG_THREADS, 2);
 });
 
+test("Dead 0-seeder solo releases do not receive the +10000 solo priority bonus over seeded batch releases", () => {
+  const torrents = [
+    {
+      id: 701,
+      title: "[DeadGroup] Orange - 08 [1080p H.264 Dual Audio].mkv",
+      seeders: 0,
+      num_files: 1,
+    },
+    {
+      id: 702,
+      title: "[CRUCiBLE] Orange Season 1 (01-13) (BD 1080p H.264 Dual Audio)",
+      seeders: 18,
+      num_files: 13,
+    },
+  ];
+
+  const bundles = ReleaseFilter.selectTopCandidateBundles(torrents as any, 8, "all", {
+    knownTitles: ["Orange"],
+    minSeeders: 0,
+    maxBundles: 4,
+  });
+
+  // Because 701 has 0 seeders, seeded batch 702 (18 seeders) ranks ahead of dead 701
+  assert.equal(bundles[0].primaryEntry.item.id, 702);
+});

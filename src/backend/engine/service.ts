@@ -568,16 +568,26 @@ export class PipelineEngineService {
       enforceHardCapBeforeStart,
     } = params;
 
-    const magnetUri = candidate.magnet_uri || candidate.torrent_url;
-    if (!magnetUri) {
+    const magnetUri =
+      candidate.magnet_uri ||
+      (candidate.info_hash ? `magnet:?xt=urn:btih:${candidate.info_hash}` : "") ||
+      candidate.torrent_url;
+    const primarySourceUrl = candidate.torrent_url || magnetUri;
+    if (!primarySourceUrl) {
       return { ok: false, reason: "Missing magnet_uri and torrent_url" };
     }
 
     const parsedCandidateTitle = ReleaseFilter.parseTitle(candidate.title || "", knownTitles, candidate);
 
     let tId: number | null = null;
+    let claimedWantedIdx: number | undefined = undefined;
     try {
-      const tInfo = await transmission.addTorrent(magnetUri, DEFAULT_DOWNLOAD_DIR, false);
+      const tInfo = await transmission.addTorrent(
+        primarySourceUrl,
+        DEFAULT_DOWNLOAD_DIR,
+        false,
+        magnetUri || undefined,
+      );
       tId = tInfo.id;
 
       const metaStatus = await transmission.waitForMetadata(tId);
@@ -589,7 +599,8 @@ export class PipelineEngineService {
       // Guardrail 1: If a torrent is marked as a batch/range pack, it MUST have multiple files so we can extract 1 episode.
       // Never download a monolithic 1-file season pack!
       if (isMarkedBatch && !isMultiFile) {
-        await transmission.removeTorrent(tId, true).catch(() => {});
+        await transmission.releaseTorrentClaim(tId, undefined, true, false).catch(() => {});
+        tId = null;
         throw new TorrentEntryNotFoundException(
           `Batch torrent '${candidate.title}' is a single monolithic file (cannot selectively extract Ep ${episodeNumber}); skipping to next candidate`,
         );
@@ -603,33 +614,37 @@ export class PipelineEngineService {
       });
 
       if (!epMap.has(episodeNumber)) {
-        await transmission.removeTorrent(tId, true).catch(() => {});
+        await transmission.releaseTorrentClaim(tId, undefined, true, false).catch(() => {});
+        tId = null;
         throw new TorrentEntryNotFoundException(
           `Ep ${episodeNumber} could not be selectively isolated in torrent '${candidate.title}' (${tFiles.length} files)`,
         );
       }
 
       const [wantedIdx, relPath] = epMap.get(episodeNumber)!;
+      claimedWantedIdx = wantedIdx;
       const wantedFileBytes = Number(tFiles[wantedIdx]?.length || candidate.size || 0);
 
-      // Guardrail 2: If this is a multi-file batch torrent, immediately deselect ALL other files BEFORE downloading
-      if (isMultiFile) {
-        await transmission.selectOnlyFiles(tId, [wantedIdx], tFiles.length);
+      // Guardrail 2: Reject abnormally huge single files (> 8.5 GB) from batch torrents (allows up to 8.5 GB for BD Remux single episodes while blocking combined season files)
+      if ((isMarkedBatch || isMultiFile) && wantedFileBytes > 8.5 * 1024 * 1024 * 1024) {
+        await transmission.releaseTorrentClaim(tId, wantedIdx, true, false).catch(() => {});
+        tId = null;
+        throw new TorrentEntryNotFoundException(
+          `Matched file in batch '${candidate.title}' is ${(wantedFileBytes / (1024 * 1024 * 1024)).toFixed(2)} GB (exceeds 8.5 GB single-episode safety threshold)`,
+        );
       }
 
-      // Guardrail 3: Reject abnormally huge single files (> 4.5 GB) from batch torrents
-      if ((isMarkedBatch || isMultiFile) && wantedFileBytes > 4.5 * 1024 * 1024 * 1024) {
-        await transmission.removeTorrent(tId, true).catch(() => {});
-        throw new TorrentEntryNotFoundException(
-          `Matched file in batch '${candidate.title}' is ${(wantedFileBytes / (1024 * 1024 * 1024)).toFixed(2)} GB (exceeds single-episode safety threshold)`,
-        );
+      // Guardrail 3: If this is a multi-file batch torrent, register our wantedIdx in the shared active set and exclude unclaimed batch files
+      if (isMultiFile) {
+        await transmission.selectOnlyFiles(tId, [wantedIdx], tFiles.length);
       }
 
       // Gate 2: Verify exact wanted episode file size against 56 GB cap before data transfer completes
       if (enforceHardCapBeforeStart && wantedFileBytes > 0) {
         const capNow = await this.checkStorageCapacityForDownload(jobId);
         if (capNow.usedBytes > 0 && capNow.usedBytes + wantedFileBytes > KIRA_MAX_STAGING_BYTES) {
-          await transmission.removeTorrent(tId, true).catch(() => {});
+          await transmission.releaseTorrentClaim(tId, wantedIdx, true, false).catch(() => {});
+          tId = null;
           const usedGb = (capNow.usedBytes / (1024 * 1024 * 1024)).toFixed(2);
           const fileGb = (wantedFileBytes / (1024 * 1024 * 1024)).toFixed(2);
           const maxGb = (KIRA_MAX_STAGING_BYTES / (1024 * 1024 * 1024)).toFixed(1);
@@ -642,7 +657,7 @@ export class PipelineEngineService {
       }
 
       const fullPath = path.join(dlDir, relPath);
-      await transmission.startTorrent(tId);
+      await transmission.startTorrentNow(tId);
       await transmission.waitForCompletion(tId, {
         wantedFileIndex: wantedIdx,
         expectedDiskPath: fullPath,
@@ -664,19 +679,20 @@ export class PipelineEngineService {
       }
 
       const sizeBytes = fs.statSync(stagedPath).size;
-      await transmission.removeTorrent(tId, !tInfo.isDuplicate).catch(() => {});
+      await transmission.releaseTorrentClaim(tId, wantedIdx, true, true).catch(() => {});
+      tId = null;
 
       return {
         ok: true,
         stagedPath,
         sizeBytes,
-        magnetUri,
+        magnetUri: magnetUri || primarySourceUrl,
         isBatchExtracted: isMultiFile || isMarkedBatch,
         fileIndex: wantedIdx,
       };
     } catch (err: any) {
       if (tId) {
-        await transmission.removeTorrent(tId, true).catch(() => {});
+        await transmission.releaseTorrentClaim(tId, claimedWantedIdx, true, false).catch(() => {});
       }
       return { ok: false, reason: err?.message || String(err) };
     }
