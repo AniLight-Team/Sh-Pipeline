@@ -35,6 +35,7 @@ import {
   loadAccountsFromEnv,
 } from "../config.js";
 import { notifyMainBackendRevalidate } from "../utils/notifier.js";
+import { inngest } from "../inngest/client.js";
 import type {
   AnimeToshoItem,
   CandidateSelectionTier,
@@ -63,6 +64,17 @@ export const stage1DiscoveryQueue = new PQueue({ concurrency: KIRA_DISCOVERY_CON
 
 export class PipelineEngineService {
   public static readonly stage1DiscoveryQueue = stage1DiscoveryQueue;
+  private static readonly activeVmRemuxJobIds = new Set<number>();
+  private static readonly activeExecutingBatchIds = new Set<number>();
+  private static isDrainingVmRemux = false;
+
+  public static isBatchCurrentlyExecutingInProcess(batchId: number): boolean {
+    return this.activeExecutingBatchIds.has(batchId);
+  }
+
+  public static getActiveVmRemuxCount(): number {
+    return this.activeVmRemuxJobIds.size;
+  }
 
   public static markWatchdogRun(): void {
     lastWatchdogTimestamp = new Date().toISOString();
@@ -731,11 +743,26 @@ export class PipelineEngineService {
     }
 
     if (job.status === "completed" || job.status === "encoding") {
-      return { status: "staged", jobId, sizeBytes: job.sizeBytes || 0 };
+      return {
+        status: "staged",
+        jobId,
+        pipelineType: this.isJobVmRemux(job) ? "vm_remux" : "kaggle_gpu",
+        sizeBytes: job.sizeBytes || 0,
+      };
     }
 
     if (job.status === "staged" && this.hasValidStagedFiles(job)) {
-      return { status: "staged", jobId, sizeBytes: job.sizeBytes || 0 };
+      if (this.isJobVmRemux(job)) {
+        setImmediate(() => {
+          this.drainVmRemuxQueue().catch(() => {});
+        });
+      }
+      return {
+        status: "staged",
+        jobId,
+        pipelineType: this.isJobVmRemux(job) ? "vm_remux" : "kaggle_gpu",
+        sizeBytes: job.sizeBytes || 0,
+      };
     }
 
     // Gate 1: Strict 56 GB Staging Limit Check BEFORE transitioning job to "downloading"
@@ -755,6 +782,7 @@ export class PipelineEngineService {
         })
         .where(eq(schema.pipelineJob.id, jobId));
 
+      await this.drainVmRemuxQueue().catch(() => {});
       await this.sealAvailableBatches({
         forceFlush: true,
         triggerReason: "storage_limit_56gb",
@@ -1281,6 +1309,13 @@ export class PipelineEngineService {
         `Job #${job.id} staged on SSD [pipeline=${processingMode.toUpperCase()} | tier=${effectiveSelectionTier} | group=${selectedBundle.group} | qualities=${stagedQualityList.join("/")} (${stagedQualityList.length})]: ${(totalJobBytes / (1024 * 1024)).toFixed(1)} MB`,
       );
 
+      // If Pipeline 1 (vm_remux), immediately pass into the 2-slot VM Remux queue (no batching!)
+      if (processingMode === "vm_remux") {
+        setImmediate(() => {
+          this.drainVmRemuxQueue().catch(() => {});
+        });
+      }
+
       return {
         status: "staged",
         jobId,
@@ -1379,9 +1414,9 @@ export class PipelineEngineService {
   }
 
   /**
-   * Determines whether the current staged window should be sealed into a batch.
-   * - Pipeline 1 (`stagedRemuxCount > 0`): Always ready to seal immediately into a dedicated VM Direct-Remux batch.
-   * - Pipeline 2 (`stagedGpuCount > 0`): Seals when 10 files / 10 GB / 30m window / queue-drain / 56 GB pressure is reached.
+   * Determines whether the current staged GPU window should be sealed into a Kaggle GPU batch.
+   * - Pipeline 1 (`vm_remux`): Runs continuously 2-at-a-time on the VM with ZERO batching via `drainVmRemuxQueue()`.
+   * - Pipeline 2 (`kaggle_gpu`): Seals when 10 files / 10 GB / 30m window / 90s GPU idle settle / queue-drain / 56 GB pressure is reached.
    */
   public static async evaluateBatchSealReadiness(forceFlush = false): Promise<{
     shouldSeal: boolean;
@@ -1389,26 +1424,29 @@ export class PipelineEngineService {
     stats: Awaited<ReturnType<typeof PipelineEngineService.getStagedWindowStats>>;
   }> {
     const stats = await this.getStagedWindowStats();
-    if (stats.stagedCount === 0) {
-      return { shouldSeal: false, reason: "no_staged_jobs", stats };
+
+    // Always ensure Pipeline 1 (2-at-a-time VM Remux) is draining any staged H.264 jobs immediately
+    if (stats.stagedRemuxCount > 0) {
+      setImmediate(() => {
+        this.drainVmRemuxQueue().catch(() => {});
+      });
+    }
+
+    if (stats.stagedGpuCount === 0) {
+      return { shouldSeal: false, reason: "no_staged_gpu_jobs", stats };
     }
 
     if (forceFlush) {
       return { shouldSeal: true, reason: "manual_flush", stats };
     }
 
-    // 1. Pipeline 1: Any H.264 VM direct-remux job seals immediately into a VM Remux batch
-    if (stats.stagedRemuxCount > 0) {
-      return { shouldSeal: true, reason: "vm_remux_ready", stats };
-    }
-
-    // 2. If total staging disk usage is >= 85% of the 56 GB limit, flush GPU batches immediately to free SSD space
+    // 1. If total staging disk usage is >= 80% of the 56 GB limit, flush GPU batches immediately to free SSD space
     const diskBytes = Math.max(stats.totalBytes, this.getActualStagingDiskBytes());
-    if (diskBytes >= KIRA_MAX_STAGING_BYTES * 0.85) {
+    if (diskBytes >= KIRA_MAX_STAGING_BYTES * 0.8) {
       return { shouldSeal: true, reason: "storage_pressure_56gb", stats };
     }
 
-    // 3. Pipeline 2: Kaggle GPU batch triggers
+    // 2. Pipeline 2: Kaggle GPU batch triggers
     if (stats.stagedGpuCount >= KIRA_BATCH_MAX_ITEMS) {
       return { shouldSeal: true, reason: "file_limit_10", stats };
     }
@@ -1429,142 +1467,157 @@ export class PipelineEngineService {
       return { shouldSeal: true, reason: "queue_drained", stats };
     }
 
+    // 3. Anti-stall GPU idle settle: if no new HEVC/AV1 episode has arrived in >= 90s, seal and dispatch to available GPU slot
+    if (
+      stats.newestGpuStagedAt &&
+      Date.now() - stats.newestGpuStagedAt.getTime() >= 90_000
+    ) {
+      return { shouldSeal: true, reason: "gpu_idle_settle_90s", stats };
+    }
+
     return { shouldSeal: false, reason: "waiting_for_window_or_downloads", stats };
   }
 
   /**
-   * Pipeline 1 Batch Sealer:
-   * Atomically seals a separate VM Direct-Remux batch (`pipelineType = "vm_remux"`, `kaggleUsername = "local-vm"`)
-   * for staged H.264 jobs (both `h264_multi` and `h264_single_1080p`).
+   * Pipeline 1 Direct 2-Slot Queue Drainer (NO Batching!):
+   * Pulls staged `vm_remux` jobs one-by-one into `vmRemuxQueue` (`concurrency = 2`).
+   * As soon as 1 of the 2 VM remux jobs completes, the next staged `vm_remux` job immediately enters the slot.
    */
-  public static async sealVmRemuxBatch(options: {
-    triggerReason?: string;
-  } = {}): Promise<{
-    batchId: number | null;
-    jobCount: number;
-    totalBytes: number;
-  }> {
-    await this.ensureTables();
+  public static async drainVmRemuxQueue(): Promise<number[]> {
+    if (this.isDrainingVmRemux) return [];
+    this.isDrainingVmRemux = true;
+    const startedJobIds: number[] = [];
 
-    return await db.transaction(async (tx) => {
-      const lockRes = await tx.execute(sql`SELECT pg_try_advisory_xact_lock(405002) AS locked`);
-      const isLocked = Boolean((lockRes[0] as any)?.locked);
-      if (!isLocked) {
-        return { batchId: null, jobCount: 0, totalBytes: 0 };
-      }
+    try {
+      await this.ensureTables();
 
-      const activeBatches = await tx
-        .select({
-          id: schema.pipelineBatch.id,
-          pipelineType: schema.pipelineBatch.pipelineType,
-          kaggleUsername: schema.pipelineBatch.kaggleUsername,
-          triggerReason: schema.pipelineBatch.triggerReason,
-          status: schema.pipelineBatch.status,
-        })
-        .from(schema.pipelineBatch)
+      // 1. Recover any orphaned VM remux job stuck in 'encoding' with batchId IS NULL and stale heartbeat (> 3m)
+      const threeMinsAgo = new Date(Date.now() - 3 * 60 * 1000);
+      const encodingUnbatched = await db
+        .select()
+        .from(schema.pipelineJob)
         .where(
-          inArray(schema.pipelineBatch.status, [
-            "created",
-            "uploading",
-            "waiting_dataset",
-            "kernel_running",
-          ]),
+          and(
+            eq(schema.pipelineJob.status, "encoding"),
+            isNull(schema.pipelineJob.batchId),
+          ),
         );
 
-      const activeVmBatches = activeBatches.filter((b) => this.isBatchVmRemux(b));
-
-      if (activeVmBatches.length >= KIRA_VM_MAX_CONCURRENT_BATCHES) {
-        return { batchId: null, jobCount: 0, totalBytes: 0 };
+      for (const sj of encodingUnbatched) {
+        if (
+          this.isJobVmRemux(sj) &&
+          !this.activeVmRemuxJobIds.has(sj.id) &&
+          (!sj.heartbeatAt || sj.heartbeatAt < threeMinsAgo)
+        ) {
+          if (this.hasValidStagedFiles(sj)) {
+            log.warn(
+              "PipelineEngine",
+              `[Pipeline 1: VM Remux] Recovering interrupted Job #${sj.id} back to 'staged' queue...`,
+            );
+            await db
+              .update(schema.pipelineJob)
+              .set({
+                status: "staged",
+                heartbeatAt: new Date(),
+                updatedAt: new Date(),
+              })
+              .where(eq(schema.pipelineJob.id, sj.id));
+          } else {
+            await db
+              .update(schema.pipelineJob)
+              .set({
+                status: "queued",
+                stagedFilePath: null,
+                heartbeatAt: new Date(),
+                updatedAt: new Date(),
+              })
+              .where(eq(schema.pipelineJob.id, sj.id));
+          }
+        }
       }
 
-      const allStagedJobs = await tx
+      if (this.activeVmRemuxJobIds.size >= KIRA_VM_MAX_CONCURRENT_BATCHES) {
+        return [];
+      }
+
+      // 2. Fetch staged unbatched jobs in FIFO order
+      const allStagedJobs = await db
         .select()
         .from(schema.pipelineJob)
         .where(and(eq(schema.pipelineJob.status, "staged"), isNull(schema.pipelineJob.batchId)))
-        .orderBy(asc(schema.pipelineJob.stagedAt));
+        .orderBy(asc(schema.pipelineJob.stagedAt), asc(schema.pipelineJob.id));
 
-      const remuxCandidates = allStagedJobs.filter((j) => this.isJobVmRemux(j));
-      if (remuxCandidates.length === 0) {
-        return { batchId: null, jobCount: 0, totalBytes: 0 };
-      }
-
-      const validRemuxJobs: typeof remuxCandidates = [];
-      for (const j of remuxCandidates) {
-        if (this.hasValidStagedFiles(j)) {
-          validRemuxJobs.push(j);
-        } else {
-          log.warn("PipelineEngine", `Staged file missing for VM Remux Job #${j.id}; re-queuing job.`);
-          await tx
-            .update(schema.pipelineJob)
-            .set({ status: "queued", stagedFilePath: null, batchId: null, updatedAt: new Date() })
-            .where(eq(schema.pipelineJob.id, j.id));
-        }
-      }
-
-      if (validRemuxJobs.length === 0) {
-        return { batchId: null, jobCount: 0, totalBytes: 0 };
-      }
-
-      const packedJobs: typeof validRemuxJobs = [];
-      let accBytes = 0;
-
-      for (const job of validRemuxJobs) {
-        const sz = Number(job.sizeBytes || 0);
-        if (
-          (accBytes + sz > KIRA_VM_BATCH_SAFE_MAX_BYTES || packedJobs.length >= KIRA_VM_BATCH_MAX_ITEMS) &&
-          packedJobs.length > 0
-        ) {
-          break;
-        }
-        packedJobs.push(job);
-        accBytes += sz;
-      }
-
-      if (packedJobs.length === 0) {
-        return { batchId: null, jobCount: 0, totalBytes: 0 };
-      }
-
-      const rawReason = options.triggerReason || "vm_remux";
-      const effectiveReason = rawReason.startsWith("vm_remux") ? rawReason : `vm_remux_${rawReason}`;
-
-      const [batch] = await tx
-        .insert(schema.pipelineBatch)
-        .values({
-          pipelineType: "vm_remux",
-          status: "created",
-          triggerReason: effectiveReason,
-          kaggleUsername: "local-vm",
-          datasetSlug: "vm-direct-remux",
-          kernelSlug: "ffmpeg-copy-remux",
-          jobCount: packedJobs.length,
-          totalBytes: accBytes,
-          heartbeatAt: new Date(),
-        })
-        .returning();
-
-      const jobIds = packedJobs.map((j) => j.id);
-      await tx
-        .update(schema.pipelineJob)
-        .set({
-          batchId: batch.id,
-          pipelineType: "vm_remux",
-          status: "encoding",
-          heartbeatAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .where(inArray(schema.pipelineJob.id, jobIds));
-
-      log.success(
-        "PipelineEngine",
-        `[Pipeline 1: VM Remux] Sealed Batch #${batch.id} [${effectiveReason}] -> @local-vm (Slot ${activeVmBatches.length + 1}/${KIRA_VM_MAX_CONCURRENT_BATCHES}): ${packedJobs.length} H.264 job(s), ${(accBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`,
+      const remuxCandidates = allStagedJobs.filter(
+        (j) => this.isJobVmRemux(j) && !this.activeVmRemuxJobIds.has(j.id),
       );
 
-      return {
-        batchId: batch.id,
-        jobCount: packedJobs.length,
-        totalBytes: accBytes,
-      };
-    });
+      for (const job of remuxCandidates) {
+        if (this.activeVmRemuxJobIds.size >= KIRA_VM_MAX_CONCURRENT_BATCHES) {
+          break;
+        }
+
+        if (!this.hasValidStagedFiles(job)) {
+          log.warn("PipelineEngine", `Staged file missing for VM Remux Job #${job.id}; re-queuing job.`);
+          await db
+            .update(schema.pipelineJob)
+            .set({ status: "queued", stagedFilePath: null, batchId: null, updatedAt: new Date() })
+            .where(eq(schema.pipelineJob.id, job.id));
+          continue;
+        }
+
+        this.activeVmRemuxJobIds.add(job.id);
+        startedJobIds.push(job.id);
+
+        await db
+          .update(schema.pipelineJob)
+          .set({
+            status: "encoding",
+            pipelineType: "vm_remux",
+            batchId: null,
+            heartbeatAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.pipelineJob.id, job.id));
+
+        const slotIndex = this.activeVmRemuxJobIds.size;
+        log.success(
+          "PipelineEngine",
+          `[Pipeline 1: VM Remux] Passing Job #${job.id} (Ep ${job.episodeNumber} | ${job.selectionTier || "h264"} | ${job.qualityCount || 1}Q) directly into VM Slot ${slotIndex}/${KIRA_VM_MAX_CONCURRENT_BATCHES} (zero batching)...`,
+        );
+
+        vmRemuxQueue
+          .add(async () => {
+            await this.executeVmRemuxJob(job.id);
+          })
+          .catch((err) => {
+            log.error("PipelineEngine", `VM Remux worker error for Job #${job.id}: ${err?.message || err}`);
+          });
+      }
+    } catch (err: any) {
+      log.warn("PipelineEngine", `drainVmRemuxQueue warning: ${err?.message || err}`);
+    } finally {
+      this.isDrainingVmRemux = false;
+    }
+
+    return startedJobIds;
+  }
+
+  /**
+   * Backward-compatible wrapper: instead of creating a batch for Pipeline 1, drains the 2-slot VM Remux queue directly.
+   */
+  public static async sealVmRemuxBatch(_options: {
+    triggerReason?: string;
+  } = {}): Promise<{
+    batchId: null;
+    jobCount: number;
+    totalBytes: number;
+  }> {
+    const startedIds = await this.drainVmRemuxQueue();
+    return {
+      batchId: null,
+      jobCount: startedIds.length,
+      totalBytes: 0,
+    };
   }
 
   /**
@@ -1741,24 +1794,17 @@ export class PipelineEngineService {
   }
 
   /**
-   * Seals both independent pipelines:
-   * - Pipeline 1: VM Direct-Remux batches (for H.264 multi-quality or single 1080p releases)
-   * - Pipeline 2: Kaggle GPU batches (for HEVC/AV1 releases)
+   * Triggers Pipeline 1 (continuous 2-at-a-time VM Direct-Remux queue) AND seals eligible Pipeline 2 (Kaggle GPU) batches.
    */
   public static async sealAvailableBatches(options: {
     forceFlush?: boolean;
     triggerReason?: string;
   } = {}): Promise<number[]> {
-    const sealedBatchIds: number[] = [];
-
-    // 1. Seal Pipeline 1 (VM Direct-Remux) batches
-    while (true) {
-      const vmRes = await this.sealVmRemuxBatch({ triggerReason: options.triggerReason });
-      if (!vmRes.batchId) break;
-      sealedBatchIds.push(vmRes.batchId);
-    }
+    // 1. Drain Pipeline 1 (VM Direct-Remux) 2-slot worker queue immediately (no batching!)
+    await this.drainVmRemuxQueue();
 
     // 2. Seal Pipeline 2 (Kaggle GPU) batches
+    const sealedBatchIds: number[] = [];
     while (true) {
       const gpuRes = await this.sealStagedBatch(options);
       if (!gpuRes.batchId) break;
@@ -1886,11 +1932,200 @@ export class PipelineEngineService {
   }
 
   /**
-   * Pipeline 1 Executor:
-   * Executes a VM Direct-Remux batch locally on the VM under `vmRemuxQueue`.
-   * Converts container to .mp4 with `-c:v copy` (zero video re-encoding) for either:
-   * - Tier 1 (`h264_multi`): 1080p + 720p + 480p from the same release group
-   * - Tier 2 (`h264_single_1080p`): 1080p only (1 quality) when no group had lower qualities
+   * Pipeline 1 Single-Job Executor (2-At-A-Time Streaming Worker — NO Batching!):
+   * Remuxes a single H.264 job (`h264_multi` 1080p/720p/480p or `h264_single_1080p`) on the VM with `-c:v copy`,
+   * uploads to Hugging Face, delivers the Main Backend callback, deletes local staged files,
+   * and immediately pulls the next staged `vm_remux` job into the freed slot.
+   */
+  public static async executeVmRemuxJob(jobId: number): Promise<void> {
+    await this.ensureTables();
+
+    const heartbeatTimer = setInterval(() => {
+      db.update(schema.pipelineJob)
+        .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+        .where(eq(schema.pipelineJob.id, jobId))
+        .catch(() => {});
+    }, 20_000);
+
+    try {
+      const job = await db.query.pipelineJob.findFirst({
+        where: eq(schema.pipelineJob.id, jobId),
+      });
+      if (!job || job.status === "completed") {
+        return;
+      }
+
+      const videoManager = new VideoEncodingManager();
+
+      try {
+        const stagedQualitiesMap = (job.stagedQualities ||
+          job.metadata?.stagedQualities ||
+          {}) as Partial<Record<VideoResolutionQuality, string>>;
+        const qualityFiles: Partial<Record<VideoResolutionQuality, string>> = {};
+
+        const allowedQualities: VideoResolutionQuality[] =
+          job.selectionTier === "h264_single_1080p"
+            ? ["1080p"]
+            : (["1080p", "720p", "480p"] as VideoResolutionQuality[]);
+
+        for (const q of allowedQualities) {
+          const p = stagedQualitiesMap[q];
+          if (p && fs.existsSync(p)) {
+            qualityFiles[q] = p;
+          }
+        }
+        if (Object.keys(qualityFiles).length === 0 && job.stagedFilePath && fs.existsSync(job.stagedFilePath)) {
+          qualityFiles["1080p"] = job.stagedFilePath;
+        }
+
+        if (Object.keys(qualityFiles).length === 0) {
+          throw new Error(`No staged video files found on disk for Job #${job.id}`);
+        }
+
+        let tracks: [string, number][] = [];
+        if (Array.isArray(job.tracksConfig) && job.tracksConfig.length > 0) {
+          tracks = (job.tracksConfig as [string, number][]).filter(
+            (t) => Array.isArray(t) && (t[0] === "sub" || t[0] === "dub"),
+          );
+        }
+        if (tracks.length === 0) {
+          tracks = job.types.includes("dub") && !job.types.includes("sub") ? [["dub", 0]] : [["sub", 0]];
+        }
+
+        const hfAccount = videoManager.getNextHfAccount();
+        const animeId = job.animeId || job.anilistId || job.anidbId || job.id;
+
+        const records = await videoManager.remuxAndUploadJobOnVm({
+          jobId: job.id,
+          animeId,
+          episodeNumber: job.episodeNumber,
+          stagedQualities: qualityFiles,
+          tracks,
+          hf: hfAccount,
+          workBaseDir: getKiraStagingDir(),
+          onProgress: async () => {
+            const hb = new Date();
+            await db
+              .update(schema.pipelineJob)
+              .set({ heartbeatAt: hb, updatedAt: hb })
+              .where(eq(schema.pipelineJob.id, job.id));
+          },
+        });
+
+        await this.persistAndDeliverJobCompletion(job, records);
+
+        log.success(
+          "PipelineEngine",
+          `[Pipeline 1: VM Remux] Job #${job.id} (Ep ${job.episodeNumber}) finished! Passing next staged job into VM slot...`,
+        );
+      } catch (jobErr: any) {
+        const lastJobErr = jobErr?.message || String(jobErr);
+        log.error(
+          "PipelineEngine",
+          `[Pipeline 1: VM Remux] Job #${job.id} failed: ${lastJobErr}`,
+        );
+
+        const canReStage = job.attempt < MAX_JOB_ATTEMPTS && this.hasValidStagedFiles(job);
+        if (canReStage) {
+          await db
+            .update(schema.pipelineJob)
+            .set({
+              status: "staged",
+              batchId: null,
+              attempt: job.attempt + 1,
+              lastError: lastJobErr,
+              heartbeatAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.pipelineJob.id, job.id));
+        } else {
+          await db
+            .update(schema.pipelineJob)
+            .set({
+              status: "failed",
+              lastError: lastJobErr,
+              heartbeatAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.pipelineJob.id, job.id));
+        }
+      }
+    } finally {
+      clearInterval(heartbeatTimer);
+      this.activeVmRemuxJobIds.delete(jobId);
+      // Immediately pass the next waiting VM remux job into the freed slot and wake up any downloads waiting on the 56 GB cap!
+      setImmediate(() => {
+        this.drainVmRemuxQueue().catch(() => {});
+        this.onStagingSpaceFreed().catch(() => {});
+      });
+    }
+  }
+
+  /**
+   * Called whenever a job or batch deletes its staged files from SSD.
+   * Immediately drains next VM Remux jobs, seals any ready GPU batches, and wakes up downloads paused by the 56 GB limit.
+   */
+  public static async onStagingSpaceFreed(): Promise<void> {
+    try {
+      await this.drainVmRemuxQueue();
+
+      const readiness = await this.evaluateBatchSealReadiness(false);
+      if (readiness.shouldSeal) {
+        const sealedIds = await this.sealAvailableBatches({
+          forceFlush: false,
+          triggerReason: readiness.reason,
+        });
+        for (const bId of sealedIds) {
+          await inngest
+            .send({
+              name: "pipeline/batch.execute",
+              id: `pipeline-batch-${bId}-freed-${Date.now()}`,
+              data: { batchId: bId },
+            })
+            .catch(() => {
+              this.executeBatch(bId).catch(() => {});
+            });
+        }
+      }
+
+      const cap = await this.checkStorageCapacityForDownload();
+      if (cap.allowed) {
+        const queuedRows = await db
+          .select()
+          .from(schema.pipelineJob)
+          .where(eq(schema.pipelineJob.status, "queued"))
+          .orderBy(asc(schema.pipelineJob.id))
+          .limit(KIRA_DISCOVERY_CONCURRENCY);
+
+        for (const qJob of queuedRows) {
+          await inngest
+            .send({
+              name: "pipeline/job.discover",
+              id: `pipe-job-${qJob.id}-freed-${Date.now()}`,
+              data: {
+                jobId: qJob.id,
+                anilistId: qJob.anilistId,
+                animeId: qJob.animeId,
+                anidbId: qJob.anidbId,
+                episodeNumber: qJob.episodeNumber,
+                types: qJob.types,
+                knownTitles: qJob.knownTitles || [],
+              },
+            })
+            .catch(() => {
+              this.stage1DiscoveryQueue
+                .add(async () => {
+                  await this.discoverAndStageJob(qJob.id).catch(() => {});
+                })
+                .catch(() => {});
+            });
+        }
+      }
+    } catch {}
+  }
+
+  /**
+   * Legacy Pipeline 1 Batch Executor (retained for backward-compatibility with any pre-existing vm_remux batch records).
    */
   public static async executeVmRemuxBatch(batchId: number): Promise<void> {
     await this.ensureTables();
@@ -2167,6 +2402,40 @@ export class PipelineEngineService {
     return assigned || kaggleAccounts[0];
   }
 
+  private static async selectAlternateKaggleAccount(excludeUsername: string) {
+    const { kaggleAccounts } = loadAccountsFromEnv();
+    const candidates = kaggleAccounts.filter((a) => a.username !== excludeUsername);
+    if (candidates.length === 0) return null;
+
+    try {
+      const activeBatches = await db
+        .select({ kaggleUsername: schema.pipelineBatch.kaggleUsername })
+        .from(schema.pipelineBatch)
+        .where(
+          inArray(schema.pipelineBatch.status, [
+            "created",
+            "uploading",
+            "waiting_dataset",
+            "kernel_running",
+          ]),
+        );
+      const usageMap: Record<string, number> = {};
+      for (const b of activeBatches) {
+        if (b.kaggleUsername) {
+          usageMap[b.kaggleUsername] = (usageMap[b.kaggleUsername] || 0) + 1;
+        }
+      }
+      candidates.sort(
+        (a, b) => (usageMap[a.username] || 0) - (usageMap[b.username] || 0),
+      );
+      if ((usageMap[candidates[0].username] || 0) < KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT) {
+        return candidates[0];
+      }
+    } catch {}
+
+    return candidates[0];
+  }
+
   public static async prepareAndUploadBatchDataset(batchId: number): Promise<{
     skipped: boolean;
     empty: boolean;
@@ -2175,209 +2444,314 @@ export class PipelineEngineService {
     kaggleUsername: string;
   }> {
     await this.ensureTables();
+    this.activeExecutingBatchIds.add(batchId);
 
-    const batch = await db.query.pipelineBatch.findFirst({
-      where: eq(schema.pipelineBatch.id, batchId),
-    });
-    if (!batch) {
-      throw new Error(`Batch #${batchId} not found`);
-    }
+    try {
+      const batch = await db.query.pipelineBatch.findFirst({
+        where: eq(schema.pipelineBatch.id, batchId),
+      });
+      if (!batch) {
+        throw new Error(`Batch #${batchId} not found`);
+      }
 
-    const account = this.resolveBatchKaggleAccount(batch.kaggleUsername);
-    const datasetSlug = batch.datasetSlug || `kira-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
-    const kernelSlug = batch.kernelSlug || `enc-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
+      let account = this.resolveBatchKaggleAccount(batch.kaggleUsername);
+      const datasetSlug = batch.datasetSlug || `kira-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
+      const kernelSlug = batch.kernelSlug || `enc-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
 
-    if (batch.status === "completed") {
+      if (batch.status === "completed") {
+        return {
+          skipped: true,
+          empty: false,
+          datasetSlug,
+          kernelSlug,
+          kaggleUsername: account.username,
+        };
+      }
+
+      const videoManager = new VideoEncodingManager();
+
+      if (
+        (batch.status === "waiting_dataset" || batch.status === "kernel_running") &&
+        batch.datasetSlug
+      ) {
+        const dsStatus = await videoManager.checkDatasetStatusOnce(
+          batch.datasetSlug,
+          account.username,
+          account.key,
+        );
+        if (dsStatus.state === "ready" || batch.status === "kernel_running") {
+          log.info(
+            "PipelineEngine",
+            `Batch #${batchId} resuming existing dataset '${account.username}/${batch.datasetSlug}' (status=${batch.status})`,
+          );
+          return {
+            skipped: true,
+            empty: false,
+            datasetSlug: batch.datasetSlug,
+            kernelSlug,
+            kaggleUsername: account.username,
+          };
+        }
+      }
+
+      const { uploadItems } = await this.buildBatchItems(batchId, videoManager);
+      if (uploadItems.length === 0) {
+        await db
+          .update(schema.pipelineBatch)
+          .set({ status: "completed", completedAt: new Date(), updatedAt: new Date() })
+          .where(eq(schema.pipelineBatch.id, batchId));
+        return {
+          skipped: true,
+          empty: true,
+          datasetSlug,
+          kernelSlug,
+          kaggleUsername: account.username,
+        };
+      }
+
+      await db
+        .update(schema.pipelineBatch)
+        .set({
+          pipelineType: "kaggle_gpu",
+          status: "uploading",
+          kaggleUsername: account.username,
+          datasetSlug,
+          kernelSlug,
+          startedAt: batch.startedAt || new Date(),
+          heartbeatAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.pipelineBatch.id, batchId));
+
+      log.info(
+        "PipelineEngine",
+        `[Pipeline 2: Kaggle GPU] Batch #${batchId}: Uploading ${uploadItems.length} staged MKV(s) to Kaggle Dataset '${account.username}/${datasetSlug}'...`,
+      );
+
+      try {
+        await videoManager.uploadBatchDatasetRest(
+          uploadItems,
+          datasetSlug,
+          account.username,
+          account.key,
+          async () => {
+            await db
+              .update(schema.pipelineBatch)
+              .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+              .where(eq(schema.pipelineBatch.id, batchId));
+          },
+        );
+      } catch (uploadErr: any) {
+        const altAccount = await this.selectAlternateKaggleAccount(account.username);
+        if (!altAccount) {
+          throw uploadErr;
+        }
+        log.warn(
+          "PipelineEngine",
+          `Batch #${batchId}: Dataset upload failed on @${account.username} (${uploadErr?.message || uploadErr}). Rotating to alternate Kaggle account @${altAccount.username}...`,
+        );
+        account = altAccount;
+        await db
+          .update(schema.pipelineBatch)
+          .set({
+            kaggleUsername: account.username,
+            heartbeatAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.pipelineBatch.id, batchId));
+
+        await videoManager.uploadBatchDatasetRest(
+          uploadItems,
+          datasetSlug,
+          account.username,
+          account.key,
+          async () => {
+            await db
+              .update(schema.pipelineBatch)
+              .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+              .where(eq(schema.pipelineBatch.id, batchId));
+          },
+        );
+      }
+
+      await db
+        .update(schema.pipelineBatch)
+        .set({
+          status: "waiting_dataset",
+          kaggleUsername: account.username,
+          heartbeatAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.pipelineBatch.id, batchId));
+
       return {
-        skipped: true,
+        skipped: false,
         empty: false,
         datasetSlug,
         kernelSlug,
         kaggleUsername: account.username,
       };
+    } finally {
+      this.activeExecutingBatchIds.delete(batchId);
     }
-
-    const videoManager = new VideoEncodingManager();
-
-    if (
-      (batch.status === "waiting_dataset" || batch.status === "kernel_running") &&
-      batch.datasetSlug
-    ) {
-      const dsStatus = await videoManager.checkDatasetStatusOnce(
-        batch.datasetSlug,
-        account.username,
-        account.key,
-      );
-      if (dsStatus.state === "ready" || batch.status === "kernel_running") {
-        log.info(
-          "PipelineEngine",
-          `Batch #${batchId} resuming existing dataset '${account.username}/${batch.datasetSlug}' (status=${batch.status})`,
-        );
-        return {
-          skipped: true,
-          empty: false,
-          datasetSlug: batch.datasetSlug,
-          kernelSlug,
-          kaggleUsername: account.username,
-        };
-      }
-    }
-
-    const { uploadItems } = await this.buildBatchItems(batchId, videoManager);
-    if (uploadItems.length === 0) {
-      await db
-        .update(schema.pipelineBatch)
-        .set({ status: "completed", completedAt: new Date(), updatedAt: new Date() })
-        .where(eq(schema.pipelineBatch.id, batchId));
-      return {
-        skipped: true,
-        empty: true,
-        datasetSlug,
-        kernelSlug,
-        kaggleUsername: account.username,
-      };
-    }
-
-    await db
-      .update(schema.pipelineBatch)
-      .set({
-        pipelineType: "kaggle_gpu",
-        status: "uploading",
-        kaggleUsername: account.username,
-        datasetSlug,
-        kernelSlug,
-        startedAt: batch.startedAt || new Date(),
-        heartbeatAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.pipelineBatch.id, batchId));
-
-    log.info(
-      "PipelineEngine",
-      `[Pipeline 2: Kaggle GPU] Batch #${batchId}: Uploading ${uploadItems.length} staged MKV(s) to Kaggle Dataset '${account.username}/${datasetSlug}'...`,
-    );
-
-    await videoManager.uploadBatchDatasetRest(
-      uploadItems,
-      datasetSlug,
-      account.username,
-      account.key,
-      async () => {
-        await db
-          .update(schema.pipelineBatch)
-          .set({ heartbeatAt: new Date(), updatedAt: new Date() })
-          .where(eq(schema.pipelineBatch.id, batchId));
-      },
-    );
-
-    await db
-      .update(schema.pipelineBatch)
-      .set({
-        status: "waiting_dataset",
-        heartbeatAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.pipelineBatch.id, batchId));
-
-    return {
-      skipped: false,
-      empty: false,
-      datasetSlug,
-      kernelSlug,
-      kaggleUsername: account.username,
-    };
   }
 
   public static async waitBatchDatasetReady(batchId: number): Promise<void> {
     await this.ensureTables();
+    this.activeExecutingBatchIds.add(batchId);
 
-    const batch = await db.query.pipelineBatch.findFirst({
-      where: eq(schema.pipelineBatch.id, batchId),
-    });
-    if (!batch || batch.status === "completed" || batch.status === "kernel_running") {
-      return;
+    try {
+      const batch = await db.query.pipelineBatch.findFirst({
+        where: eq(schema.pipelineBatch.id, batchId),
+      });
+      if (!batch || batch.status === "completed" || batch.status === "kernel_running") {
+        return;
+      }
+
+      const account = this.resolveBatchKaggleAccount(batch.kaggleUsername);
+      const datasetSlug = batch.datasetSlug;
+      if (!datasetSlug) {
+        throw new Error(`Batch #${batchId} missing datasetSlug in waitBatchDatasetReady`);
+      }
+
+      const videoManager = new VideoEncodingManager();
+      await videoManager.waitForDatasetReady(
+        datasetSlug,
+        account.username,
+        account.key,
+        720,
+        async () => {
+          await db
+            .update(schema.pipelineBatch)
+            .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+            .where(eq(schema.pipelineBatch.id, batchId));
+        },
+      );
+    } finally {
+      this.activeExecutingBatchIds.delete(batchId);
     }
-
-    const account = this.resolveBatchKaggleAccount(batch.kaggleUsername);
-    const datasetSlug = batch.datasetSlug;
-    if (!datasetSlug) {
-      throw new Error(`Batch #${batchId} missing datasetSlug in waitBatchDatasetReady`);
-    }
-
-    const videoManager = new VideoEncodingManager();
-    await videoManager.waitForDatasetReady(
-      datasetSlug,
-      account.username,
-      account.key,
-      600,
-      async () => {
-        await db
-          .update(schema.pipelineBatch)
-          .set({ heartbeatAt: new Date(), updatedAt: new Date() })
-          .where(eq(schema.pipelineBatch.id, batchId));
-      },
-    );
   }
 
   public static async pushBatchKernel(batchId: number): Promise<void> {
     await this.ensureTables();
+    this.activeExecutingBatchIds.add(batchId);
 
-    const batch = await db.query.pipelineBatch.findFirst({
-      where: eq(schema.pipelineBatch.id, batchId),
-    });
-    if (!batch || batch.status === "completed") {
-      return;
-    }
-
-    const account = this.resolveBatchKaggleAccount(batch.kaggleUsername);
-    const datasetSlug = batch.datasetSlug;
-    const kernelSlug = batch.kernelSlug;
-    if (!datasetSlug || !kernelSlug) {
-      throw new Error(`Batch #${batchId} missing datasetSlug or kernelSlug`);
-    }
-
-    const videoManager = new VideoEncodingManager();
-
-    if (batch.status === "kernel_running") {
-      const existingStatus = await videoManager.checkKernelStatusOnce(
-        kernelSlug,
-        account.username,
-        account.key,
-      );
-      if (existingStatus.state === "running" || existingStatus.state === "completed") {
-        log.info(
-          "PipelineEngine",
-          `Batch #${batchId}: Re-attached to existing Kaggle kernel '${account.username}/${kernelSlug}' (state=${existingStatus.state})`,
-        );
-        await db
-          .update(schema.pipelineBatch)
-          .set({ heartbeatAt: new Date(), updatedAt: new Date() })
-          .where(eq(schema.pipelineBatch.id, batchId));
+    try {
+      const batch = await db.query.pipelineBatch.findFirst({
+        where: eq(schema.pipelineBatch.id, batchId),
+      });
+      if (!batch || batch.status === "completed") {
         return;
       }
+
+      let account = this.resolveBatchKaggleAccount(batch.kaggleUsername);
+      const datasetSlug = batch.datasetSlug;
+      const kernelSlug = batch.kernelSlug;
+      if (!datasetSlug || !kernelSlug) {
+        throw new Error(`Batch #${batchId} missing datasetSlug or kernelSlug`);
+      }
+
+      const videoManager = new VideoEncodingManager();
+
+      if (batch.status === "kernel_running") {
+        const existingStatus = await videoManager.checkKernelStatusOnce(
+          kernelSlug,
+          account.username,
+          account.key,
+        );
+        if (existingStatus.state === "running" || existingStatus.state === "completed") {
+          log.info(
+            "PipelineEngine",
+            `Batch #${batchId}: Re-attached to existing Kaggle kernel '${account.username}/${kernelSlug}' (state=${existingStatus.state})`,
+          );
+          await db
+            .update(schema.pipelineBatch)
+            .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+            .where(eq(schema.pipelineBatch.id, batchId));
+          return;
+        }
+      }
+
+      const { uploadItems, manifestItems } = await this.buildBatchItems(batchId, videoManager);
+      if (manifestItems.length === 0) {
+        throw new Error(`Batch #${batchId} has 0 valid manifest items to push`);
+      }
+
+      try {
+        await videoManager.pushBatchGpuKernel(
+          datasetSlug,
+          kernelSlug,
+          manifestItems,
+          account.username,
+          account.key,
+        );
+      } catch (pushErr: any) {
+        const altAccount = await this.selectAlternateKaggleAccount(account.username);
+        if (!altAccount || uploadItems.length === 0) {
+          throw pushErr;
+        }
+        log.warn(
+          "PipelineEngine",
+          `Batch #${batchId}: Kernel push failed on @${account.username} (${pushErr?.message || pushErr}). Rotating to alternate Kaggle account @${altAccount.username}...`,
+        );
+        account = altAccount;
+        await db
+          .update(schema.pipelineBatch)
+          .set({
+            kaggleUsername: account.username,
+            status: "uploading",
+            heartbeatAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.pipelineBatch.id, batchId));
+
+        await videoManager.uploadBatchDatasetRest(
+          uploadItems,
+          datasetSlug,
+          account.username,
+          account.key,
+          async () => {
+            await db
+              .update(schema.pipelineBatch)
+              .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+              .where(eq(schema.pipelineBatch.id, batchId));
+          },
+        );
+
+        await videoManager.waitForDatasetReady(
+          datasetSlug,
+          account.username,
+          account.key,
+          720,
+          async () => {
+            await db
+              .update(schema.pipelineBatch)
+              .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+              .where(eq(schema.pipelineBatch.id, batchId));
+          },
+        );
+
+        await videoManager.pushBatchGpuKernel(
+          datasetSlug,
+          kernelSlug,
+          manifestItems,
+          account.username,
+          account.key,
+        );
+      }
+
+      await db
+        .update(schema.pipelineBatch)
+        .set({
+          status: "kernel_running",
+          kaggleUsername: account.username,
+          heartbeatAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.pipelineBatch.id, batchId));
+    } finally {
+      this.activeExecutingBatchIds.delete(batchId);
     }
-
-    const { manifestItems } = await this.buildBatchItems(batchId, videoManager);
-    if (manifestItems.length === 0) {
-      throw new Error(`Batch #${batchId} has 0 valid manifest items to push`);
-    }
-
-    await videoManager.pushBatchGpuKernel(
-      datasetSlug,
-      kernelSlug,
-      manifestItems,
-      account.username,
-      account.key,
-    );
-
-    await db
-      .update(schema.pipelineBatch)
-      .set({
-        status: "kernel_running",
-        heartbeatAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.pipelineBatch.id, batchId));
   }
 
   public static async checkBatchKernelProgress(batchId: number): Promise<{
@@ -2670,11 +3044,14 @@ export class PipelineEngineService {
   }
 
   public static async executeBatch(batchId: number): Promise<void> {
+    if (this.activeExecutingBatchIds.has(batchId)) {
+      return;
+    }
     await this.ensureTables();
     const batch = await db.query.pipelineBatch.findFirst({
       where: eq(schema.pipelineBatch.id, batchId),
     });
-    if (!batch) return;
+    if (!batch || batch.status === "completed") return;
 
     if (this.isBatchVmRemux(batch)) {
       try {
@@ -2695,7 +3072,8 @@ export class PipelineEngineService {
 
       const kernelStartTime = Date.now();
       while (Date.now() - kernelStartTime < 6 * 3600 * 1000) {
-        await new Promise((r) => setTimeout(r, 45000));
+        // Gentle 75s kernel status polling interval to prevent Kaggle HTTP 429 rate limits
+        await new Promise((r) => setTimeout(r, 75_000));
         const progress = await this.checkBatchKernelProgress(batchId);
         if (progress.state === "completed") {
           await this.finalizeCompletedBatch(batchId);
@@ -2776,6 +3154,7 @@ export class PipelineEngineService {
     await this.ensureTables();
 
     let activeBatchRows: (typeof schema.pipelineBatch.$inferSelect)[] = [];
+    let activeUnbatchedVmJobs: (typeof schema.pipelineJob.$inferSelect)[] = [];
     let counts: { status: string; count: number }[] = [];
     let windowStats: {
       stagedCount: number;
@@ -2795,6 +3174,17 @@ export class PipelineEngineService {
         .from(schema.pipelineBatch)
         .where(inArray(schema.pipelineBatch.status, ["created", "uploading", "waiting_dataset", "kernel_running"]))
         .orderBy(asc(schema.pipelineBatch.id));
+
+      activeUnbatchedVmJobs = await db
+        .select()
+        .from(schema.pipelineJob)
+        .where(
+          and(
+            eq(schema.pipelineJob.status, "encoding"),
+            isNull(schema.pipelineJob.batchId),
+          ),
+        )
+        .orderBy(asc(schema.pipelineJob.id));
 
       counts = await db
         .select({
@@ -2828,7 +3218,32 @@ export class PipelineEngineService {
       };
     });
 
-    const vmActiveBatches = activeBatches.filter((b) => b.mode === "vm_remux");
+    // Include active 2-at-a-time VM Remux jobs (which run without batching) in live activeBatches telemetry
+    for (const vmJob of activeUnbatchedVmJobs) {
+      if (this.isJobVmRemux(vmJob)) {
+        activeBatches.push({
+          id: vmJob.id,
+          status: "kernel_running",
+          pipelineType: "vm_remux",
+          mode: "vm_remux",
+          kaggleUsername: "local-vm",
+          datasetSlug: vmJob.releaseGroup || "vm-direct-remux",
+          kernelSlug: `Job #${vmJob.id} • Ep ${vmJob.episodeNumber} (${vmJob.qualityCount || 1}Q -c:v copy)`,
+          jobCount: 1,
+          totalBytes: Number(vmJob.sizeBytes || 0),
+          elapsedSeconds: vmJob.stagedAt
+            ? Math.max(1, Math.floor((Date.now() - vmJob.stagedAt.getTime()) / 1000))
+            : 1,
+          heartbeatAt: vmJob.heartbeatAt.toISOString(),
+        });
+      }
+    }
+
+    const vmActiveCount = Math.max(
+      this.activeVmRemuxJobIds.size,
+      activeUnbatchedVmJobs.filter((j) => this.isJobVmRemux(j)).length,
+      activeBatches.filter((b) => b.mode === "vm_remux").length,
+    );
     const gpuActiveBatches = activeBatches.filter((b) => b.mode === "kaggle_gpu");
 
     const queueMap: Record<string, number> = {};
@@ -2863,7 +3278,7 @@ export class PipelineEngineService {
         max: maxConcurrentBatches,
         accountsCount: kaggleAccounts.length,
         maxPerAccount: KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT,
-        vmActive: vmActiveBatches.length,
+        vmActive: Math.min(KIRA_VM_MAX_CONCURRENT_BATCHES, vmActiveCount),
         vmMax: KIRA_VM_MAX_CONCURRENT_BATCHES,
         discoveryConcurrency: KIRA_DISCOVERY_CONCURRENCY,
       },

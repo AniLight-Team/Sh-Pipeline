@@ -444,3 +444,33 @@ test("Dead 0-seeder solo releases do not receive the +10000 solo priority bonus 
   // Because 701 has 0 seeders, seeded batch 702 (18 seeders) ranks ahead of dead 701
   assert.equal(bundles[0].primaryEntry.item.id, 702);
 });
+
+test("Pipeline 1 (vm_remux) 2-slot unbatched worker and Kaggle status normalization", async () => {
+  const { PipelineEngineService } = await import("./service.js");
+  const vm = new VideoEncodingManager();
+
+  // Verify Pipeline 1 (vm_remux) jobs are classified accurately vs Pipeline 2 (kaggle_gpu)
+  assert.equal(
+    PipelineEngineService.isJobVmRemux({
+      pipelineType: "vm_remux",
+      metadata: { processingMode: "vm_remux" },
+    }),
+    true,
+  );
+  assert.equal(
+    PipelineEngineService.isJobVmRemux({
+      pipelineType: "kaggle_gpu",
+      metadata: { processingMode: "kaggle_gpu" },
+    }),
+    false,
+  );
+
+  // Verify VM Remux 2-at-a-time concurrency limit is 2
+  assert.equal(KIRA_VM_MAX_CONCURRENT_BATCHES, 2);
+  assert.equal(PipelineEngineService.getActiveVmRemuxCount(), 0);
+
+  // Verify Kaggle status extraction handles nested objects and dotted enum strings
+  assert.equal(vm.extractCleanStatus({ status: "KernelWorkerStatus.COMPLETE" }), "complete");
+  assert.equal(vm.extractCleanStatus({ state: "DatasetStatus.READY" }), "ready");
+});
+

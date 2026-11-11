@@ -53,6 +53,34 @@ export class VideoEncodingManager {
     return Boolean(key && key.trim().toUpperCase().startsWith("KGAT_"));
   }
 
+  private static kagglePacerChain: Promise<void> = Promise.resolve();
+  private static lastKaggleRequestAt = 0;
+  private static kaggleRateLimitCooldownUntil = 0;
+  private static readonly MIN_KAGGLE_REQUEST_INTERVAL_MS = 1800;
+
+  /**
+   * Serializes and paces all Kaggle REST API requests across the entire process
+   * and pauses requests globally whenever any endpoint receives HTTP 429 Too Many Requests.
+   */
+  private static async acquireKaggleRequestSlot(): Promise<void> {
+    const next = VideoEncodingManager.kagglePacerChain.then(async () => {
+      const now = Date.now();
+      if (now < VideoEncodingManager.kaggleRateLimitCooldownUntil) {
+        const cooldownWait = VideoEncodingManager.kaggleRateLimitCooldownUntil - now;
+        await new Promise((r) => setTimeout(r, cooldownWait));
+      }
+      const elapsed = Date.now() - VideoEncodingManager.lastKaggleRequestAt;
+      if (elapsed < VideoEncodingManager.MIN_KAGGLE_REQUEST_INTERVAL_MS) {
+        await new Promise((r) =>
+          setTimeout(r, VideoEncodingManager.MIN_KAGGLE_REQUEST_INTERVAL_MS - elapsed),
+        );
+      }
+      VideoEncodingManager.lastKaggleRequestAt = Date.now();
+    });
+    VideoEncodingManager.kagglePacerChain = next.catch(() => {});
+    await next;
+  }
+
   public static getKaggleAuthHeader(username: string, key: string): string {
     const cleanKey = (key || "").trim();
     if (VideoEncodingManager.isBearerToken(cleanKey)) {
@@ -69,9 +97,10 @@ export class VideoEncodingManager {
       method?: string;
       payload?: any;
       quietCodes?: number[];
+      maxRetries?: number;
     } = {},
   ): Promise<any> {
-    const { method = "GET", payload, quietCodes = [] } = options;
+    const { method = "GET", payload, quietCodes = [], maxRetries = 6 } = options;
     const authHeader = VideoEncodingManager.getKaggleAuthHeader(username, key);
 
     const headers: Record<string, string> = {
@@ -83,42 +112,104 @@ export class VideoEncodingManager {
 
     const body = payload !== undefined ? JSON.stringify(payload) : undefined;
 
-    let res = await fetch(url, { method, headers, body });
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      await VideoEncodingManager.acquireKaggleRequestSlot();
 
-    if (
-      (res.status === 401 || res.status === 403) &&
-      !headers.Authorization.startsWith("Bearer")
-    ) {
-      headers.Authorization = `Bearer ${key.trim()}`;
-      res = await fetch(url, { method, headers, body });
-    } else if (
-      (res.status === 401 || res.status === 403) &&
-      headers.Authorization.startsWith("Bearer")
-    ) {
-      headers.Authorization =
-        "Basic " +
-        Buffer.from(`${username}:${key.trim()}`).toString("base64");
-      res = await fetch(url, { method, headers, body });
-    }
+      let res: Response;
+      try {
+        res = await fetch(url, { method, headers, body });
+      } catch (netErr: any) {
+        if (attempt < maxRetries) {
+          const waitMs = 5000 * attempt;
+          log.warn(
+            "Kaggle:HTTP",
+            `Network error on ${url} (${netErr?.message || netErr}). Retrying in ${(waitMs / 1000).toFixed(1)}s (${attempt}/${maxRetries})...`,
+          );
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        throw netErr;
+      }
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      if (!quietCodes.includes(res.status)) {
-        log.warn(
-          "Kaggle:HTTP",
-          `HTTP ${res.status} on ${url}: ${text.slice(0, 300)}`,
+      if (
+        (res.status === 401 || res.status === 403) &&
+        !headers.Authorization.startsWith("Bearer")
+      ) {
+        headers.Authorization = `Bearer ${key.trim()}`;
+        await VideoEncodingManager.acquireKaggleRequestSlot();
+        res = await fetch(url, { method, headers, body });
+      } else if (
+        (res.status === 401 || res.status === 403) &&
+        headers.Authorization.startsWith("Bearer")
+      ) {
+        headers.Authorization =
+          "Basic " +
+          Buffer.from(`${username}:${key.trim()}`).toString("base64");
+        await VideoEncodingManager.acquireKaggleRequestSlot();
+        res = await fetch(url, { method, headers, body });
+      }
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        const lowerText = text.toLowerCase();
+        const isRateLimit =
+          res.status === 429 ||
+          (res.status === 403 &&
+            (lowerText.includes("too many requests") ||
+              lowerText.includes("rate limit") ||
+              lowerText.includes("throttl")));
+        const isTransientServer = [500, 502, 503, 504, 520, 522, 524].includes(res.status);
+
+        if ((isRateLimit || isTransientServer) && attempt < maxRetries) {
+          const retryAfterRaw = res.headers.get("retry-after");
+          let retryAfterMs = 0;
+          if (retryAfterRaw) {
+            const parsedSec = parseInt(retryAfterRaw, 10);
+            if (!isNaN(parsedSec) && parsedSec > 0) {
+              retryAfterMs = parsedSec * 1000;
+            }
+          }
+
+          const baseBackoffMs = isRateLimit
+            ? Math.min(180_000, Math.round(15_000 * Math.pow(1.85, attempt - 1)))
+            : Math.min(60_000, 8_000 * attempt);
+          const jitterMs = Math.floor(Math.random() * 4000);
+          const waitMs = Math.max(retryAfterMs, baseBackoffMs + jitterMs);
+
+          if (isRateLimit) {
+            VideoEncodingManager.kaggleRateLimitCooldownUntil = Math.max(
+              VideoEncodingManager.kaggleRateLimitCooldownUntil,
+              Date.now() + waitMs,
+            );
+          }
+
+          log.warn(
+            "Kaggle:HTTP",
+            `HTTP ${res.status} (${isRateLimit ? "429 Rate-Limit" : "Transient Server"}) on ${url} [user=${username}]. Cooling down & backing off ${(waitMs / 1000).toFixed(1)}s (attempt ${attempt}/${maxRetries})...`,
+          );
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+
+        if (!quietCodes.includes(res.status)) {
+          log.warn(
+            "Kaggle:HTTP",
+            `HTTP ${res.status} on ${url}: ${text.slice(0, 300)}`,
+          );
+        }
+        throw new Error(
+          `Kaggle API returned HTTP ${res.status} for ${url}: ${text.slice(0, 250)}`,
         );
       }
-      throw new Error(
-        `Kaggle API returned HTTP ${res.status} for ${url}: ${text.slice(0, 250)}`,
-      );
+
+      const contentType = res.headers.get("content-type") || "";
+      if (contentType.includes("application/json")) {
+        return await res.json();
+      }
+      return { raw: await res.text() };
     }
 
-    const contentType = res.headers.get("content-type") || "";
-    if (contentType.includes("application/json")) {
-      return await res.json();
-    }
-    return { raw: await res.text() };
+    throw new Error(`Kaggle API exhausted ${maxRetries} retries for ${url}`);
   }
 
   public getNextHfAccount(): HuggingFaceAccount {
@@ -591,28 +682,24 @@ print("HF_UPLOAD_OK")
     );
 
     const tokens: { token: string }[] = new Array(items.length);
-    const concurrency = Math.min(2, items.length);
-    let cursor = 0;
 
-    const worker = async () => {
-      while (true) {
-        const idx = cursor++;
-        if (idx >= items.length) break;
-        const item = items[idx];
-        const tok = await this.uploadSingleBlobToGcs(
-          item.localFilePath,
-          item.remoteFilename,
-          username,
-          key,
-        );
-        tokens[idx] = { token: tok };
-        if (onProgress) {
-          await onProgress().catch(() => {});
-        }
+    // Upload blobs sequentially with gentle pacing so Kaggle's StartBlobUpload endpoint never hits HTTP 429
+    for (let idx = 0; idx < items.length; idx++) {
+      const item = items[idx];
+      if (idx > 0) {
+        await new Promise((r) => setTimeout(r, 1500));
       }
-    };
-
-    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+      const tok = await this.uploadSingleBlobToGcs(
+        item.localFilePath,
+        item.remoteFilename,
+        username,
+        key,
+      );
+      tokens[idx] = { token: tok };
+      if (onProgress) {
+        await onProgress().catch(() => {});
+      }
+    }
 
     log.info(
       "Kaggle:Dataset",
@@ -685,42 +772,44 @@ print("HF_UPLOAD_OK")
 
   /**
    * Single non-blocking dataset readiness check.
-   * Checks both /datasets/status and /datasets/view + /datasets/list to prevent "Dataset not found" when mounting into kernels.
+   * Paced to minimize Kaggle API calls: checks primary /datasets/status first and only falls back to /datasets/view if ambiguous.
    */
   public async checkDatasetStatusOnce(
     datasetSlug: string,
     username: string,
     key: string,
-    allowListFallback = true,
+    allowListFallback = false,
   ): Promise<{ state: "ready" | "indexing" | "failed"; rawStatus: string }> {
     const datasetIdentifier = `${username}/${datasetSlug}`;
     let cleanStatus = "";
     let httpNote = "";
 
-    for (const dsUrl of [
-      `https://www.kaggle.com/api/v1/datasets/status/${datasetIdentifier}`,
-      `https://api.kaggle.com/v1/datasets/status/${datasetIdentifier}`,
-    ]) {
-      try {
-        const dsData = await this.makeKaggleRequest(dsUrl, username, key, {
+    try {
+      const dsData = await this.makeKaggleRequest(
+        `https://www.kaggle.com/api/v1/datasets/status/${datasetIdentifier}`,
+        username,
+        key,
+        {
           method: "GET",
           quietCodes: [403, 404],
-        });
-        const cand = this.extractCleanStatus(dsData);
-        if (cand && !cand.slice(0, 20).includes("error")) {
-          cleanStatus = cand;
-          break;
-        } else if (["error", "failed"].includes(cand)) {
-          cleanStatus = cand;
-          break;
-        }
-      } catch {
-        if (!httpNote) httpNote = "iam_propagating";
+        },
+      );
+      const cand = this.extractCleanStatus(dsData);
+      if (cand && !cand.slice(0, 20).includes("error")) {
+        cleanStatus = cand;
+      } else if (["error", "failed"].includes(cand)) {
+        cleanStatus = cand;
       }
+    } catch {
+      httpNote = "iam_propagating";
     }
 
-    // Secondary check: /datasets/view/${username}/${datasetSlug}
-    if (!cleanStatus || !["ready", "complete", "completed", "ok"].includes(cleanStatus)) {
+    if (["ready", "complete", "completed", "ok"].includes(cleanStatus)) {
+      return { state: "ready", rawStatus: cleanStatus };
+    }
+
+    // Secondary check: /datasets/view/${username}/${datasetSlug} only when primary status is not yet ready
+    if (!cleanStatus || !["ready", "complete", "completed", "ok", "error", "failed"].includes(cleanStatus)) {
       try {
         const viewUrl = `https://www.kaggle.com/api/v1/datasets/view/${datasetIdentifier}`;
         const viewData = await this.makeKaggleRequest(viewUrl, username, key, {
@@ -775,15 +864,15 @@ print("HF_UPLOAD_OK")
     datasetSlug: string,
     username: string,
     key: string,
-    timeoutSec = 600,
+    timeoutSec = 720,
     onHeartbeat?: () => Promise<void>,
   ): Promise<boolean> {
     log.info(
       "Kaggle:Dataset",
-      `Waiting for Kaggle backend to index dataset '${username}/${datasetSlug}'...`,
+      `Waiting for Kaggle backend to index dataset '${username}/${datasetSlug}' (paced 15s polling)...`,
     );
     const startTime = Date.now();
-    await new Promise((r) => setTimeout(r, 5000));
+    await new Promise((r) => setTimeout(r, 8000));
 
     while ((Date.now() - startTime) / 1000 < timeoutSec) {
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -795,7 +884,7 @@ print("HF_UPLOAD_OK")
         datasetSlug,
         username,
         key,
-        elapsed >= 20,
+        elapsed >= 45,
       );
 
       log.info(
@@ -804,8 +893,8 @@ print("HF_UPLOAD_OK")
       );
 
       if (res.state === "ready") {
-        // Extra 5s settle buffer so Kaggle NFS mounts propagate to GPU worker nodes
-        await new Promise((r) => setTimeout(r, 5000));
+        // Extra 6s settle buffer so Kaggle NFS mounts propagate to GPU worker nodes
+        await new Promise((r) => setTimeout(r, 6000));
         log.success(
           "Kaggle:Dataset",
           `Dataset '${username}/${datasetSlug}' is indexed and READY on Kaggle!`,
@@ -818,7 +907,7 @@ print("HF_UPLOAD_OK")
         );
       }
 
-      await new Promise((r) => setTimeout(r, 6000));
+      await new Promise((r) => setTimeout(r, 15_000));
     }
 
     throw new Error(
@@ -1730,9 +1819,9 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
         if (pushAttempt < 6) {
           // If dataset was still propagating on Kaggle IAM, wait for it before next push attempt
           if (errMsg.toLowerCase().includes("dataset") || errMsg.includes("404") || errMsg.includes("400")) {
-            await this.waitForDatasetReady(datasetSlug, username, key, 120).catch(() => {});
+            await this.waitForDatasetReady(datasetSlug, username, key, 150).catch(() => {});
           }
-          await new Promise((r) => setTimeout(r, 8000 * pushAttempt));
+          await new Promise((r) => setTimeout(r, 14_000 * pushAttempt));
         }
       }
     }

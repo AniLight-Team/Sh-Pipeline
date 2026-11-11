@@ -202,14 +202,14 @@ export function BatchViewer({
         <div>
           <div className="flex items-center gap-2">
             <h2 className="text-sm font-semibold text-[#f3f4f8]">
-              Dual-Pipeline Batch Executions (Pipeline 1: VM Remux · Pipeline 2: Kaggle GPU)
+              Pipeline 2 GPU Batch Executions (Kaggle Dual-T4 GPU · 429 Rate-Limit Protected)
             </h2>
             <span className="text-xs font-mono tabular-nums text-[#636b82]">
               · {filteredBatches.length} {filteredBatches.length === 1 ? "batch" : "batches"}
             </span>
           </div>
           <p className="text-xs text-[#636b82] mt-0.5">
-            Pipeline 1: H.264 multi-quality or 1080p solo remux on VM (-c:v copy) · Pipeline 2: HEVC/AV1 batch encode on Kaggle Dual-T4 GPU
+            Pipeline 1 (H.264) streams 2 jobs at a time directly on the VM (-c:v copy, no batching) · Pipeline 2 (HEVC/AV1) batches up to 10 episodes on Kaggle GPU
           </p>
         </div>
 
@@ -258,7 +258,7 @@ export function BatchViewer({
               className="btn-secondary px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer"
             >
               <Layers className="w-3.5 h-3.5 text-indigo-400" />
-              <span>Seal & Flush ({stagedCount})</span>
+              <span>Drain VM Slots & Seal GPU ({stagedCount})</span>
             </button>
           )}
           <button
@@ -315,10 +315,10 @@ export function BatchViewer({
         <div className="px-6 py-10 text-center">
           <Boxes className="w-6 h-6 text-[#636b82] mx-auto mb-2" />
           <p className="text-xs font-medium text-[#f3f4f8]">
-            No VM Remux or GPU batches match the current filter
+            No Kaggle GPU batches match the current filter
           </p>
           <p className="text-xs text-[#636b82] mt-1 max-w-md mx-auto">
-            H.264 multi-quality releases seal immediately into a local VM Direct-Remux batch (-c:v copy). HEVC/AV1 releases seal into a Kaggle GPU batch once 10 episodes are staged.
+            Pipeline 1 (H.264) processes 2 episodes concurrently on the VM with zero batch wait — as soon as one finishes, the next enters immediately. Pipeline 2 (HEVC/AV1) seals into a Kaggle GPU batch (10 eps / 10 GB / 90s idle settle).
           </p>
         </div>
       ) : (

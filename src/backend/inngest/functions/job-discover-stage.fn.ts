@@ -30,8 +30,10 @@ export const jobDiscoverStageFn = inngest.createFunction(
     });
 
     if (res.status === "download_paused") {
-      // Flush any ready or created batches so SSD staging space (< 56 GB) is cleared
+      // Drain 2-slot VM remux queue and flush any ready GPU batches so SSD staging space (< 56 GB) is cleared
       const flushedBatchIds = await step.run("flush-batches-on-storage-cap", async () => {
+        await PipelineEngineService.drainVmRemuxQueue();
+
         const pendingCreated = await db
           .select({ id: schema.pipelineBatch.id })
           .from(schema.pipelineBatch)
@@ -65,7 +67,10 @@ export const jobDiscoverStageFn = inngest.createFunction(
     }
 
     if (res.status === "staged") {
+      // Pipeline 1 (vm_remux): Immediately drain into the 2-slot VM Remux worker (ZERO batching!)
+      // Pipeline 2 (kaggle_gpu): Evaluate & seal GPU batches when ready
       const sealCheck = await step.run("evaluate-and-seal-ready-batches", async () => {
+        const startedVmJobs = await PipelineEngineService.drainVmRemuxQueue();
         const readiness = await PipelineEngineService.evaluateBatchSealReadiness(false);
         if (readiness.shouldSeal) {
           const sealedBatchIds = await PipelineEngineService.sealAvailableBatches({
@@ -76,14 +81,16 @@ export const jobDiscoverStageFn = inngest.createFunction(
             shouldSeal: true,
             reason: readiness.reason,
             sealedBatchIds,
-            stagedCount: readiness.stats.stagedCount,
+            startedVmJobs,
+            stagedGpuCount: readiness.stats.stagedGpuCount,
           };
         }
         return {
           shouldSeal: false,
           reason: readiness.reason,
           sealedBatchIds: [] as number[],
-          stagedCount: readiness.stats.stagedCount,
+          startedVmJobs,
+          stagedGpuCount: readiness.stats.stagedGpuCount,
         };
       });
 
@@ -93,14 +100,14 @@ export const jobDiscoverStageFn = inngest.createFunction(
           id: `pipeline-batch-${bId}-exec-${Date.now()}`,
           data: { batchId: bId },
         });
-        log.info("JobDiscoverStageFn", `Dispatched Batch #${bId} (${sealCheck.reason})`);
+        log.info("JobDiscoverStageFn", `Dispatched GPU Batch #${bId} (${sealCheck.reason})`);
       }
 
       // Arm the coordinator timer if any staged GPU episodes remain waiting for a batch window or queue drain
-      if (sealCheck.stagedCount > 0) {
+      if (sealCheck.stagedGpuCount > 0) {
         await step.sendEvent("arm-batch-timer", {
           name: "pipeline/batch.arm-timer",
-          data: { reason: "new_staged_episode", jobId: Number(jobId) },
+          data: { reason: "new_staged_gpu_episode", jobId: Number(jobId) },
         });
       }
     }

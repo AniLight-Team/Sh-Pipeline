@@ -80,12 +80,12 @@ export const batchExecuteFn = inngest.createFunction(
         await PipelineEngineService.pushBatchKernel(batchId);
       });
 
-      // Phase 4: Durable non-blocking polling loop (survives sh-pipeline restarts & git deployments!)
+      // Phase 4: Durable non-blocking polling loop (paced at 75s intervals to avoid Kaggle 429 rate limits)
       let kernelCompleted = false;
-      const maxPolls = 400; // 400 * 45s = 5 hours max kernel runtime
+      const maxPolls = 260; // 260 * 75s = ~5.4 hours max kernel runtime
 
       for (let pollIdx = 1; pollIdx <= maxPolls; pollIdx++) {
-        await step.sleep(`wait-kernel-poll-${pollIdx}`, "45s");
+        await step.sleep(`wait-kernel-poll-${pollIdx}`, "75s");
 
         const progress = await step.run(`check-kernel-poll-${pollIdx}`, async () => {
           return await PipelineEngineService.checkBatchKernelProgress(batchId);
@@ -106,7 +106,7 @@ export const batchExecuteFn = inngest.createFunction(
       }
 
       if (!kernelCompleted) {
-        const timeoutMsg = "Kaggle GPU kernel timed out after 5 hours";
+        const timeoutMsg = "Kaggle GPU kernel timed out after 5.4 hours";
         await step.run("cleanup-timeout-batch", async () => {
           await PipelineEngineService.handleBatchFailure(batchId, timeoutMsg);
         });
@@ -119,8 +119,10 @@ export const batchExecuteFn = inngest.createFunction(
       });
     }
 
-    // Phase 6: Check if next available batch(es) can be sealed and dispatched, AND wake up any queued downloads waiting on the 56 GB limit
+    // Phase 6: Check if next available batch(es) can be sealed and dispatched, drain VM remux slots, AND wake up any queued downloads waiting on the 56 GB limit
     const drainResult = await step.run("phase-6-drain-next-batch-slots", async () => {
+      await PipelineEngineService.drainVmRemuxQueue();
+
       const existingCreated = await db
         .select({ id: schema.pipelineBatch.id })
         .from(schema.pipelineBatch)

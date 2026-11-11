@@ -42,6 +42,7 @@ async function dispatchJobDiscovery(job: {
         try {
           const res = await PipelineEngineService.discoverAndStageJob(job.id);
           if (res.status === "staged") {
+            await PipelineEngineService.drainVmRemuxQueue();
             const readiness = await PipelineEngineService.evaluateBatchSealReadiness(false);
             if (readiness.shouldSeal) {
               const batchIds = await PipelineEngineService.sealAvailableBatches({
@@ -374,8 +375,9 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
         updatedCount++;
       }
 
+      const startedVmIds = await PipelineEngineService.drainVmRemuxQueue();
       const sealed = await PipelineEngineService.sealAvailableBatches({
-        forceFlush: action === "force_remux",
+        forceFlush: action === "force_gpu",
         triggerReason: action === "force_remux" ? "manual_vm_remux" : "manual_mode_switch",
       });
       for (const bId of sealed) {
@@ -385,8 +387,9 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
       return {
         ok: true,
         affected: updatedCount,
+        startedVmJobIds: startedVmIds,
         dispatchedBatchIds: sealed,
-        message: `Updated ${updatedCount} job(s) to ${targetMode === "vm_remux" ? "VM Direct Remux (-c:v copy)" : "Kaggle GPU Encode"}${sealed.length > 0 ? ` and dispatched ${sealed.length} batch(es)` : ""}.`,
+        message: `Updated ${updatedCount} job(s) to ${targetMode === "vm_remux" ? "VM Direct Remux (-c:v copy, 2-slot queue)" : "Kaggle GPU Encode"}${startedVmIds.length > 0 ? ` and started ${startedVmIds.length} VM remux slot(s)` : ""}${sealed.length > 0 ? ` and dispatched ${sealed.length} GPU batch(es)` : ""}.`,
       };
     }
 
@@ -611,6 +614,8 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
   app.post("/batches/flush", async () => {
     log.info("API", "Force-flush triggered manually");
 
+    const startedVmJobIds = await PipelineEngineService.drainVmRemuxQueue();
+
     const pendingBatches = await db
       .select({ id: schema.pipelineBatch.id })
       .from(schema.pipelineBatch)
@@ -639,7 +644,8 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
 
     return {
       ok: true,
-      message: `Force flush processed: dispatched ${allDispatchIds.length} batch(es) (${pendingIds.length} resumed, ${sealedBatchIds.length} new)`,
+      message: `Force flush processed: ${startedVmJobIds.length} VM remux slot(s) started, dispatched ${allDispatchIds.length} GPU batch(es) (${pendingIds.length} resumed, ${sealedBatchIds.length} new)`,
+      startedVmJobIds,
       dispatchedBatchIds: allDispatchIds,
     };
   });

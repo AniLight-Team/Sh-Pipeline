@@ -117,17 +117,20 @@ async function runAutonomousReconciliationTick() {
   try {
     await PipelineEngineService.ensureTables();
 
+    // 0. Drain Pipeline 1 (continuous 2-at-a-time VM Direct-Remux queue — no batching)
+    await PipelineEngineService.drainVmRemuxQueue().catch(() => {});
+
     // 1. Retry any pending callbacks to Main Backend (localhost:4000)
     await PipelineEngineService.retryPendingCallbacks().catch(() => {});
 
-    // 2. Seal any staged jobs that have met the 10-item cap, 10GB cap, 30m window, or queue-drain settle
+    // 2. Seal any staged GPU jobs that have met the 10-item cap, 10GB cap, 30m window, 90s GPU idle settle, or queue-drain settle
     const newlySealed = await PipelineEngineService.sealAvailableBatches({
       forceFlush: false,
     });
 
-    // 3. Find any batches in "created" for >15s or active batches with stale heartbeats (>4m)
-    const fifteenSecsAgo = new Date(Date.now() - 15 * 1000);
-    const fourMinsAgo = new Date(Date.now() - 4 * 60 * 1000);
+    // 3. Find any batches in "created" for >20s or active batches with stale heartbeats (>8m)
+    const twentySecsAgo = new Date(Date.now() - 20 * 1000);
+    const eightMinsAgo = new Date(Date.now() - 8 * 60 * 1000);
 
     const [createdBatches, staleActiveBatches] = await Promise.all([
       db
@@ -136,7 +139,7 @@ async function runAutonomousReconciliationTick() {
         .where(
           and(
             eq(schema.pipelineBatch.status, "created"),
-            lt(schema.pipelineBatch.createdAt, fifteenSecsAgo),
+            lt(schema.pipelineBatch.createdAt, twentySecsAgo),
           ),
         ),
       db
@@ -145,7 +148,7 @@ async function runAutonomousReconciliationTick() {
         .where(
           and(
             inArray(schema.pipelineBatch.status, ["uploading", "waiting_dataset", "kernel_running"]),
-            lt(schema.pipelineBatch.heartbeatAt, fourMinsAgo),
+            lt(schema.pipelineBatch.heartbeatAt, eightMinsAgo),
           ),
         ),
     ]);
@@ -153,13 +156,22 @@ async function runAutonomousReconciliationTick() {
     const batchIdsToDispatch = Array.from(
       new Set([
         ...newlySealed,
-        ...createdBatches.map((b) => b.id),
-        ...staleActiveBatches.map((b) => b.id),
+        ...createdBatches
+          .map((b) => b.id)
+          .filter((id) => !PipelineEngineService.isBatchCurrentlyExecutingInProcess(id)),
+        ...staleActiveBatches
+          .map((b) => b.id)
+          .filter((id) => !PipelineEngineService.isBatchCurrentlyExecutingInProcess(id)),
       ]),
     );
 
     for (const bId of batchIdsToDispatch) {
       log.info("Server", `Autonomous Heartbeat: Dispatching / resuming Batch #${bId}`);
+      await db
+        .update(schema.pipelineBatch)
+        .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+        .where(eq(schema.pipelineBatch.id, bId))
+        .catch(() => {});
       await inngest
         .send({
           name: "pipeline/batch.execute",

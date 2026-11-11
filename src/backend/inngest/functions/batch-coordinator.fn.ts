@@ -21,11 +21,12 @@ export const batchCoordinatorFn = inngest.createFunction(
 
     if (!isForceFlush) {
       const waitInfo = await step.run("inspect-staged-window", async () => {
+        await PipelineEngineService.drainVmRemuxQueue();
         const readiness = await PipelineEngineService.evaluateBatchSealReadiness(false);
         const { stats } = readiness;
 
-        if (stats.stagedCount === 0 || !stats.oldestStagedAt) {
-          return { shouldSkip: true, shouldWait: false, waitSeconds: 0, reason: "no_staged_items" };
+        if (stats.stagedGpuCount === 0 || !stats.oldestGpuStagedAt) {
+          return { shouldSkip: true, shouldWait: false, waitSeconds: 0, reason: "no_staged_gpu_items" };
         }
 
         if (readiness.shouldSeal) {
@@ -45,19 +46,25 @@ export const batchCoordinatorFn = inngest.createFunction(
           };
         }
 
-        const oldestRef = stats.oldestGpuStagedAt || stats.oldestStagedAt;
+        // Otherwise wait at most until the 90s GPU idle settle window or 30m max window
+        const oldestRef = stats.oldestGpuStagedAt;
         const elapsedMs = Date.now() - oldestRef.getTime();
-        const remainingMs = Math.max(0, KIRA_BATCH_WINDOW_MS - elapsedMs);
+        const windowRemainingMs = Math.max(0, KIRA_BATCH_WINDOW_MS - elapsedMs);
+        const gpuSettleRemainingMs = newestRef
+          ? Math.max(10_000, 90_000 - (Date.now() - newestRef.getTime()) + 2000)
+          : 45_000;
+        const effectiveWaitMs = Math.min(windowRemainingMs, gpuSettleRemainingMs, 95_000);
+
         return {
           shouldSkip: false,
-          shouldWait: remainingMs > 5000,
-          waitSeconds: Math.ceil(remainingMs / 1000),
-          reason: "window_30m",
+          shouldWait: effectiveWaitMs > 5000,
+          waitSeconds: Math.ceil(effectiveWaitMs / 1000),
+          reason: "gpu_settle_or_window",
         };
       });
 
       if (waitInfo.shouldSkip) {
-        return { status: "skipped", reason: "no_staged_items" };
+        return { status: "skipped", reason: "no_staged_gpu_items" };
       }
 
       if (waitInfo.shouldWait && waitInfo.waitSeconds > 0) {

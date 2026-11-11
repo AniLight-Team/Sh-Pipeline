@@ -29,9 +29,12 @@ export const recoveryWatchdogFn = inngest.createFunction(
 
       const now = Date.now();
       const twoMinsAgo = new Date(now - 2 * 60 * 1000);
-      const fourMinsAgo = new Date(now - 4 * 60 * 1000);
+      const eightMinsAgo = new Date(now - 8 * 60 * 1000);
       const tenMinsAgo = new Date(now - 10 * 60 * 1000);
       const sixHoursMs = 6 * 3600 * 1000;
+
+      // 0. Drain Pipeline 1 (2-at-a-time VM Direct-Remux queue — no batching)
+      await PipelineEngineService.drainVmRemuxQueue();
 
       // 1. Recover orphaned "queued" jobs that haven't transitioned to downloading after >2m
       const orphanedQueuedJobs = await db
@@ -86,15 +89,14 @@ export const recoveryWatchdogFn = inngest.createFunction(
         }
       }
 
-      // 3. Inspect active batches with stale heartbeats (>4m)
-      // Instead of blindly failing running Kaggle kernels after a restart, re-dispatch them so batchExecuteFn re-attaches!
+      // 3. Inspect active batches with stale heartbeats (>8m) and not currently executing in-process
       const staleBatches = await db
         .select()
         .from(schema.pipelineBatch)
         .where(
           and(
             inArray(schema.pipelineBatch.status, ["uploading", "waiting_dataset", "kernel_running"]),
-            lt(schema.pipelineBatch.heartbeatAt, fourMinsAgo),
+            lt(schema.pipelineBatch.heartbeatAt, eightMinsAgo),
           ),
         );
 
@@ -102,6 +104,9 @@ export const recoveryWatchdogFn = inngest.createFunction(
       let expiredBatchCount = 0;
 
       for (const sb of staleBatches) {
+        if (PipelineEngineService.isBatchCurrentlyExecutingInProcess(sb.id)) {
+          continue;
+        }
         const runtimeMs = sb.startedAt ? now - sb.startedAt.getTime() : 0;
         if (runtimeMs < sixHoursMs && sb.attempt <= MAX_BATCH_ATTEMPTS) {
           log.info(
@@ -128,9 +133,11 @@ export const recoveryWatchdogFn = inngest.createFunction(
         .from(schema.pipelineBatch)
         .where(eq(schema.pipelineBatch.status, "created"));
 
-      const pendingBatchIds = pendingCreatedBatches.map((b) => b.id);
+      const pendingBatchIds = pendingCreatedBatches
+        .map((b) => b.id)
+        .filter((id) => !PipelineEngineService.isBatchCurrentlyExecutingInProcess(id));
 
-      // 5. Seal eligible staged jobs (respecting 10-item cap / 10GB cap / 30m window / queue-drain settle)
+      // 5. Seal eligible staged GPU jobs (respecting 10-item cap / 10GB cap / 30m window / 90s GPU idle settle)
       const newlySealedIds = await PipelineEngineService.sealAvailableBatches({
         forceFlush: false,
       });
