@@ -8,9 +8,11 @@ import { LiveTerminal } from "./components/LiveTerminal.js";
 import { EnqueueModal } from "./components/EnqueueModal.js";
 import { KaggleAccountsModal } from "./components/KaggleAccountsModal.js";
 import { HuggingFaceModal } from "./components/HuggingFaceModal.js";
+import { StagingExplorerModal } from "./components/StagingExplorerModal.js";
 import { MobileBottomDock } from "./components/MobileBottomDock.js";
 import { usePipelineStream } from "./hooks/usePipelineStream.js";
-import { Plus, Cpu, Cloud, CheckCircle2 } from "lucide-react";
+import type { PipelineExecutionPolicy } from "../backend/engine/types.js";
+import { Plus, Cpu, Cloud, CheckCircle2, HardDrive } from "lucide-react";
 
 export default function App() {
   const { stats, logs, connected } = usePipelineStream();
@@ -19,6 +21,7 @@ export default function App() {
   const [isEnqueueOpen, setIsEnqueueOpen] = useState(false);
   const [isKaggleOpen, setIsKaggleOpen] = useState(false);
   const [isHfOpen, setIsHfOpen] = useState(false);
+  const [isStagingOpen, setIsStagingOpen] = useState(false);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [externalJobStatusFilter, setExternalJobStatusFilter] =
     useState<string>("all");
@@ -33,7 +36,7 @@ export default function App() {
 
   const showNotice = (msg: string) => {
     setActionNotice(msg);
-    setTimeout(() => setActionNotice(null), 4000);
+    setTimeout(() => setActionNotice(null), 4500);
   };
 
   // Keyboard shortcut: Cmd/Ctrl + K to toggle Enqueue modal
@@ -68,6 +71,45 @@ export default function App() {
     }
   };
 
+  const handleSyncEncoding = async () => {
+    try {
+      const res = await fetch("/api/system/sync-encoding", { method: "POST" });
+      const data = await res.json();
+      showNotice(
+        data.message || "Verified live Kaggle GPU status and reconciled encoding jobs.",
+      );
+    } catch {
+      showNotice("Failed to verify live encoding states.");
+    }
+  };
+
+  const handleChangePolicy = async (policy: PipelineExecutionPolicy) => {
+    try {
+      const res = await fetch("/api/pipeline/policy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          policy,
+          requeueSkipped: policy === "all",
+        }),
+      });
+      const data = await res.json();
+      showNotice(data.message || `Updated pipeline execution policy to ${policy}.`);
+    } catch {
+      showNotice("Failed to update pipeline execution policy.");
+    }
+  };
+
+  const handleRequeueSkipped = async () => {
+    try {
+      const res = await fetch("/api/jobs/requeue-skipped", { method: "POST" });
+      const data = await res.json();
+      showNotice(data.message || "Re-queued skipped jobs for discovery.");
+    } catch {
+      showNotice("Failed to re-queue skipped jobs.");
+    }
+  };
+
   return (
     <div className="min-h-screen bg-[#090a0f] text-[#f3f4f8] flex relative overflow-x-hidden">
       {/* Desktop Sidebar */}
@@ -84,8 +126,8 @@ export default function App() {
 
       {/* Main Content Container */}
       <div
-        className={`flex-1 flex flex-col min-h-screen transition-all duration-200 ${
-          sidebarCollapsed ? "pl-0 md:pl-16" : "pl-0 md:pl-60"
+        className={`flex-1 min-w-0 flex flex-col min-h-screen transition-all duration-200 ${
+          sidebarCollapsed ? "md:ml-16" : "md:ml-60"
         }`}
       >
         <Navbar
@@ -96,6 +138,9 @@ export default function App() {
           onOpenEnqueue={() => setIsEnqueueOpen(true)}
           onForceFlush={handleForceFlush}
           onRunRecovery={handleRunRecovery}
+          onSyncEncoding={handleSyncEncoding}
+          onOpenStagingExplorer={() => setIsStagingOpen(true)}
+          onChangePolicy={handleChangePolicy}
         />
 
         {/* Operational Notification Banner */}
@@ -123,7 +168,11 @@ export default function App() {
                 onOpenEnqueue={() => setIsEnqueueOpen(true)}
                 onOpenKaggleDetails={() => setIsKaggleOpen(true)}
                 onOpenHfDetails={() => setIsHfOpen(true)}
+                onOpenStagingExplorer={() => setIsStagingOpen(true)}
                 onForceFlush={handleForceFlush}
+                onSyncEncoding={handleSyncEncoding}
+                onChangePolicy={handleChangePolicy}
+                onRequeueSkipped={handleRequeueSkipped}
                 onSelectStatusFilter={(status) => {
                   setExternalJobStatusFilter(status);
                   showNotice(`Filtered multimedia jobs by status: ${status}`);
@@ -348,6 +397,12 @@ export default function App() {
         isOpen={isHfOpen}
         onClose={() => setIsHfOpen(false)}
         stats={stats}
+      />
+
+      <StagingExplorerModal
+        isOpen={isStagingOpen}
+        onClose={() => setIsStagingOpen(false)}
+        onNotice={showNotice}
       />
     </div>
   );

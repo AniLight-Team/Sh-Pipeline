@@ -33,7 +33,9 @@ export const recoveryWatchdogFn = inngest.createFunction(
       const tenMinsAgo = new Date(now - 10 * 60 * 1000);
       const sixHoursMs = 6 * 3600 * 1000;
 
-      // 0. Drain Pipeline 1 (2-at-a-time VM Direct-Remux queue — no batching)
+      // 0. Reconcile any stuck 'encoding' jobs/batches (including live Kaggle status check for stale batches)
+      // and drain Pipeline 1 (2-at-a-time VM Direct-Remux queue — no batching)
+      await PipelineEngineService.reconcileStuckEncodingStates({ liveKaggleCheck: false });
       await PipelineEngineService.drainVmRemuxQueue();
 
       // 1. Recover orphaned "queued" jobs that haven't transitioned to downloading after >2m

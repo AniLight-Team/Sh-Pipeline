@@ -40,6 +40,8 @@ export type CandidateSelectionTier =
 
 export type PipelineExecutionType = "vm_remux" | "kaggle_gpu";
 
+export type PipelineExecutionPolicy = "all" | "vm_remux_only" | "kaggle_gpu_only";
+
 export interface ParsedReleaseTitle {
   group: string;
   groupLower: string;
@@ -213,6 +215,7 @@ export interface EnqueueRequest {
   knownTitles?: string[];
   metadata?: Record<string, any>;
   callbackUrl?: string;
+  executionPolicy?: PipelineExecutionPolicy;
 }
 
 export interface EnqueueResponse {
@@ -239,6 +242,7 @@ export interface ActiveBatchSummary {
   elapsedSeconds: number;
   heartbeatAt: string;
   mode?: "vm_remux" | "kaggle_gpu";
+  lastError?: string | null;
 }
 
 export interface KaggleAccountStatus {
@@ -249,7 +253,36 @@ export interface KaggleAccountStatus {
   slots: [boolean, boolean]; // [slot1Occupied, slot2Occupied]
 }
 
+export interface StagedFileDiskEntry {
+  filename: string;
+  fullPath: string;
+  sizeBytes: number;
+  modifiedAt: string;
+  isDirectory: boolean;
+  jobId: number | null;
+  anilistId: number | null;
+  animeTitle: string | null;
+  episodeNumber: number | null;
+  quality: VideoResolutionQuality | null;
+  pipelineType: PipelineExecutionType | null;
+  jobStatus: string | null;
+  isOrphan: boolean;
+}
+
+export interface StorageInspectionReport {
+  stagingDir: string;
+  downloadDir: string;
+  totalDiskBytes: number;
+  maxStagingBytes: number;
+  freeDiskBytes: number;
+  fileCount: number;
+  orphanCount: number;
+  orphanBytes: number;
+  files: StagedFileDiskEntry[];
+}
+
 export interface PipelineStats {
+  executionPolicy: PipelineExecutionPolicy;
   activeBatch: ActiveBatchSummary | null;
   activeBatches: ActiveBatchSummary[];
   concurrency: {
@@ -269,6 +302,7 @@ export interface PipelineStats {
     completed: number;
     failed: number;
     paused: number;
+    skipped: number;
     total: number;
     stagedRemux?: number;
     stagedGpu?: number;
@@ -280,6 +314,7 @@ export interface PipelineStats {
     maxStagingBytes: number;
     minFreeBytes: number;
     stagingDir: string;
+    downloadDir?: string;
     isAtCapacity?: boolean;
   };
   accounts: {
@@ -292,6 +327,7 @@ export interface PipelineStats {
     uptimeSeconds: number;
     lastWatchdogRun: string | null;
     pendingCallbacks?: number;
+    executionPolicy?: PipelineExecutionPolicy;
   };
 }
 
@@ -311,3 +347,4 @@ export interface AnimeResolvedMetadata {
   status?: string;
   source: string;
 }
+

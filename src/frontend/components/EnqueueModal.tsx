@@ -86,6 +86,9 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
   const [error, setError] = useState<string | null>(null);
 
   // Advanced fields
+  const [executionPolicy, setExecutionPolicy] = useState<
+    "default" | "all" | "vm_remux_only" | "kaggle_gpu_only"
+  >("default");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [overrideAnidbId, setOverrideAnidbId] = useState("");
   const [overrideAnimeId, setOverrideAnimeId] = useState("");
@@ -209,6 +212,8 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
         animeId: parsedAnime || undefined,
         episodeNumbers: epNums,
         types,
+        executionPolicy:
+          executionPolicy === "default" ? undefined : executionPolicy,
         knownTitles: knownTitles
           .split(",")
           .map((t) => t.trim())
@@ -512,6 +517,78 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                   </div>
                 </div>
               </label>
+            </div>
+          </div>
+
+          {/* Pipeline Execution Policy Override */}
+          <div>
+            <span className="block text-[#f3f4f8] font-medium mb-1.5">
+              Pipeline Execution Trigger Policy
+            </span>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setExecutionPolicy("default")}
+                className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer ${
+                  executionPolicy === "default"
+                    ? "bg-indigo-500/15 border-indigo-500/40 text-[#f3f4f8]"
+                    : "bg-[#0c0e14] border-[#1e2230] text-[#949bb0] hover:text-white"
+                }`}
+              >
+                <div className="font-semibold text-xs">Follow Global Policy</div>
+                <div className="text-[11px] text-[#636b82]">
+                  Uses active dashboard trigger mode
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setExecutionPolicy("all")}
+                className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer ${
+                  executionPolicy === "all"
+                    ? "bg-indigo-500/15 border-indigo-500/40 text-[#f3f4f8]"
+                    : "bg-[#0c0e14] border-[#1e2230] text-[#949bb0] hover:text-white"
+                }`}
+              >
+                <div className="font-semibold text-xs">Both Pipelines (Auto)</div>
+                <div className="text-[11px] text-[#636b82]">
+                  H.264 -&gt; VM Remux · HEVC -&gt; GPU
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setExecutionPolicy("vm_remux_only")}
+                className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer ${
+                  executionPolicy === "vm_remux_only"
+                    ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-200"
+                    : "bg-[#0c0e14] border-[#1e2230] text-[#949bb0] hover:text-white"
+                }`}
+              >
+                <div className="font-semibold text-xs">
+                  Pipeline 1 Only (VM H.264)
+                </div>
+                <div className="text-[11px] text-[#636b82]">
+                  Marks non-H.264 anime as Skipped
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setExecutionPolicy("kaggle_gpu_only")}
+                className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer ${
+                  executionPolicy === "kaggle_gpu_only"
+                    ? "bg-violet-500/15 border-violet-500/40 text-violet-200"
+                    : "bg-[#0c0e14] border-[#1e2230] text-[#949bb0] hover:text-white"
+                }`}
+              >
+                <div className="font-semibold text-xs">
+                  Pipeline 2 Only (Kaggle GPU)
+                </div>
+                <div className="text-[11px] text-[#636b82]">
+                  Marks H.264 anime as Skipped
+                </div>
+              </button>
             </div>
           </div>
 

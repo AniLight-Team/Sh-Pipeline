@@ -257,16 +257,29 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
         </div>
 
         {/* Selected Release Title & Multi-Quality Staged Files */}
-        {job.torrentTitle && (
+        {(job.torrentTitle || job.stagedFilePath || stagedQualityKeys.length > 0) && (
           <div className="mb-4 p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230] space-y-2">
-            <div>
-              <span className="text-[11px] text-[#636b82] block mb-1">
-                Selected Primary Release (1080p Subtitle Source)
-              </span>
-              <div className="font-mono text-xs text-[#f3f4f8] break-all">
-                {job.torrentTitle}
+            {job.torrentTitle && (
+              <div>
+                <span className="text-[11px] text-[#636b82] block mb-1">
+                  Selected Primary Release (1080p Subtitle Source)
+                </span>
+                <div className="font-mono text-xs text-[#f3f4f8] break-all">
+                  {job.torrentTitle}
+                </div>
               </div>
-            </div>
+            )}
+
+            {job.stagedFilePath && (
+              <div className="pt-2 border-t border-[#1e2230]">
+                <span className="text-[11px] text-[#636b82] block mb-1">
+                  Primary Staged File Path on Local SSD
+                </span>
+                <div className="font-mono text-[11px] text-emerald-300 break-all bg-[#12151f] px-2.5 py-1.5 rounded border border-[#1e2230]">
+                  {job.stagedFilePath}
+                </div>
+              </div>
+            )}
 
             {stagedQualityKeys.length > 0 && (
               <div className="pt-2 border-t border-[#1e2230]">

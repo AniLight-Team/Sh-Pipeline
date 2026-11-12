@@ -1,5 +1,5 @@
 import React from "react";
-import type { PipelineStats } from "../../backend/engine/types.js";
+import type { PipelineStats, PipelineExecutionPolicy } from "../../backend/engine/types.js";
 import type { LogEntry } from "../../backend/utils/logger.js";
 import {
   ArrowUpRight,
@@ -11,6 +11,9 @@ import {
   Clock,
   Plus,
   ArrowRight,
+  FolderOpen,
+  RefreshCw,
+  Sliders,
 } from "lucide-react";
 
 interface DashboardChartsProps {
@@ -20,7 +23,11 @@ interface DashboardChartsProps {
   onOpenEnqueue: () => void;
   onOpenKaggleDetails: () => void;
   onOpenHfDetails: () => void;
+  onOpenStagingExplorer?: () => void;
   onForceFlush?: () => void;
+  onSyncEncoding?: () => void;
+  onChangePolicy?: (policy: PipelineExecutionPolicy) => void;
+  onRequeueSkipped?: () => void;
   onSelectStatusFilter?: (status: string) => void;
 }
 
@@ -31,11 +38,16 @@ export function DashboardCharts({
   onOpenEnqueue,
   onOpenKaggleDetails,
   onOpenHfDetails,
+  onOpenStagingExplorer,
   onForceFlush,
+  onSyncEncoding,
+  onChangePolicy,
+  onRequeueSkipped,
   onSelectStatusFilter,
 }: DashboardChartsProps) {
   const activeBatches = stats?.activeBatches || [];
   const latestBatch = activeBatches[0] || null;
+  const currentPolicy: PipelineExecutionPolicy = stats?.executionPolicy || "all";
   const queue = stats?.queue || {
     queued: 0,
     downloading: 0,
@@ -45,6 +57,7 @@ export function DashboardCharts({
     encoding: 0,
     completed: 0,
     failed: 0,
+    skipped: 0,
     paused: 0,
     total: 0,
   };
@@ -54,7 +67,7 @@ export function DashboardCharts({
     maxBatchItems: 10,
     maxStagingBytes: 56 * 1024 * 1024 * 1024,
     minFreeBytes: 12_000_000_000,
-    stagingDir: "/tmp/kira-staging",
+    stagingDir: "/srv/torrents/complete/.kira-staging",
     isAtCapacity: false,
   };
   const concurrency = stats?.concurrency || {
@@ -63,7 +76,7 @@ export function DashboardCharts({
     accountsCount: 1,
     maxPerAccount: 2,
     vmActive: 0,
-    vmMax: 1,
+    vmMax: 2,
   };
 
   const stagedGb = (storage.stagedBytes / (1024 * 1024 * 1024)).toFixed(2);
@@ -112,7 +125,7 @@ export function DashboardCharts({
     {
       key: "staged",
       label: "Staged on Local SSD",
-      sublabel: `1080p R2 subtitles synced · ${queue.stagedRemux ?? 0} VM Remux / ${queue.stagedGpu ?? 0} GPU`,
+      sublabel: `${storage.stagingDir} · ${queue.stagedRemux ?? 0} VM Remux / ${queue.stagedGpu ?? 0} GPU`,
       count: queue.staged,
       barColor: "bg-indigo-400",
       textColor: "text-indigo-300",
@@ -120,7 +133,7 @@ export function DashboardCharts({
     {
       key: "encoding",
       label: "VM Direct Remux / Kaggle GPU",
-      sublabel: "H.264 direct MP4 remux (-c:v copy) · HEVC/AV1 GPU encode",
+      sublabel: "H.264 direct MP4 remux (-c:v copy, 2 slots) · HEVC/AV1 GPU encode",
       count: queue.encoding,
       barColor: "bg-violet-400",
       textColor: "text-violet-300",
@@ -132,6 +145,19 @@ export function DashboardCharts({
       count: queue.completed,
       barColor: "bg-emerald-400",
       textColor: "text-emerald-300",
+    },
+    {
+      key: "skipped",
+      label: "Skipped by Pipeline Policy",
+      sublabel:
+        currentPolicy === "vm_remux_only"
+          ? "Pipeline 1 Only active — non-H.264 (HEVC/AV1) anime skipped"
+          : currentPolicy === "kaggle_gpu_only"
+            ? "Pipeline 2 Only active — H.264 anime skipped"
+            : "Skipped due to active pipeline execution filter",
+      count: queue.skipped ?? 0,
+      barColor: "bg-slate-400",
+      textColor: "text-slate-300",
     },
     {
       key: "failed",
@@ -148,7 +174,7 @@ export function DashboardCharts({
       index: "01",
       title: "Torrent Discovery",
       detail: "Tsukihime + AnimeTosho · H.264 priority",
-      metric: `${queue.queued} queued`,
+      metric: `${queue.queued} queued · ${queue.skipped ?? 0} skipped`,
       filterKey: "queued",
     },
     {
@@ -161,15 +187,15 @@ export function DashboardCharts({
     {
       index: "03",
       title: "1080p R2 Subtitles & SSD",
-      detail: "Extract subs from 1080p only · ffprobe",
+      detail: `Staged in ${storage.stagingDir}`,
       metric: `${queue.staged} staged (${stagedGb} GB)`,
       filterKey: "staged",
     },
     {
       index: "04",
       title: "VM Remux / Kaggle GPU",
-      detail: "H.264 -> VM -c:v copy · HEVC -> GPU",
-      metric: `VM ${concurrency.vmActive || 0}/${concurrency.vmMax || 1} · GPU ${concurrency.active}/${concurrency.max}`,
+      detail: "H.264 -> VM 2-slot · HEVC -> GPU",
+      metric: `VM ${concurrency.vmActive || 0}/${concurrency.vmMax || 2} · GPU ${concurrency.active}/${concurrency.max}`,
       filterKey: "encoding",
     },
     {
@@ -185,6 +211,86 @@ export function DashboardCharts({
 
   return (
     <div className="space-y-6">
+      {/* 0. Pipeline Execution Mode & Staged SSD Control Banner */}
+      <div className="surface-panel rounded-xl p-4 flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-start sm:items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center shrink-0">
+            <Sliders className="w-4 h-4 text-indigo-400" />
+          </div>
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-xs font-semibold text-[#f3f4f8]">
+                Pipeline Execution Trigger Policy
+              </h2>
+              <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-[#151822] border border-[#232838] text-indigo-300">
+                {currentPolicy === "vm_remux_only"
+                  ? "Pipeline 1 Only (Skip HEVC/AV1)"
+                  : currentPolicy === "kaggle_gpu_only"
+                    ? "Pipeline 2 Only (Skip H.264)"
+                    : "Both Pipelines (Auto Waterfall)"}
+              </span>
+            </div>
+            <p className="text-[11px] text-[#636b82] mt-0.5">
+              {currentPolicy === "vm_remux_only"
+                ? "Strictly runs Pipeline 1 (8-bit H.264 VM Direct Remux, 2 at a time). Non-compatible HEVC/AV1 anime episodes are automatically marked as Skipped."
+                : currentPolicy === "kaggle_gpu_only"
+                  ? "Strictly runs Pipeline 2 (Kaggle Dual-T4 GPU NVENC). Pipeline 1 (H.264) anime episodes are automatically marked as Skipped."
+                  : "Runs Pipeline 1 (VM Direct Remux, 2 slots) for H.264 releases and falls back to Pipeline 2 (Kaggle GPU) only when HEVC/AV1 is required."}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center bg-[#0c0e14] p-1 rounded-lg border border-[#1e2230] text-xs font-mono">
+            <button
+              type="button"
+              onClick={() => onChangePolicy?.("all")}
+              className={`px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
+                currentPolicy === "all"
+                  ? "bg-indigo-500/25 text-indigo-200 border border-indigo-500/40 font-semibold"
+                  : "text-[#949bb0] hover:text-white"
+              }`}
+            >
+              Both Pipelines
+            </button>
+            <button
+              type="button"
+              onClick={() => onChangePolicy?.("vm_remux_only")}
+              className={`px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
+                currentPolicy === "vm_remux_only"
+                  ? "bg-emerald-500/25 text-emerald-200 border border-emerald-500/40 font-semibold"
+                  : "text-[#949bb0] hover:text-white"
+              }`}
+            >
+              Pipeline 1 Only (VM)
+            </button>
+            <button
+              type="button"
+              onClick={() => onChangePolicy?.("kaggle_gpu_only")}
+              className={`px-2.5 py-1 rounded-md transition-colors cursor-pointer ${
+                currentPolicy === "kaggle_gpu_only"
+                  ? "bg-violet-500/25 text-violet-200 border border-violet-500/40 font-semibold"
+                  : "text-[#949bb0] hover:text-white"
+              }`}
+            >
+              Pipeline 2 Only (GPU)
+            </button>
+          </div>
+
+          {(queue.skipped ?? 0) > 0 && onRequeueSkipped && (
+            <button
+              type="button"
+              onClick={onRequeueSkipped}
+              className="btn-secondary px-2.5 py-1.5 rounded-lg text-xs font-mono text-amber-300 hover:text-white inline-flex items-center gap-1.5 cursor-pointer"
+              title="Re-queue all skipped jobs for discovery under the current policy"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Re-queue Skipped ({queue.skipped})</span>
+            </button>
+          )}
+        </div>
+      </div>
+
       {/* 1. Top 4-Column Real Telemetry KPI Strip */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {/* KPI 1: Pipeline Queue Overview */}
@@ -204,19 +310,31 @@ export function DashboardCharts({
             </div>
           </div>
           <div className="mt-4 pt-3 border-t border-[#1e2230] flex items-center justify-between text-xs text-[#636b82] font-mono tabular-nums">
-            <span>Completed: {queue.completed}</span>
+            <span>Done: {queue.completed}</span>
+            <span>Skipped: {queue.skipped ?? 0}</span>
             <span className={queue.failed > 0 ? "text-rose-400" : "text-[#636b82]"}>
               Failed: {queue.failed}
             </span>
           </div>
         </div>
 
-        {/* KPI 2: Local SSD Staging Buffer (56 GB Guardrail) */}
+        {/* KPI 2: Local SSD Staging Buffer (56 GB Guardrail + Exact Path) */}
         <div className="surface-panel rounded-xl p-4 flex flex-col justify-between">
           <div>
             <div className="flex items-center justify-between text-xs text-[#949bb0]">
               <span className="font-medium">SSD Staging Buffer</span>
-              <HardDrive className="w-4 h-4 text-[#636b82]" />
+              {onOpenStagingExplorer ? (
+                <button
+                  type="button"
+                  onClick={onOpenStagingExplorer}
+                  className="text-xs text-sky-400 hover:text-sky-300 inline-flex items-center gap-1 cursor-pointer font-mono"
+                >
+                  <FolderOpen className="w-3.5 h-3.5" />
+                  <span>Inspect Files</span>
+                </button>
+              ) : (
+                <HardDrive className="w-4 h-4 text-[#636b82]" />
+              )}
             </div>
             <div className="mt-2 flex items-baseline gap-2">
               <span className="text-2xl font-bold font-mono tabular-nums text-[#f3f4f8]">
@@ -226,15 +344,8 @@ export function DashboardCharts({
                 / {maxStagingGb} GB hard cap
               </span>
             </div>
-            <div className="mt-2.5 h-1.5 w-full bg-[#151822] rounded-full overflow-hidden">
-              <div
-                className={`h-full transition-all duration-300 ${
-                  storage.isAtCapacity || stagingPercent >= 90
-                    ? "bg-amber-400"
-                    : "bg-indigo-500"
-                }`}
-                style={{ width: `${stagingPercent}%` }}
-              />
+            <div className="mt-2 text-[11px] font-mono text-[#949bb0] truncate" title={storage.stagingDir}>
+              Path: <span className="text-emerald-300">{storage.stagingDir}</span>
             </div>
           </div>
           <div className="mt-3 pt-2.5 border-t border-[#1e2230] flex items-center justify-between text-xs font-mono tabular-nums">
@@ -266,19 +377,29 @@ export function DashboardCharts({
                 {concurrency.active} / {concurrency.max}
               </span>
               <span className="text-xs font-mono tabular-nums text-[#949bb0]">
-                GPU · VM {concurrency.vmActive || 0}/{concurrency.vmMax || 1}
+                GPU · VM {concurrency.vmActive || 0}/{concurrency.vmMax || 2}
               </span>
             </div>
           </div>
           <div className="mt-4 pt-3 border-t border-[#1e2230] flex items-center justify-between gap-3 text-xs font-mono tabular-nums text-[#636b82]">
-            <span className="truncate">VM Copy + T4 NVENC ({gpuLoadPercent}%)</span>
-            <button
-              type="button"
-              onClick={onOpenHfDetails}
-              className="text-[#949bb0] hover:text-white transition-colors cursor-pointer shrink-0"
-            >
-              Storage & CDN →
-            </button>
+            <span className="truncate">VM 2-Slot + T4 NVENC ({gpuLoadPercent}%)</span>
+            {onSyncEncoding ? (
+              <button
+                type="button"
+                onClick={onSyncEncoding}
+                className="text-violet-400 hover:text-violet-300 transition-colors cursor-pointer shrink-0 font-semibold"
+              >
+                Verify Live →
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={onOpenHfDetails}
+                className="text-[#949bb0] hover:text-white transition-colors cursor-pointer shrink-0"
+              >
+                Storage & CDN →
+              </button>
+            )}
           </div>
         </div>
 

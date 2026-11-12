@@ -759,7 +759,13 @@ print("HF_UPLOAD_OK")
     if (!rawStatus) return "";
     let val = "";
     if (typeof rawStatus === "object") {
-      val = rawStatus.status || rawStatus.state || rawStatus.raw || "";
+      val =
+        rawStatus.status ||
+        rawStatus.state ||
+        rawStatus.kernelWorkerStatus ||
+        rawStatus.datasetStatus ||
+        rawStatus.raw ||
+        "";
     } else {
       val = String(rawStatus);
     }
@@ -767,8 +773,13 @@ print("HF_UPLOAD_OK")
     if (s.includes(".") && !s.includes(" ")) {
       s = s.split(".").pop() || s;
     }
+    s = s
+      .replace(/^kernel_worker_status_/, "")
+      .replace(/^dataset_status_/, "")
+      .replace(/^databundle_status_/, "");
     return s;
   }
+
 
   /**
    * Single non-blocking dataset readiness check.
@@ -1834,7 +1845,46 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
   }
 
   /**
+   * Helper to download a file URL from Kaggle /api/v1/kernels/output.
+   * Crucial: Pre-signed GCS URLs (storage.googleapis.com with X-Goog-Signature) reject requests that include
+   * an Authorization header (HTTP 400 InvalidAuthentication). We try without Authorization first for signed URLs.
+   */
+  private async fetchKaggleOutputFileUrl(
+    fileUrl: string,
+    username: string,
+    key: string,
+  ): Promise<Response | null> {
+    const authHeader = VideoEncodingManager.getKaggleAuthHeader(username, key);
+    const isSignedGcs =
+      fileUrl.includes("storage.googleapis.com") ||
+      fileUrl.includes("X-Goog-Signature") ||
+      fileUrl.includes("Signature=");
+
+    const headerAttempts: Record<string, string>[] = isSignedGcs
+      ? [
+          { "User-Agent": "AniLight-Worker/3.0" },
+          { Authorization: authHeader, "User-Agent": "AniLight-Worker/3.0" },
+        ]
+      : [
+          { Authorization: authHeader, "User-Agent": "AniLight-Worker/3.0" },
+          { "User-Agent": "AniLight-Worker/3.0" },
+        ];
+
+    for (const headers of headerAttempts) {
+      try {
+        const res = await fetch(fileUrl, { headers });
+        if (res.ok) {
+          return res;
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  /**
    * Non-blocking single status check for a running or reattached Kaggle kernel.
+   * Accurately detects Kaggle errors, cancellations, failureMessages, and deleted/missing kernels
+   * so jobs never remain stuck in 'encoding' when Kaggle errors out.
    */
   public async checkKernelStatusOnce(
     kernelSlug: string,
@@ -1845,39 +1895,105 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
     rawStatus: string;
     failureMessage?: string;
   }> {
-    try {
-      const statusUrl = `https://www.kaggle.com/api/v1/kernels/status?userName=${encodeURIComponent(username)}&kernelSlug=${encodeURIComponent(kernelSlug)}`;
-      const sData = await this.makeKaggleRequest(statusUrl, username, key, {
-        method: "GET",
-        quietCodes: [403, 404],
-      });
-      const cleanStatus = this.extractCleanStatus(sData);
-      const failureMsg = sData?.failureMessage || sData?.failure_message || undefined;
+    const statusUrls = [
+      `https://www.kaggle.com/api/v1/kernels/status?userName=${encodeURIComponent(username)}&kernelSlug=${encodeURIComponent(kernelSlug)}`,
+      `https://api.kaggle.com/v1/kernels/status?userName=${encodeURIComponent(username)}&kernelSlug=${encodeURIComponent(kernelSlug)}`,
+    ];
 
-      if (
-        ["complete", "completed", "success", "finished"].includes(cleanStatus)
-      ) {
-        return { state: "completed", rawStatus: cleanStatus };
+    let lastErrMsg = "";
+    for (const statusUrl of statusUrls) {
+      try {
+        const sData = await this.makeKaggleRequest(statusUrl, username, key, {
+          method: "GET",
+          quietCodes: [400, 403, 404],
+          maxRetries: 3,
+        });
+        const cleanStatus = this.extractCleanStatus(sData);
+        const failureMsg =
+          sData?.failureMessage ||
+          sData?.failure_message ||
+          sData?.error ||
+          undefined;
+
+        if (
+          cleanStatus.includes("error") ||
+          cleanStatus.includes("fail") ||
+          cleanStatus.includes("cancel") ||
+          cleanStatus.includes("timeout") ||
+          cleanStatus.includes("killed") ||
+          (typeof failureMsg === "string" && failureMsg.trim().length > 0 && !cleanStatus.includes("running") && !cleanStatus.includes("queued"))
+        ) {
+          return {
+            state: "failed",
+            rawStatus: cleanStatus || "error",
+            failureMessage: typeof failureMsg === "string" ? failureMsg.trim() : undefined,
+          };
+        }
+
+        if (
+          ["complete", "completed", "success", "finished"].includes(cleanStatus) ||
+          cleanStatus.includes("complete")
+        ) {
+          return { state: "completed", rawStatus: cleanStatus || "complete" };
+        }
+
+        return { state: "running", rawStatus: cleanStatus || "running" };
+      } catch (err: any) {
+        lastErrMsg = String(err?.message || err);
       }
-      if (
-        ["error", "failed", "cancel", "cancelled", "timeout"].includes(
-          cleanStatus,
-        )
-      ) {
-        return { state: "failed", rawStatus: cleanStatus, failureMessage: failureMsg };
-      }
-      return { state: "running", rawStatus: cleanStatus || "running" };
-    } catch (err: any) {
-      const msg = String(err?.message || "");
-      if (msg.includes("HTTP 404")) {
-        return { state: "not_found", rawStatus: "404" };
-      }
-      return { state: "running", rawStatus: "polling_transient_err" };
     }
+
+    // Fallback: Check user's kernel list to verify if kernel errored, completed, or was deleted on Kaggle
+    try {
+      const userKernels = await this.listUserKernels(username, key, 30);
+      const matched = userKernels.find((k: any) => {
+        const ref = String(k?.ref || k?.slug || k?.title || "").toLowerCase();
+        return ref.includes(kernelSlug.toLowerCase());
+      });
+      if (matched) {
+        const kStat = this.extractCleanStatus(matched.status || matched.lastRunStatus || "");
+        if (kStat.includes("error") || kStat.includes("fail") || kStat.includes("cancel")) {
+          return {
+            state: "failed",
+            rawStatus: kStat,
+            failureMessage: matched.failureMessage || matched.error || undefined,
+          };
+        }
+        if (kStat.includes("complete") || kStat === "success") {
+          return { state: "completed", rawStatus: kStat };
+        }
+        if (kStat) {
+          return { state: "running", rawStatus: kStat };
+        }
+      }
+    } catch {}
+
+    if (
+      lastErrMsg.includes("HTTP 404") ||
+      lastErrMsg.includes("HTTP 400") ||
+      lastErrMsg.toLowerCase().includes("not found")
+    ) {
+      return {
+        state: "not_found",
+        rawStatus: "404_not_found",
+        failureMessage: lastErrMsg.slice(0, 240),
+      };
+    }
+
+    if (lastErrMsg.includes("HTTP 401") || lastErrMsg.includes("HTTP 403")) {
+      return {
+        state: "failed",
+        rawStatus: "auth_or_permission_error",
+        failureMessage: lastErrMsg.slice(0, 240),
+      };
+    }
+
+    return { state: "running", rawStatus: "polling_transient_err" };
   }
 
   /**
    * Retrieves the tail of the Kaggle kernel log when a kernel fails so the exact Python/FFmpeg error is surfaced.
+   * Supports both inline `outData.log` and signed GCS `.log` file URLs in `outData.files`.
    */
   public async fetchKernelErrorSnippet(
     kernelSlug: string,
@@ -1889,11 +2005,34 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
         `https://www.kaggle.com/api/v1/kernels/output?userName=${encodeURIComponent(username)}&kernelSlug=${encodeURIComponent(kernelSlug)}`,
         username,
         key,
-        { method: "GET", quietCodes: [403, 404] },
+        { method: "GET", quietCodes: [400, 403, 404], maxRetries: 2 },
       );
+
+      let logText = "";
       if (outData?.log && typeof outData.log === "string") {
-        const lines = outData.log.trim().splitlines ? outData.log.trim().split("\n") : outData.log.trim().split(/\r?\n/);
-        return lines.slice(-15).join(" | ").slice(-600);
+        logText = outData.log;
+      } else if (Array.isArray(outData?.files)) {
+        const logFile = outData.files.find(
+          (f: any) =>
+            String(f?.fileName || f?.name || "")
+              .toLowerCase()
+              .endsWith(".log"),
+        );
+        if (logFile?.url) {
+          const logRes = await this.fetchKaggleOutputFileUrl(logFile.url, username, key);
+          if (logRes) {
+            logText = await logRes.text().catch(() => "");
+          }
+        }
+      }
+
+      if (logText && logText.trim()) {
+        const lines = logText
+          .trim()
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean);
+        return lines.slice(-15).join(" | ").slice(-700);
       }
     } catch {}
     return "";
@@ -1930,12 +2069,14 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
 
   /**
    * Fetches structured output (records + per-job status) from a completed Kaggle batch kernel.
+   * Handles both GCS signed URLs for `result.json` / `.log` files and inline `outData.log`.
    */
   public async fetchBatchKernelOutput(
     kernelSlug: string,
     username: string,
     key: string,
   ): Promise<KiraBatchKernelOutput> {
+    let lastLogTail = "";
     try {
       const outData = await this.makeKaggleRequest(
         `https://www.kaggle.com/api/v1/kernels/output?userName=${encodeURIComponent(username)}&kernelSlug=${encodeURIComponent(kernelSlug)}`,
@@ -1944,7 +2085,7 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
         { method: "GET" },
       );
 
-      const files = outData?.files || [];
+      const files = Array.isArray(outData?.files) ? outData.files : [];
       const resFile = files.find(
         (f: any) =>
           f.fileName === "result.json" ||
@@ -1953,18 +2094,13 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
       );
 
       if (resFile?.url) {
-        const authHeader = VideoEncodingManager.getKaggleAuthHeader(
+        const fetchRes = await this.fetchKaggleOutputFileUrl(
+          resFile.url,
           username,
           key,
         );
-        const fetchRes = await fetch(resFile.url, {
-          headers: {
-            Authorization: authHeader,
-            "User-Agent": "AniLight-Worker/3.0",
-          },
-        });
-        if (fetchRes.ok) {
-          const data = await fetchRes.json();
+        if (fetchRes) {
+          const data = await fetchRes.json().catch(() => null);
           const norm = this.normalizeKernelOutput(data);
           if (norm) {
             return norm;
@@ -1972,8 +2108,27 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
         }
       }
 
-      if (outData?.log) {
-        const logStr = outData.log as string;
+      // Check inline log OR downloadable .log file in outData.files for __TASK_RESULT__
+      let logStr = typeof outData?.log === "string" ? outData.log : "";
+      if (!logStr.includes("__TASK_RESULT__=")) {
+        const logFile = files.find((f: any) =>
+          String(f?.fileName || f?.name || "")
+            .toLowerCase()
+            .endsWith(".log"),
+        );
+        if (logFile?.url) {
+          const logRes = await this.fetchKaggleOutputFileUrl(
+            logFile.url,
+            username,
+            key,
+          );
+          if (logRes) {
+            logStr = await logRes.text().catch(() => logStr);
+          }
+        }
+      }
+
+      if (logStr) {
         const match = logStr.match(/__TASK_RESULT__=(.*)/);
         if (match) {
           try {
@@ -1984,16 +2139,24 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
             }
           } catch {}
         }
+        const lines = logStr
+          .trim()
+          .split(/\r?\n/)
+          .map((l: string) => l.trim())
+          .filter(Boolean);
+        lastLogTail = lines.slice(-12).join(" | ").slice(-500);
       }
     } catch (e: any) {
       log.warn(
         "Kaggle:Output",
         `Could not fetch kernel output for '${kernelSlug}': ${e?.message || e}`,
       );
+      lastLogTail = e?.message || String(e);
     }
 
     throw new Error(
-      `Kaggle kernel '${kernelSlug}' completed but output result.json was not found`,
+      `Kaggle kernel '${kernelSlug}' completed without result.json${lastLogTail ? ` — Log tail: ${lastLogTail}` : ""}`,
     );
   }
 }
+

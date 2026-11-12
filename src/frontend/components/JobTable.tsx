@@ -184,6 +184,20 @@ export function JobTable({
     }
   };
 
+  const handleRequeueAllSkipped = async () => {
+    setBulkLoading("requeue_skipped");
+    try {
+      const res = await fetch("/api/jobs/requeue-skipped", { method: "POST" });
+      const data = await res.json();
+      onNotice?.(data.message || "Re-queued skipped jobs.");
+      await fetchJobs();
+    } catch {
+      onNotice?.("Failed to re-queue skipped jobs.");
+    } finally {
+      setBulkLoading(null);
+    }
+  };
+
   const handleExportSelectedJson = () => {
     const selectedList = jobs.filter((j) => selectedIds.has(j.id));
     if (selectedList.length === 0) return;
@@ -297,6 +311,10 @@ export function JobTable({
     () => jobs.filter((j) => j.status === "failed").length,
     [jobs],
   );
+  const skippedCount = useMemo(
+    () => jobs.filter((j) => j.status === "skipped").length,
+    [jobs],
+  );
   const completedCount = useMemo(
     () => jobs.filter((j) => j.status === "completed").length,
     [jobs],
@@ -346,6 +364,13 @@ export function JobTable({
             <span>Queued</span>
           </span>
         );
+      case "skipped":
+        return (
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-slate-300">
+            <PauseCircle className="w-3.5 h-3.5 shrink-0 text-amber-300" />
+            <span>Skipped (Policy)</span>
+          </span>
+        );
       case "failed":
         return (
           <span className="inline-flex items-center gap-1.5 text-xs font-mono text-rose-400">
@@ -369,6 +394,7 @@ export function JobTable({
     { id: "staged", label: "Staged" },
     { id: "encoding", label: "Encoding" },
     { id: "completed", label: "Completed" },
+    { id: "skipped", label: "Skipped" },
     { id: "failed", label: "Failed" },
   ];
 
@@ -386,6 +412,18 @@ export function JobTable({
 
           {/* Quick Selection & QoL Shortcuts */}
           <div className="hidden md:flex items-center gap-1.5 ml-2 text-[11px] font-mono">
+            {skippedCount > 0 && (
+              <button
+                type="button"
+                onClick={handleRequeueAllSkipped}
+                disabled={bulkLoading !== null}
+                className="btn-secondary px-2 py-1 rounded text-indigo-300 hover:text-white inline-flex items-center gap-1 cursor-pointer"
+                title="Re-queue all skipped jobs for discovery"
+              >
+                <RefreshCw className="w-3 h-3" />
+                <span>Re-queue Skipped ({skippedCount})</span>
+              </button>
+            )}
             {failedCount > 0 && (
               <button
                 type="button"
@@ -890,12 +928,13 @@ export function JobTable({
                         ) : (
                           <div className="inline-flex items-center gap-1">
                             {(job.status === "failed" ||
+                              job.status === "skipped" ||
                               job.status === "download_paused") && (
                               <button
                                 type="button"
                                 onClick={() => handleRetry(job.id)}
                                 className="btn-secondary p-1.5 rounded-md text-[#d5d9e6] hover:text-white cursor-pointer"
-                                title={`Retry Job #${job.id}`}
+                                title={`Retry / Re-queue Job #${job.id}`}
                                 aria-label={`Retry Job #${job.id}`}
                               >
                                 <RefreshCw className="w-3.5 h-3.5" />

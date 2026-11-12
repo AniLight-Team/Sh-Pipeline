@@ -42,6 +42,7 @@ import type {
   EnqueueRequest,
   EnqueueResponse,
   PipelineEpisodeResult,
+  PipelineExecutionPolicy,
   PipelineExecutionType,
   PipelineStats,
   KiraBatchManifestItem,
@@ -49,12 +50,41 @@ import type {
   KiraBatchHfRecord,
   R2SubtitleRecord,
   ReleaseCandidateBundle,
+  StagedFileDiskEntry,
+  StorageInspectionReport,
   VideoResolutionQuality,
 } from "./types.js";
 import { log } from "../utils/logger.js";
 
 let tablesInitialized = false;
 let lastWatchdogTimestamp: string | null = new Date().toISOString();
+let lastQuickReconcileAt = 0;
+
+function loadInitialExecutionPolicy(): PipelineExecutionPolicy {
+  try {
+    const policyFile = path.join(getKiraStagingDir(), ".pipeline-policy.json");
+    if (fs.existsSync(policyFile)) {
+      const parsed = JSON.parse(fs.readFileSync(policyFile, "utf8"));
+      if (
+        parsed?.policy === "all" ||
+        parsed?.policy === "vm_remux_only" ||
+        parsed?.policy === "kaggle_gpu_only"
+      ) {
+        return parsed.policy;
+      }
+    }
+  } catch {}
+  const envPolicy = (process.env.KIRA_EXECUTION_POLICY || "").trim().toLowerCase();
+  if (envPolicy === "vm_remux_only" || envPolicy === "pipeline_1" || envPolicy === "pipeline1") {
+    return "vm_remux_only";
+  }
+  if (envPolicy === "kaggle_gpu_only" || envPolicy === "pipeline_2" || envPolicy === "pipeline2") {
+    return "kaggle_gpu_only";
+  }
+  return "all";
+}
+
+let currentExecutionPolicy: PipelineExecutionPolicy = loadInitialExecutionPolicy();
 
 // Dedicated VM direct-remux concurrency limiter (Pipeline 1: H.264 -c:v copy)
 const vmRemuxQueue = new PQueue({ concurrency: KIRA_VM_MAX_CONCURRENT_BATCHES });
@@ -67,6 +97,108 @@ export class PipelineEngineService {
   private static readonly activeVmRemuxJobIds = new Set<number>();
   private static readonly activeExecutingBatchIds = new Set<number>();
   private static isDrainingVmRemux = false;
+  private static isReconcilingEncoding = false;
+
+  public static getExecutionPolicy(): PipelineExecutionPolicy {
+    return currentExecutionPolicy;
+  }
+
+  public static persistExecutionPolicyToDisk(policy: PipelineExecutionPolicy): void {
+    currentExecutionPolicy = policy;
+    try {
+      const policyFile = path.join(getKiraStagingDir(), ".pipeline-policy.json");
+      fs.writeFileSync(
+        policyFile,
+        JSON.stringify({ policy, updatedAt: new Date().toISOString() }, null, 2),
+        "utf8",
+      );
+    } catch {}
+  }
+
+  /**
+   * Pure deterministic policy filter for candidate bundles:
+   * - `all`: Allows both Pipeline 1 (`vm_remux` H.264) and Pipeline 2 (`kaggle_gpu` HEVC/AV1).
+   * - `vm_remux_only` (Pipeline 1 Only): Allows only `vm_remux` (H.264) bundles. If an episode only has HEVC/AV1 (`kaggle_gpu`) releases, marks it as skipped.
+   * - `kaggle_gpu_only` (Pipeline 2 Only): Allows only `kaggle_gpu` (HEVC/AV1) episodes. If an episode is a Pipeline 1 (H.264) release (unless explicitly forced to `kaggle_gpu`), marks it as skipped.
+   */
+  public static filterCandidateBundlesByPolicy(
+    bundles: ReleaseCandidateBundle[],
+    policy: PipelineExecutionPolicy,
+    forcedMode?: PipelineExecutionType | null,
+  ): {
+    allowedBundles: ReleaseCandidateBundle[];
+    skippedReason: string | null;
+    naturalPipeline: PipelineExecutionType | null;
+  } {
+    if (bundles.length === 0) {
+      return { allowedBundles: [], skippedReason: null, naturalPipeline: null };
+    }
+
+    const hasVmRemuxCandidate = bundles.some((b) => b.pipelineType === "vm_remux");
+    const hasKaggleGpuCandidate = bundles.some((b) => b.pipelineType === "kaggle_gpu");
+    const naturalPipeline: PipelineExecutionType = hasVmRemuxCandidate ? "vm_remux" : "kaggle_gpu";
+
+    if (policy === "all") {
+      if (forcedMode === "vm_remux" && hasVmRemuxCandidate) {
+        return {
+          allowedBundles: bundles.filter((b) => b.pipelineType === "vm_remux"),
+          skippedReason: null,
+          naturalPipeline,
+        };
+      }
+      if (forcedMode === "kaggle_gpu" && hasKaggleGpuCandidate) {
+        return {
+          allowedBundles: bundles.filter((b) => b.pipelineType === "kaggle_gpu"),
+          skippedReason: null,
+          naturalPipeline,
+        };
+      }
+      return { allowedBundles: bundles, skippedReason: null, naturalPipeline };
+    }
+
+    if (policy === "vm_remux_only") {
+      const vmBundles = bundles.filter((b) => b.pipelineType === "vm_remux");
+      if (vmBundles.length > 0) {
+        return {
+          allowedBundles: vmBundles,
+          skippedReason: null,
+          naturalPipeline: "vm_remux",
+        };
+      }
+      return {
+        allowedBundles: [],
+        skippedReason:
+          "Skipped: Only HEVC/AV1 (Pipeline 2 GPU) releases found while 'Pipeline 1 Only (VM H.264 Remux)' mode is active.",
+        naturalPipeline: "kaggle_gpu",
+      };
+    }
+
+    // policy === "kaggle_gpu_only"
+    if (hasVmRemuxCandidate && forcedMode !== "kaggle_gpu") {
+      return {
+        allowedBundles: [],
+        skippedReason:
+          "Skipped: Episode has H.264 (Pipeline 1 VM Remux) release while 'Pipeline 2 Only (Kaggle GPU)' mode is active.",
+        naturalPipeline: "vm_remux",
+      };
+    }
+
+    const gpuBundles = bundles.filter((b) => b.pipelineType === "kaggle_gpu");
+    if (gpuBundles.length > 0) {
+      return {
+        allowedBundles: gpuBundles,
+        skippedReason: null,
+        naturalPipeline: "kaggle_gpu",
+      };
+    }
+
+    return {
+      allowedBundles: [],
+      skippedReason:
+        "Skipped: No Pipeline 2 (HEVC/AV1 Kaggle GPU) releases found while 'Pipeline 2 Only' mode is active.",
+      naturalPipeline: "vm_remux",
+    };
+  }
 
   public static isBatchCurrentlyExecutingInProcess(batchId: number): boolean {
     return this.activeExecutingBatchIds.has(batchId);
@@ -79,6 +211,7 @@ export class PipelineEngineService {
   public static markWatchdogRun(): void {
     lastWatchdogTimestamp = new Date().toISOString();
   }
+
 
   public static async ensureTables(): Promise<void> {
     if (tablesInitialized || !DATABASE_URL) return;
@@ -514,6 +647,7 @@ export class PipelineEngineService {
             ...metadata,
             animeId: animeId || null,
             anilistId: anilistId || null,
+            ...(req.executionPolicy ? { executionPolicy: req.executionPolicy } : {}),
           },
           callbackUrl: effectiveCallbackUrl,
           heartbeatAt: new Date(),
@@ -680,7 +814,7 @@ export class PipelineEngineService {
       }
 
       const ext = path.extname(fullPath) || ".mkv";
-      const stagedFilename = `staged_${jobId}_${qualityTag}_${crypto.randomUUID().slice(0, 8)}${ext}`;
+      const stagedFilename = `job_${jobId}_ep${episodeNumber}_${qualityTag}_${crypto.randomUUID().slice(0, 6)}${ext}`;
       const stagedPath = path.join(stagingDir, stagedFilename);
 
       try {
@@ -721,11 +855,14 @@ export class PipelineEngineService {
    *      picks the best 1080p H.264 release and ONLY processes 1 quality (1080p).
    *    - Tier 3 (`hevc_av1_gpu` -> Pipeline 2 `kaggle_gpu`): If no H.264 release exists at all, picks the best 1080p HEVC/AV1
    *      release and routes to the Kaggle GPU batch pipeline.
-   * 4. Extracts & uploads subtitles to Cloudflare R2 strictly from the 1080p version.
-   * 5. For Tier 1 (`h264_multi`), downloads same-group 720p & 480p in parallel!
+   * 4. Enforces the active PipelineExecutionPolicy (`all` | `vm_remux_only` | `kaggle_gpu_only`):
+   *    - If `vm_remux_only` (Pipeline 1 Only) is active and an episode only has HEVC/AV1 (`kaggle_gpu`) releases, marks the job as `skipped`.
+   *    - If `kaggle_gpu_only` (Pipeline 2 Only) is active and an episode is a Pipeline 1 (`vm_remux` H.264) release, marks the job as `skipped`.
+   * 5. Extracts & uploads subtitles to Cloudflare R2 strictly from the 1080p version.
+   * 6. For Tier 1 (`h264_multi`), downloads same-group 720p & 480p in parallel!
    */
   public static async discoverAndStageJob(jobId: number): Promise<{
-    status: "staged" | "download_paused" | "failed";
+    status: "staged" | "download_paused" | "skipped" | "failed";
     jobId: number;
     pipelineType?: PipelineExecutionType;
     selectionTier?: CandidateSelectionTier;
@@ -751,8 +888,64 @@ export class PipelineEngineService {
       };
     }
 
+    const effectivePolicy: PipelineExecutionPolicy =
+      job.metadata?.executionPolicy === "vm_remux_only" ||
+      job.metadata?.executionPolicy === "kaggle_gpu_only" ||
+      job.metadata?.executionPolicy === "all"
+        ? job.metadata.executionPolicy
+        : this.getExecutionPolicy();
+
     if (job.status === "staged" && this.hasValidStagedFiles(job)) {
-      if (this.isJobVmRemux(job)) {
+      const jobIsRemux = this.isJobVmRemux(job);
+      if (effectivePolicy === "vm_remux_only" && !jobIsRemux) {
+        const skipReason =
+          "Skipped: Staged HEVC/AV1 (Pipeline 2) release skipped while 'Pipeline 1 Only (VM Remux)' policy is active.";
+        await this.cleanupJobStagedFiles(job);
+        await db
+          .update(schema.pipelineJob)
+          .set({
+            status: "skipped",
+            batchId: null,
+            stagedFilePath: null,
+            lastError: skipReason,
+            metadata: {
+              ...(job.metadata || {}),
+              skippedByPolicy: effectivePolicy,
+              incompatiblePipeline: "kaggle_gpu",
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.pipelineJob.id, jobId));
+        return { status: "skipped", jobId, pipelineType: "kaggle_gpu", error: skipReason };
+      }
+
+      if (
+        effectivePolicy === "kaggle_gpu_only" &&
+        jobIsRemux &&
+        job.metadata?.processingMode !== "kaggle_gpu"
+      ) {
+        const skipReason =
+          "Skipped: Staged H.264 (Pipeline 1) release skipped while 'Pipeline 2 Only (Kaggle GPU)' policy is active.";
+        await this.cleanupJobStagedFiles(job);
+        await db
+          .update(schema.pipelineJob)
+          .set({
+            status: "skipped",
+            batchId: null,
+            stagedFilePath: null,
+            lastError: skipReason,
+            metadata: {
+              ...(job.metadata || {}),
+              skippedByPolicy: effectivePolicy,
+              incompatiblePipeline: "vm_remux",
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.pipelineJob.id, jobId));
+        return { status: "skipped", jobId, pipelineType: "vm_remux", error: skipReason };
+      }
+
+      if (jobIsRemux) {
         setImmediate(() => {
           this.drainVmRemuxQueue().catch(() => {});
         });
@@ -760,7 +953,7 @@ export class PipelineEngineService {
       return {
         status: "staged",
         jobId,
-        pipelineType: this.isJobVmRemux(job) ? "vm_remux" : "kaggle_gpu",
+        pipelineType: jobIsRemux ? "vm_remux" : "kaggle_gpu",
         sizeBytes: job.sizeBytes || 0,
       };
     }
@@ -815,7 +1008,7 @@ export class PipelineEngineService {
     try {
       log.info(
         "PipelineEngine",
-        `[Stage 1 Discovery] Job #${job.id} (AniList ${job.anilistId || "n/a"} | AniDB ${job.anidbId || "n/a"} Ep ${job.episodeNumber} [${job.types.join("/")}])...`,
+        `[Stage 1 Discovery] Job #${job.id} (AniList ${job.anilistId || "n/a"} | AniDB ${job.anidbId || "n/a"} Ep ${job.episodeNumber} [${job.types.join("/")}] | Policy: ${effectivePolicy})...`,
       );
 
       const wantsDub = job.types.includes("dub");
@@ -870,7 +1063,7 @@ export class PipelineEngineService {
           {
             knownTitles: effectiveKnownTitles,
             totalExpectedEps,
-            maxBundles: 5,
+            maxBundles: 10,
           },
         );
         if (bundles.length === 0 && wantsSub && wantsDub) {
@@ -881,7 +1074,7 @@ export class PipelineEngineService {
             {
               knownTitles: effectiveKnownTitles,
               totalExpectedEps,
-              maxBundles: 5,
+              maxBundles: 10,
             },
           );
         }
@@ -1017,8 +1210,55 @@ export class PipelineEngineService {
         );
       }
 
-      // Hydrate all quality entries (1080p, 720p, 480p) in the top bundles with Tsukihime tracker URLs & seeders
-      topBundles = await TsukihimeClient.hydrateCandidateBundles(topBundles);
+      // 5. Enforce Pipeline Execution Policy BEFORE downloading any files!
+      const forcedMode =
+        job.metadata?.processingMode === "vm_remux" || job.metadata?.processingMode === "kaggle_gpu"
+          ? (job.metadata.processingMode as PipelineExecutionType)
+          : null;
+      const policyDecision = this.filterCandidateBundlesByPolicy(
+        topBundles,
+        effectivePolicy,
+        forcedMode,
+      );
+
+      if (policyDecision.skippedReason) {
+        const naturalBundle = topBundles[0];
+        log.warn(
+          "PipelineEngine",
+          `[Job #${job.id}] Marking job as SKIPPED under policy '${effectivePolicy}': ${policyDecision.skippedReason}`,
+        );
+        await db
+          .update(schema.pipelineJob)
+          .set({
+            status: "skipped",
+            pipelineType: policyDecision.naturalPipeline || naturalBundle.pipelineType,
+            selectionTier: naturalBundle.selectionTier,
+            releaseGroup: naturalBundle.group,
+            videoCodec: naturalBundle.isH264 ? "h264" : "hevc",
+            torrentTitle: naturalBundle.primaryEntry.item.title,
+            lastError: policyDecision.skippedReason,
+            metadata: {
+              ...(job.metadata || {}),
+              skippedByPolicy: effectivePolicy,
+              incompatiblePipeline: policyDecision.naturalPipeline || naturalBundle.pipelineType,
+              candidateTitle: naturalBundle.primaryEntry.item.title,
+            },
+            heartbeatAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.pipelineJob.id, jobId));
+
+        return {
+          status: "skipped",
+          jobId,
+          pipelineType: policyDecision.naturalPipeline || naturalBundle.pipelineType,
+          selectionTier: naturalBundle.selectionTier,
+          error: policyDecision.skippedReason,
+        };
+      }
+
+      // Hydrate all quality entries (1080p, 720p, 480p) in the policy-allowed bundles with Tsukihime tracker URLs & seeders
+      topBundles = await TsukihimeClient.hydrateCandidateBundles(policyDecision.allowedBundles);
 
       let selectedBundle: ReleaseCandidateBundle | null = null;
       let primaryStagedPath: string | null = null;
@@ -1142,6 +1382,77 @@ export class PipelineEngineService {
       let effectiveSelectionTier: CandidateSelectionTier = isBrowserCompatibleH264
         ? selectedBundle.selectionTier
         : "hevc_av1_gpu";
+
+      // Post-Probe Policy Guardrail: If ffprobe revealed the stream is actually HEVC/AV1/10-bit when 'vm_remux_only' is active,
+      // or 8-bit H.264 when 'kaggle_gpu_only' is active, mark as skipped and clean up the downloaded file!
+      if (effectivePolicy === "vm_remux_only" && processingMode !== "vm_remux") {
+        const skipReason = `Skipped: Probed stream is '${detectedVideoCodec}' (requires Pipeline 2 GPU encode) while 'Pipeline 1 Only (VM Remux)' policy is active.`;
+        await fs.promises.unlink(primaryStagedPath).catch(() => {});
+        await db
+          .update(schema.pipelineJob)
+          .set({
+            status: "skipped",
+            pipelineType: "kaggle_gpu",
+            selectionTier: "hevc_av1_gpu",
+            releaseGroup: selectedBundle.group,
+            videoCodec: detectedVideoCodec,
+            stagedFilePath: null,
+            lastError: skipReason,
+            metadata: {
+              ...(job.metadata || {}),
+              skippedByPolicy: effectivePolicy,
+              incompatiblePipeline: "kaggle_gpu",
+              videoCodec: detectedVideoCodec,
+            },
+            heartbeatAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.pipelineJob.id, jobId));
+        return {
+          status: "skipped",
+          jobId,
+          pipelineType: "kaggle_gpu",
+          selectionTier: "hevc_av1_gpu",
+          error: skipReason,
+        };
+      }
+
+      if (
+        effectivePolicy === "kaggle_gpu_only" &&
+        processingMode === "vm_remux" &&
+        forcedMode !== "kaggle_gpu"
+      ) {
+        const skipReason = `Skipped: Probed stream is 8-bit H.264 (Pipeline 1 VM Remux) while 'Pipeline 2 Only (Kaggle GPU)' policy is active.`;
+        await fs.promises.unlink(primaryStagedPath).catch(() => {});
+        await db
+          .update(schema.pipelineJob)
+          .set({
+            status: "skipped",
+            pipelineType: "vm_remux",
+            selectionTier: effectiveSelectionTier,
+            releaseGroup: selectedBundle.group,
+            videoCodec: detectedVideoCodec,
+            stagedFilePath: null,
+            lastError: skipReason,
+            metadata: {
+              ...(job.metadata || {}),
+              skippedByPolicy: effectivePolicy,
+              incompatiblePipeline: "vm_remux",
+              videoCodec: detectedVideoCodec,
+            },
+            heartbeatAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.pipelineJob.id, jobId));
+        return {
+          status: "skipped",
+          jobId,
+          pipelineType: "vm_remux",
+          selectionTier: effectiveSelectionTier,
+          error: skipReason,
+        };
+      }
+
 
       // Run 1080p R2 subtitle extraction AND (if Tier 1 h264_multi) parallel sibling 720p/480p downloads concurrently!
       const extract1080pSubtitlesTask = async (): Promise<R2SubtitleRecord[]> => {
@@ -1423,13 +1734,18 @@ export class PipelineEngineService {
     reason: string;
     stats: Awaited<ReturnType<typeof PipelineEngineService.getStagedWindowStats>>;
   }> {
+    const policy = this.getExecutionPolicy();
     const stats = await this.getStagedWindowStats();
 
-    // Always ensure Pipeline 1 (2-at-a-time VM Remux) is draining any staged H.264 jobs immediately
-    if (stats.stagedRemuxCount > 0) {
+    // Always ensure Pipeline 1 (2-at-a-time VM Remux) is draining any staged H.264 jobs immediately (unless policy is kaggle_gpu_only)
+    if (stats.stagedRemuxCount > 0 && policy !== "kaggle_gpu_only") {
       setImmediate(() => {
         this.drainVmRemuxQueue().catch(() => {});
       });
+    }
+
+    if (policy === "vm_remux_only") {
+      return { shouldSeal: false, reason: "policy_vm_remux_only", stats };
     }
 
     if (stats.stagedGpuCount === 0) {
@@ -1485,14 +1801,19 @@ export class PipelineEngineService {
    */
   public static async drainVmRemuxQueue(): Promise<number[]> {
     if (this.isDrainingVmRemux) return [];
+    const policy = this.getExecutionPolicy();
+    if (policy === "kaggle_gpu_only") {
+      return [];
+    }
+
     this.isDrainingVmRemux = true;
     const startedJobIds: number[] = [];
 
     try {
       await this.ensureTables();
 
-      // 1. Recover any orphaned VM remux job stuck in 'encoding' with batchId IS NULL and stale heartbeat (> 3m)
-      const threeMinsAgo = new Date(Date.now() - 3 * 60 * 1000);
+      // 1. Recover any orphaned VM remux job stuck in 'encoding' with batchId IS NULL and stale heartbeat (> 2m)
+      const twoMinsAgo = new Date(Date.now() - 2 * 60 * 1000);
       const encodingUnbatched = await db
         .select()
         .from(schema.pipelineJob)
@@ -1507,7 +1828,7 @@ export class PipelineEngineService {
         if (
           this.isJobVmRemux(sj) &&
           !this.activeVmRemuxJobIds.has(sj.id) &&
-          (!sj.heartbeatAt || sj.heartbeatAt < threeMinsAgo)
+          (!sj.heartbeatAt || sj.heartbeatAt < twoMinsAgo)
         ) {
           if (this.hasValidStagedFiles(sj)) {
             log.warn(
@@ -1635,6 +1956,10 @@ export class PipelineEngineService {
     kaggleUsername?: string | null;
   }> {
     await this.ensureTables();
+
+    if (this.getExecutionPolicy() === "vm_remux_only") {
+      return { batchId: null, jobCount: 0, totalBytes: 0 };
+    }
 
     const { kaggleAccounts } = loadAccountsFromEnv();
     if (kaggleAccounts.length === 0) {
@@ -2881,11 +3206,18 @@ export class PipelineEngineService {
       .where(eq(schema.pipelineJob.batchId, batchId));
 
     log.info("PipelineEngine", `Fetching encoded outputs for Batch #${batchId} (${kernelSlug})...`);
-    const output = await videoManager.fetchBatchKernelOutput(
-      kernelSlug,
-      account.username,
-      account.key,
-    );
+    let output;
+    try {
+      output = await videoManager.fetchBatchKernelOutput(
+        kernelSlug,
+        account.username,
+        account.key,
+      );
+    } catch (fetchErr: any) {
+      const errMsg = fetchErr?.message || String(fetchErr);
+      await this.handleBatchFailure(batchId, errMsg);
+      throw fetchErr;
+    }
 
     const records = output.records || [];
     const failedJobMap = new Map<number, string>();
@@ -3034,6 +3366,7 @@ export class PipelineEngineService {
           .update(schema.pipelineJob)
           .set({
             status: "failed",
+            batchId: null,
             lastError: `Batch #${batchId} failed: ${errorMsg}`,
             heartbeatAt: new Date(),
             updatedAt: new Date(),
@@ -3041,6 +3374,608 @@ export class PipelineEngineService {
           .where(eq(schema.pipelineJob.id, job.id));
       }
     }
+  }
+
+  /**
+   * Updates the global Pipeline Execution Policy ("all" | "vm_remux_only" | "kaggle_gpu_only").
+   * - Marks incompatible staged jobs as "skipped" and frees their staged SSD files.
+   * - Optionally re-queues previously "skipped" jobs that are now compatible with the new policy.
+   */
+  public static async setExecutionPolicy(
+    policy: PipelineExecutionPolicy,
+    options: { requeueSkipped?: boolean; applyToStaged?: boolean } = {},
+  ): Promise<{
+    policy: PipelineExecutionPolicy;
+    skippedStagedCount: number;
+    requeuedJobs: (typeof schema.pipelineJob.$inferSelect)[];
+  }> {
+    this.persistExecutionPolicyToDisk(policy);
+    let skippedStagedCount = 0;
+    const requeuedJobs: (typeof schema.pipelineJob.$inferSelect)[] = [];
+
+    if (!DATABASE_URL) {
+      return { policy, skippedStagedCount, requeuedJobs };
+    }
+
+    try {
+      await this.ensureTables();
+
+      // 1. Apply policy to currently staged unbatched jobs
+      if (options.applyToStaged !== false && policy !== "all") {
+        const stagedRows = await db
+          .select()
+          .from(schema.pipelineJob)
+          .where(and(eq(schema.pipelineJob.status, "staged"), isNull(schema.pipelineJob.batchId)));
+
+        for (const job of stagedRows) {
+          const isRemux = this.isJobVmRemux(job);
+          if (policy === "vm_remux_only" && !isRemux) {
+            const skipReason =
+              "Skipped: Staged HEVC/AV1 (Pipeline 2) release skipped when switching to 'Pipeline 1 Only (VM Remux)' mode.";
+            await this.cleanupJobStagedFiles(job);
+            await db
+              .update(schema.pipelineJob)
+              .set({
+                status: "skipped",
+                batchId: null,
+                stagedFilePath: null,
+                lastError: skipReason,
+                metadata: {
+                  ...(job.metadata || {}),
+                  skippedByPolicy: policy,
+                  incompatiblePipeline: "kaggle_gpu",
+                },
+                updatedAt: new Date(),
+              })
+              .where(eq(schema.pipelineJob.id, job.id));
+            skippedStagedCount++;
+          } else if (
+            policy === "kaggle_gpu_only" &&
+            isRemux &&
+            job.metadata?.processingMode !== "kaggle_gpu"
+          ) {
+            const skipReason =
+              "Skipped: Staged H.264 (Pipeline 1) release skipped when switching to 'Pipeline 2 Only (Kaggle GPU)' mode.";
+            await this.cleanupJobStagedFiles(job);
+            await db
+              .update(schema.pipelineJob)
+              .set({
+                status: "skipped",
+                batchId: null,
+                stagedFilePath: null,
+                lastError: skipReason,
+                metadata: {
+                  ...(job.metadata || {}),
+                  skippedByPolicy: policy,
+                  incompatiblePipeline: "vm_remux",
+                },
+                updatedAt: new Date(),
+              })
+              .where(eq(schema.pipelineJob.id, job.id));
+            skippedStagedCount++;
+          }
+        }
+      }
+
+      // 2. Optionally re-queue previously skipped jobs that are now allowed by the new policy
+      if (options.requeueSkipped) {
+        const skippedRows = await db
+          .select()
+          .from(schema.pipelineJob)
+          .where(eq(schema.pipelineJob.status, "skipped"))
+          .orderBy(asc(schema.pipelineJob.id));
+
+        for (const sJob of skippedRows) {
+          const incomp = sJob.metadata?.incompatiblePipeline || sJob.pipelineType;
+          const isAllowedNow =
+            policy === "all" ||
+            (policy === "vm_remux_only" && incomp === "vm_remux") ||
+            (policy === "kaggle_gpu_only" && incomp === "kaggle_gpu");
+
+          if (isAllowedNow) {
+            const nextMeta = { ...(sJob.metadata || {}) };
+            delete nextMeta.skippedByPolicy;
+            delete nextMeta.executionPolicy;
+
+            const hasStaged = this.hasValidStagedFiles(sJob);
+            const [updated] = await db
+              .update(schema.pipelineJob)
+              .set({
+                status: hasStaged ? "staged" : "queued",
+                batchId: null,
+                lastError: null,
+                metadata: nextMeta,
+                heartbeatAt: new Date(),
+                updatedAt: new Date(),
+              })
+              .where(eq(schema.pipelineJob.id, sJob.id))
+              .returning();
+            if (updated) {
+              requeuedJobs.push(updated);
+            }
+          }
+        }
+      }
+    } catch (err: any) {
+      log.warn("PipelineEngine", `setExecutionPolicy warning: ${err?.message || err}`);
+    }
+
+    return { policy, skippedStagedCount, requeuedJobs };
+  }
+
+  /**
+   * Reconciles any jobs or batches stuck in 'encoding' state:
+   * 1. Heals orphaned 'encoding' jobs whose batchId points to a failed, completed, or deleted batch.
+   * 2. Heals unbatched VM Remux 'encoding' jobs that are not in `activeVmRemuxJobIds` and have a stale heartbeat.
+   * 3. When `liveKaggleCheck: true` (or when a Kaggle batch heartbeat is stale), actively queries Kaggle API right now
+   *    to verify kernel/dataset status. If Kaggle returned an error or the kernel is missing/failed, immediately calls
+   *    `handleBatchFailure` so neither the batch nor its jobs remain stuck in 'encoding'.
+   */
+  public static async reconcileStuckEncodingStates(
+    options: { liveKaggleCheck?: boolean; forceBatchId?: number } = {},
+  ): Promise<{
+    reconciledJobs: number;
+    failedBatches: number;
+    completedBatches: number;
+    details: string[];
+  }> {
+    if (this.isReconcilingEncoding && !options.liveKaggleCheck && !options.forceBatchId) {
+      return { reconciledJobs: 0, failedBatches: 0, completedBatches: 0, details: [] };
+    }
+    this.isReconcilingEncoding = true;
+
+    let reconciledJobs = 0;
+    let failedBatches = 0;
+    let completedBatches = 0;
+    const details: string[] = [];
+
+    try {
+      if (!DATABASE_URL) {
+        return { reconciledJobs, failedBatches, completedBatches, details };
+      }
+      await this.ensureTables();
+
+      // Step 1: Live Kaggle status check for active batches when requested or when heartbeat is stale (> 2m)
+      const activeBatches = await db
+        .select()
+        .from(schema.pipelineBatch)
+        .where(
+          inArray(schema.pipelineBatch.status, [
+            "created",
+            "uploading",
+            "waiting_dataset",
+            "kernel_running",
+          ]),
+        )
+        .orderBy(asc(schema.pipelineBatch.id));
+
+      const twoMinsAgo = new Date(Date.now() - 2 * 60 * 1000);
+      const fourMinsAgo = new Date(Date.now() - 4 * 60 * 1000);
+      const videoManager = new VideoEncodingManager();
+
+      for (const batch of activeBatches) {
+        const isTargetBatch = options.forceBatchId === batch.id;
+        const isStale = !batch.heartbeatAt || batch.heartbeatAt < twoMinsAgo;
+
+        if (!options.liveKaggleCheck && !isTargetBatch && !isStale) {
+          continue;
+        }
+
+        if (this.isBatchVmRemux(batch)) {
+          if (!this.activeExecutingBatchIds.has(batch.id) && (!batch.heartbeatAt || batch.heartbeatAt < fourMinsAgo)) {
+            await this.handleBatchFailure(batch.id, "Interrupted VM remux batch recovered");
+            failedBatches++;
+            details.push(`Batch #${batch.id} (VM Remux): recovered stale batch`);
+          }
+          continue;
+        }
+
+        if (batch.status === "kernel_running") {
+          if (!batch.kernelSlug) {
+            await this.handleBatchFailure(batch.id, "Batch in kernel_running state without a kernelSlug");
+            failedBatches++;
+            details.push(`Batch #${batch.id}: failed (missing kernelSlug)`);
+            continue;
+          }
+
+          const progress = await this.checkBatchKernelProgress(batch.id);
+          if (progress.state === "failed") {
+            const errMsg = progress.errorDetail || `Kaggle kernel failed (${progress.rawStatus})`;
+            await this.handleBatchFailure(batch.id, errMsg);
+            failedBatches++;
+            details.push(`Batch #${batch.id}: Kaggle error detected (${errMsg})`);
+          } else if (progress.state === "completed") {
+            try {
+              await this.finalizeCompletedBatch(batch.id);
+              completedBatches++;
+              details.push(`Batch #${batch.id}: Kaggle kernel completed & finalized`);
+            } catch (finErr: any) {
+              failedBatches++;
+              details.push(`Batch #${batch.id}: Output finalization failed (${finErr?.message || finErr})`);
+            }
+          }
+        } else if (batch.status === "waiting_dataset" && batch.datasetSlug) {
+          try {
+            const account = this.resolveBatchKaggleAccount(batch.kaggleUsername);
+            const dsStatus = await videoManager.checkDatasetStatusOnce(
+              batch.datasetSlug,
+              account.username,
+              account.key,
+              true,
+            );
+            if (dsStatus.state === "failed") {
+              const errMsg = `Kaggle dataset '${batch.datasetSlug}' indexing failed (${dsStatus.rawStatus})`;
+              await this.handleBatchFailure(batch.id, errMsg);
+              failedBatches++;
+              details.push(`Batch #${batch.id}: ${errMsg}`);
+            } else if (!this.activeExecutingBatchIds.has(batch.id) && (!batch.heartbeatAt || batch.heartbeatAt < fourMinsAgo)) {
+              // Dataset is ready or indexing, but no worker is polling it — resume execution
+              setImmediate(() => {
+                this.executeBatch(batch.id).catch(() => {});
+              });
+              details.push(`Batch #${batch.id}: resumed dataset wait worker`);
+            }
+          } catch (dsErr: any) {
+            if (!this.activeExecutingBatchIds.has(batch.id) && (!batch.heartbeatAt || batch.heartbeatAt < fourMinsAgo)) {
+              await this.handleBatchFailure(batch.id, dsErr?.message || "Dataset status check failed");
+              failedBatches++;
+            }
+          }
+        } else if (
+          (batch.status === "uploading" || batch.status === "created") &&
+          !this.activeExecutingBatchIds.has(batch.id) &&
+          (!batch.heartbeatAt || batch.heartbeatAt < fourMinsAgo)
+        ) {
+          if (batch.status === "uploading") {
+            await this.handleBatchFailure(
+              batch.id,
+              "Dataset upload interrupted or stalled; returning jobs to staged queue",
+            );
+            failedBatches++;
+            details.push(`Batch #${batch.id}: aborted stalled upload and returned jobs to staged`);
+          } else if (options.liveKaggleCheck || isTargetBatch) {
+            setImmediate(() => {
+              this.executeBatch(batch.id).catch(() => {});
+            });
+            details.push(`Batch #${batch.id}: triggered created batch execution`);
+          }
+        }
+      }
+
+      // Step 2: Reconcile any job in status = 'encoding' whose batch is already failed/completed/missing,
+      // or whose unbatched VM Remux worker is no longer active.
+      const encodingJobs = await db
+        .select()
+        .from(schema.pipelineJob)
+        .where(eq(schema.pipelineJob.status, "encoding"))
+        .orderBy(asc(schema.pipelineJob.id));
+
+      for (const job of encodingJobs) {
+        if (job.batchId != null) {
+          const parentBatch = await db.query.pipelineBatch.findFirst({
+            where: eq(schema.pipelineBatch.id, job.batchId),
+          });
+
+          if (!parentBatch || parentBatch.status === "failed" || parentBatch.status === "completed") {
+            if (job.resultPayload) {
+              await db
+                .update(schema.pipelineJob)
+                .set({
+                  status: "completed",
+                  lastError: null,
+                  completedAt: job.completedAt || new Date(),
+                  updatedAt: new Date(),
+                })
+                .where(eq(schema.pipelineJob.id, job.id));
+              reconciledJobs++;
+              details.push(`Job #${job.id}: marked completed (had resultPayload)`);
+            } else {
+              const hasStaged = this.hasValidStagedFiles(job);
+              const canRetry = hasStaged && job.attempt < MAX_JOB_ATTEMPTS;
+              const batchErr = parentBatch?.lastError || "Batch terminated while job was in encoding state";
+              await db
+                .update(schema.pipelineJob)
+                .set({
+                  status: canRetry ? "staged" : "failed",
+                  batchId: null,
+                  attempt: canRetry ? job.attempt + 1 : job.attempt,
+                  lastError: canRetry
+                    ? `Recovered from Batch #${job.batchId} (${batchErr}); re-staged for retry`
+                    : `Batch #${job.batchId} failed: ${batchErr}`,
+                  heartbeatAt: new Date(),
+                  updatedAt: new Date(),
+                })
+                .where(eq(schema.pipelineJob.id, job.id));
+              reconciledJobs++;
+              details.push(`Job #${job.id}: transitioned from stuck 'encoding' -> '${canRetry ? "staged" : "failed"}'`);
+            }
+          }
+        } else {
+          // Unbatched job in 'encoding' (Pipeline 1 VM Remux)
+          const isActivelyRemuxing = this.activeVmRemuxJobIds.has(job.id);
+          const isStaleJob = !job.heartbeatAt || job.heartbeatAt < twoMinsAgo;
+
+          if (!isActivelyRemuxing && (options.liveKaggleCheck || isStaleJob)) {
+            const hasStaged = this.hasValidStagedFiles(job);
+            await db
+              .update(schema.pipelineJob)
+              .set({
+                status: hasStaged ? "staged" : "queued",
+                batchId: null,
+                stagedFilePath: hasStaged ? job.stagedFilePath : null,
+                lastError: hasStaged
+                  ? "Recovered from interrupted VM remux slot; re-staged"
+                  : "Staged file missing after interrupted VM remux; re-queued for discovery",
+                heartbeatAt: new Date(),
+                updatedAt: new Date(),
+              })
+              .where(eq(schema.pipelineJob.id, job.id));
+            reconciledJobs++;
+            details.push(`Job #${job.id}: recovered unbatched VM Remux job -> '${hasStaged ? "staged" : "queued"}'`);
+          }
+        }
+      }
+    } catch (err: any) {
+      log.warn("PipelineEngine", `reconcileStuckEncodingStates warning: ${err?.message || err}`);
+    } finally {
+      this.isReconcilingEncoding = false;
+    }
+
+    return { reconciledJobs, failedBatches, completedBatches, details };
+  }
+
+  /**
+   * Inspects the local SSD staging folder (`getKiraStagingDir()`) and cross-references every file on disk
+   * with the jobs in `pipeline_encoding_job` so the operator can see exactly where staged files are stored,
+   * which job/episode/quality owns each file, and whether any orphaned files exist on disk.
+   */
+  public static async inspectStagedFilesOnDisk(): Promise<StorageInspectionReport> {
+    const stagingDir = getKiraStagingDir();
+    const downloadDir = DEFAULT_DOWNLOAD_DIR;
+    const files: StagedFileDiskEntry[] = [];
+    let totalDiskBytes = 0;
+    let orphanCount = 0;
+    let orphanBytes = 0;
+
+    let freeDiskBytes = Number.MAX_SAFE_INTEGER;
+    try {
+      const statFs = fs.statfsSync(stagingDir);
+      freeDiskBytes = Number(statFs.bavail) * Number(statFs.bsize);
+    } catch {}
+
+    // Map known staged file paths to jobs in DB
+    const pathToJobInfo = new Map<
+      string,
+      {
+        jobId: number;
+        anilistId: number | null;
+        animeTitle: string | null;
+        episodeNumber: number;
+        quality: VideoResolutionQuality | null;
+        pipelineType: PipelineExecutionType;
+        jobStatus: string;
+      }
+    >();
+    const jobById = new Map<
+      number,
+      {
+        jobId: number;
+        anilistId: number | null;
+        animeTitle: string | null;
+        episodeNumber: number;
+        pipelineType: PipelineExecutionType;
+        jobStatus: string;
+      }
+    >();
+
+    if (DATABASE_URL) {
+      try {
+        await this.ensureTables();
+        const allJobs = await db
+          .select({
+            id: schema.pipelineJob.id,
+            anilistId: schema.pipelineJob.anilistId,
+            episodeNumber: schema.pipelineJob.episodeNumber,
+            status: schema.pipelineJob.status,
+            pipelineType: schema.pipelineJob.pipelineType,
+            stagedFilePath: schema.pipelineJob.stagedFilePath,
+            stagedQualities: schema.pipelineJob.stagedQualities,
+            metadata: schema.pipelineJob.metadata,
+          })
+          .from(schema.pipelineJob);
+
+        for (const j of allJobs) {
+          const pType: PipelineExecutionType = this.isJobVmRemux(j) ? "vm_remux" : "kaggle_gpu";
+          const title = (j.metadata as any)?.primaryTitle || null;
+          jobById.set(j.id, {
+            jobId: j.id,
+            anilistId: j.anilistId,
+            animeTitle: title,
+            episodeNumber: j.episodeNumber,
+            pipelineType: pType,
+            jobStatus: j.status,
+          });
+
+          if (j.stagedFilePath) {
+            pathToJobInfo.set(path.resolve(j.stagedFilePath), {
+              jobId: j.id,
+              anilistId: j.anilistId,
+              animeTitle: title,
+              episodeNumber: j.episodeNumber,
+              quality: "1080p",
+              pipelineType: pType,
+              jobStatus: j.status,
+            });
+          }
+
+          const sq = (j.stagedQualities || (j.metadata as any)?.stagedQualities) as
+            | Partial<Record<VideoResolutionQuality, string>>
+            | undefined;
+          if (sq && typeof sq === "object") {
+            for (const [qKey, qPath] of Object.entries(sq)) {
+              if (typeof qPath === "string" && qPath.trim()) {
+                pathToJobInfo.set(path.resolve(qPath), {
+                  jobId: j.id,
+                  anilistId: j.anilistId,
+                  animeTitle: title,
+                  episodeNumber: j.episodeNumber,
+                  quality: qKey as VideoResolutionQuality,
+                  pipelineType: pType,
+                  jobStatus: j.status,
+                });
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+
+    try {
+      if (fs.existsSync(stagingDir)) {
+        const entries = fs.readdirSync(stagingDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.name === ".pipeline-policy.json") continue;
+          const fullPath = path.resolve(stagingDir, entry.name);
+          try {
+            let sizeBytes = 0;
+            const stat = fs.statSync(fullPath);
+            if (entry.isFile()) {
+              sizeBytes = stat.size;
+            } else if (entry.isDirectory()) {
+              const subEntries = fs.readdirSync(fullPath, { withFileTypes: true });
+              for (const sub of subEntries) {
+                if (sub.isFile()) {
+                  sizeBytes += fs.statSync(path.join(fullPath, sub.name)).size;
+                }
+              }
+            }
+
+            totalDiskBytes += sizeBytes;
+
+            let matched = pathToJobInfo.get(fullPath) || null;
+            let inferredQuality: VideoResolutionQuality | null = matched?.quality || null;
+
+            if (!matched) {
+              // Try inferring Job ID from filename pattern: job_123_ep1_1080p_... or staged_123_1080p_... or vm_remux_job_123_...
+              const m =
+                entry.name.match(/^(?:job|staged|vm_remux_job)_(\d+)(?:_ep(\d+))?(?:_(1080p|720p|480p))?/i);
+              if (m) {
+                const parsedJobId = parseInt(m[1], 10);
+                if (m[3]) {
+                  inferredQuality = m[3].toLowerCase() as VideoResolutionQuality;
+                }
+                const jInfo = jobById.get(parsedJobId);
+                if (jInfo) {
+                  matched = {
+                    ...jInfo,
+                    quality: inferredQuality,
+                  };
+                }
+              }
+            }
+
+            const isActiveOwner =
+              matched &&
+              ["downloading", "staged", "encoding"].includes(matched.jobStatus);
+            const isOrphan = !isActiveOwner;
+
+            if (isOrphan) {
+              orphanCount++;
+              orphanBytes += sizeBytes;
+            }
+
+            files.push({
+              filename: entry.name,
+              fullPath,
+              sizeBytes,
+              modifiedAt: stat.mtime.toISOString(),
+              isDirectory: entry.isDirectory(),
+              jobId: matched?.jobId ?? null,
+              anilistId: matched?.anilistId ?? null,
+              animeTitle: matched?.animeTitle ?? null,
+              episodeNumber: matched?.episodeNumber ?? null,
+              quality: matched?.quality ?? inferredQuality,
+              pipelineType: matched?.pipelineType ?? null,
+              jobStatus: matched?.jobStatus ?? null,
+              isOrphan,
+            });
+          } catch {}
+        }
+      }
+    } catch {}
+
+    files.sort((a, b) => new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime());
+
+    return {
+      stagingDir,
+      downloadDir,
+      totalDiskBytes,
+      maxStagingBytes: KIRA_MAX_STAGING_BYTES,
+      freeDiskBytes: freeDiskBytes === Number.MAX_SAFE_INTEGER ? 0 : freeDiskBytes,
+      fileCount: files.length,
+      orphanCount,
+      orphanBytes,
+      files,
+    };
+  }
+
+  /**
+   * Deletes all orphaned files and temporary folders in `getKiraStagingDir()` that do not belong
+   * to any currently active (`downloading`, `staged`, or `encoding`) job.
+   */
+  public static async cleanupOrphanedStagedFiles(): Promise<{
+    deletedCount: number;
+    freedBytes: number;
+    requeuedMissingJobs: number;
+  }> {
+    const report = await this.inspectStagedFilesOnDisk();
+    let deletedCount = 0;
+    let freedBytes = 0;
+    let requeuedMissingJobs = 0;
+
+    for (const file of report.files) {
+      if (file.isOrphan) {
+        try {
+          await fs.promises.rm(file.fullPath, { recursive: true, force: true });
+          deletedCount++;
+          freedBytes += file.sizeBytes;
+        } catch {}
+      }
+    }
+
+    if (DATABASE_URL) {
+      try {
+        await this.ensureTables();
+        const stagedJobs = await db
+          .select()
+          .from(schema.pipelineJob)
+          .where(eq(schema.pipelineJob.status, "staged"));
+
+        for (const j of stagedJobs) {
+          if (!this.hasValidStagedFiles(j)) {
+            await db
+              .update(schema.pipelineJob)
+              .set({
+                status: "queued",
+                batchId: null,
+                stagedFilePath: null,
+                lastError: "Staged file missing on disk; re-queued for torrent discovery",
+                updatedAt: new Date(),
+              })
+              .where(eq(schema.pipelineJob.id, j.id));
+            requeuedMissingJobs++;
+          }
+        }
+      } catch {}
+    }
+
+    if (deletedCount > 0) {
+      setImmediate(() => {
+        this.onStagingSpaceFreed().catch(() => {});
+      });
+    }
+
+    return { deletedCount, freedBytes, requeuedMissingJobs };
   }
 
   public static async executeBatch(batchId: number): Promise<void> {
@@ -3153,6 +4088,14 @@ export class PipelineEngineService {
   public static async getStats(): Promise<PipelineStats> {
     await this.ensureTables();
 
+    // Throttled background reconciliation (every 12s) so jobs whose batch failed/completed never stay stuck in 'encoding'
+    if (Date.now() - lastQuickReconcileAt > 12_000) {
+      lastQuickReconcileAt = Date.now();
+      setImmediate(() => {
+        this.reconcileStuckEncodingStates({ liveKaggleCheck: false }).catch(() => {});
+      });
+    }
+
     let activeBatchRows: (typeof schema.pipelineBatch.$inferSelect)[] = [];
     let activeUnbatchedVmJobs: (typeof schema.pipelineJob.$inferSelect)[] = [];
     let counts: { status: string; count: number }[] = [];
@@ -3215,6 +4158,7 @@ export class PipelineEngineService {
           ? Math.floor((Date.now() - row.startedAt.getTime()) / 1000)
           : 0,
         heartbeatAt: row.heartbeatAt.toISOString(),
+        lastError: row.lastError,
       };
     });
 
@@ -3235,6 +4179,7 @@ export class PipelineEngineService {
             ? Math.max(1, Math.floor((Date.now() - vmJob.stagedAt.getTime()) / 1000))
             : 1,
           heartbeatAt: vmJob.heartbeatAt.toISOString(),
+          lastError: vmJob.lastError || null,
         });
       }
     }
@@ -3269,8 +4214,10 @@ export class PipelineEngineService {
 
     const maxConcurrentBatches = Math.max(2, kaggleAccounts.length * KAGGLE_MAX_NOTEBOOKS_PER_ACCOUNT);
     const effectiveStagedBytes = Math.max(windowStats.totalBytes, this.getActualStagingDiskBytes());
+    const policy = this.getExecutionPolicy();
 
     return {
+      executionPolicy: policy,
       activeBatch: activeBatches[0] || null,
       activeBatches,
       concurrency: {
@@ -3292,6 +4239,7 @@ export class PipelineEngineService {
         completed: queueMap["completed"] || 0,
         failed: queueMap["failed"] || 0,
         paused: queueMap["paused"] || 0,
+        skipped: queueMap["skipped"] || 0,
         total,
       },
       storage: {
@@ -3301,6 +4249,7 @@ export class PipelineEngineService {
         maxStagingBytes: KIRA_MAX_STAGING_BYTES,
         minFreeBytes: KIRA_MIN_FREE_SSD_BYTES,
         stagingDir: getKiraStagingDir(),
+        downloadDir: DEFAULT_DOWNLOAD_DIR,
         isAtCapacity: effectiveStagedBytes >= KIRA_MAX_STAGING_BYTES,
       },
       accounts: {
@@ -3315,7 +4264,9 @@ export class PipelineEngineService {
         isPaused: false,
         uptimeSeconds: Math.floor(process.uptime()),
         lastWatchdogRun: lastWatchdogTimestamp,
+        executionPolicy: policy,
       },
     };
   }
 }
+

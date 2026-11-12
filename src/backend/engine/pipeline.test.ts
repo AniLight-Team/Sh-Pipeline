@@ -469,8 +469,109 @@ test("Pipeline 1 (vm_remux) 2-slot unbatched worker and Kaggle status normalizat
   assert.equal(KIRA_VM_MAX_CONCURRENT_BATCHES, 2);
   assert.equal(PipelineEngineService.getActiveVmRemuxCount(), 0);
 
-  // Verify Kaggle status extraction handles nested objects and dotted enum strings
+  // Verify Kaggle status extraction handles nested objects, dotted enum strings, and gRPC prefix strings
   assert.equal(vm.extractCleanStatus({ status: "KernelWorkerStatus.COMPLETE" }), "complete");
-  assert.equal(vm.extractCleanStatus({ state: "DatasetStatus.READY" }), "ready");
+  assert.equal(vm.extractCleanStatus({ status: "KERNEL_WORKER_STATUS_ERROR" }), "error");
+  assert.equal(vm.extractCleanStatus({ status: "KERNEL_WORKER_STATUS_RUNNING" }), "running");
+  assert.equal(vm.extractCleanStatus({ state: "DATASET_STATUS_READY" }), "ready");
 });
+
+test("PipelineEngineService.filterCandidateBundlesByPolicy skips incompatible anime under Pipeline 1 Only or Pipeline 2 Only", async () => {
+  const { PipelineEngineService } = await import("./service.js");
+
+  const mixedFeed = [
+    {
+      id: 801,
+      title: "[SubsPlease] Solo Leveling - 01 (1080p) [1111AAAA].mkv",
+      seeders: 120,
+      num_files: 1,
+    },
+    {
+      id: 802,
+      title: "[Judas] Solo Leveling - S01E01 [1080p][HEVC x265 10bit].mkv",
+      seeders: 150,
+      num_files: 1,
+    },
+  ];
+
+  const hevcOnlyFeed = [
+    {
+      id: 901,
+      title: "[Judas] Frieren - S01E01 [1080p][HEVC x265 10bit].mkv",
+      seeders: 200,
+      num_files: 1,
+    },
+  ];
+
+  const h264OnlyFeed = [
+    {
+      id: 902,
+      title: "[SubsPlease] Frieren - 01 (1080p) [2222BBBB].mkv",
+      seeders: 180,
+      num_files: 1,
+    },
+  ];
+
+  const mixedBundles = ReleaseFilter.selectTopCandidateBundles(mixedFeed as any, 1, "sub", {
+    knownTitles: ["Solo Leveling"],
+  });
+  const hevcBundles = ReleaseFilter.selectTopCandidateBundles(hevcOnlyFeed as any, 1, "sub", {
+    knownTitles: ["Frieren"],
+  });
+  const h264Bundles = ReleaseFilter.selectTopCandidateBundles(h264OnlyFeed as any, 1, "sub", {
+    knownTitles: ["Frieren"],
+  });
+
+  // 1. Under Pipeline 1 Only (vm_remux_only), HEVC-only anime has 0 compatible bundles -> marked skipped
+  const p1OnHevc = PipelineEngineService.filterCandidateBundlesByPolicy(
+    hevcBundles,
+    "vm_remux_only",
+  );
+  assert.equal(p1OnHevc.allowedBundles.length, 0);
+  assert.equal(p1OnHevc.skippedReason?.includes("Pipeline 1 Only"), true);
+
+  // 2. Under Pipeline 1 Only (vm_remux_only), mixed feed keeps only H.264 (vm_remux) bundles
+  const p1OnMixed = PipelineEngineService.filterCandidateBundlesByPolicy(
+    mixedBundles,
+    "vm_remux_only",
+  );
+  assert.equal(p1OnMixed.allowedBundles.length, 1);
+  assert.equal(p1OnMixed.allowedBundles[0].pipelineType, "vm_remux");
+  assert.equal(p1OnMixed.skippedReason, null);
+
+  // 3. Under Pipeline 2 Only (kaggle_gpu_only), H.264-only anime has 0 compatible bundles -> marked skipped
+  const p2OnH264 = PipelineEngineService.filterCandidateBundlesByPolicy(
+    h264Bundles,
+    "kaggle_gpu_only",
+  );
+  assert.equal(p2OnH264.allowedBundles.length, 0);
+  assert.equal(p2OnH264.skippedReason?.includes("Pipeline 2 Only"), true);
+
+  // 4. Under Pipeline 2 Only (kaggle_gpu_only), HEVC-only anime (Pipeline 2 compatible) is allowed
+  const p2OnHevc = PipelineEngineService.filterCandidateBundlesByPolicy(
+    hevcBundles,
+    "kaggle_gpu_only",
+  );
+  assert.equal(p2OnHevc.allowedBundles.length, 1);
+  assert.equal(p2OnHevc.allowedBundles[0].pipelineType, "kaggle_gpu");
+  assert.equal(p2OnHevc.skippedReason, null);
+
+  // 5. Under Pipeline 2 Only (kaggle_gpu_only), mixed feed (which has H.264 Pipeline 1) is skipped unless forced to kaggle_gpu
+  const p2OnMixedDefault = PipelineEngineService.filterCandidateBundlesByPolicy(
+    mixedBundles,
+    "kaggle_gpu_only",
+  );
+  assert.equal(p2OnMixedDefault.allowedBundles.length, 0);
+  assert.equal(p2OnMixedDefault.skippedReason?.includes("Pipeline 2 Only"), true);
+
+  const p2OnMixedForced = PipelineEngineService.filterCandidateBundlesByPolicy(
+    mixedBundles,
+    "kaggle_gpu_only",
+    "kaggle_gpu",
+  );
+  assert.equal(p2OnMixedForced.allowedBundles.length, 1);
+  assert.equal(p2OnMixedForced.allowedBundles[0].pipelineType, "kaggle_gpu");
+  assert.equal(p2OnMixedForced.skippedReason, null);
+});
+
 

@@ -70,11 +70,12 @@ export function BatchViewer({
   const handleExecuteBatch = async (batchId: number) => {
     setExecutingId(batchId);
     try {
-      await fetch(`/api/batches/${batchId}/execute`, { method: "POST" });
-      onNotice?.(`Batch #${batchId} execution dispatched.`);
+      const res = await fetch(`/api/batches/${batchId}/execute`, { method: "POST" });
+      const data = await res.json();
+      onNotice?.(data.message || `Batch #${batchId} verified and dispatched.`);
       await fetchBatches();
     } catch {
-      onNotice?.(`Failed to dispatch Batch #${batchId}.`);
+      onNotice?.(`Failed to dispatch or verify Batch #${batchId}.`);
     } finally {
       setExecutingId(null);
     }
@@ -430,19 +431,30 @@ export function BatchViewer({
                         onClick={(e) => e.stopPropagation()}
                       >
                         <div className="inline-flex items-center gap-1.5">
-                          {(b.status === "created" || b.status === "failed") && (
+                          {(b.status === "created" ||
+                            b.status === "failed" ||
+                            b.status === "kernel_running" ||
+                            b.status === "uploading" ||
+                            b.status === "waiting_dataset") && (
                             <button
                               type="button"
                               onClick={() => handleExecuteBatch(b.id)}
                               disabled={executingId === b.id}
                               className="btn-secondary px-2.5 py-1 rounded-md text-[11px] font-medium inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                              title="Verify live Kaggle kernel status and dispatch or reconcile stuck encoding jobs"
                             >
                               {executingId === b.id ? (
                                 <Loader2 className="w-3 h-3 animate-spin" />
                               ) : (
                                 <Play className="w-3 h-3 text-indigo-400" />
                               )}
-                              <span>{b.status === "failed" ? "Retry" : "Dispatch"}</span>
+                              <span>
+                                {b.status === "failed"
+                                  ? "Retry"
+                                  : b.status === "created"
+                                    ? "Dispatch"
+                                    : "Verify Live"}
+                              </span>
                             </button>
                           )}
                           <button

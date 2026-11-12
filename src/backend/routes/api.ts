@@ -6,7 +6,11 @@ import { AnimeMetadataResolver } from "../engine/metadata-resolver.js";
 import { MAIN_BACKEND_URL } from "../config.js";
 import { inngest } from "../inngest/client.js";
 import { log } from "../utils/logger.js";
-import type { EnqueueRequest, PipelineEpisodeResult } from "../engine/types.js";
+import type {
+  EnqueueRequest,
+  PipelineEpisodeResult,
+  PipelineExecutionPolicy,
+} from "../engine/types.js";
 
 /**
  * Helper that dispatches a job discovery event via Inngest, falling back to direct async execution
@@ -87,6 +91,83 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
   app.get("/stats", async () => {
     return await PipelineEngineService.getStats();
   });
+
+  app.get("/pipeline/policy", async () => {
+    return {
+      ok: true,
+      policy: PipelineEngineService.getExecutionPolicy(),
+    };
+  });
+
+  app.post("/pipeline/policy", async (req, reply) => {
+    const body = req.body as {
+      policy?: PipelineExecutionPolicy;
+      requeueSkipped?: boolean;
+    };
+    const policy = body?.policy;
+    if (
+      policy !== "all" &&
+      policy !== "vm_remux_only" &&
+      policy !== "kaggle_gpu_only"
+    ) {
+      return reply.status(400).send({
+        error: "Valid policy ('all' | 'vm_remux_only' | 'kaggle_gpu_only') is required",
+      });
+    }
+
+    const res = await PipelineEngineService.setExecutionPolicy(policy, {
+      requeueSkipped: Boolean(body?.requeueSkipped),
+      applyToStaged: true,
+    });
+
+    for (const rJob of res.requeuedJobs) {
+      if (rJob.status === "queued") {
+        await dispatchJobDiscovery(rJob);
+      }
+    }
+
+    const startedVmJobIds = await PipelineEngineService.drainVmRemuxQueue();
+    const sealedBatchIds = await PipelineEngineService.sealAvailableBatches({
+      forceFlush: false,
+      triggerReason: `policy_${policy}`,
+    });
+    for (const bId of sealedBatchIds) {
+      await dispatchBatchExecution(bId);
+    }
+
+    const policyLabel =
+      policy === "vm_remux_only"
+        ? "Pipeline 1 Only (VM H.264 Remux)"
+        : policy === "kaggle_gpu_only"
+          ? "Pipeline 2 Only (Kaggle GPU)"
+          : "Both Pipelines (Auto Waterfall)";
+
+    return {
+      ok: true,
+      policy: res.policy,
+      skippedStagedCount: res.skippedStagedCount,
+      requeuedCount: res.requeuedJobs.length,
+      startedVmJobIds,
+      dispatchedBatchIds: sealedBatchIds,
+      message: `Switched execution mode to ${policyLabel}${res.skippedStagedCount > 0 ? ` (${res.skippedStagedCount} incompatible staged job(s) marked skipped)` : ""}${res.requeuedJobs.length > 0 ? ` (${res.requeuedJobs.length} skipped job(s) re-queued)` : ""}.`,
+    };
+  });
+
+  app.get("/storage/staged-files", async () => {
+    const report = await PipelineEngineService.inspectStagedFilesOnDisk();
+    return { ok: true, report };
+  });
+
+  app.post("/storage/cleanup-orphans", async () => {
+    const res = await PipelineEngineService.cleanupOrphanedStagedFiles();
+    const freedMb = (res.freedBytes / (1024 * 1024)).toFixed(1);
+    return {
+      ok: true,
+      ...res,
+      message: `Cleaned ${res.deletedCount} orphaned file(s) (${freedMb} MB freed)${res.requeuedMissingJobs > 0 ? ` and re-queued ${res.requeuedMissingJobs} job(s) with missing files` : ""}.`,
+    };
+  });
+
 
   // Resolve AniList ID to AniDB ID, Tsukihime ID, internal anime ID, title variations, and cover art
   app.get("/anime/resolve", async (req, reply) => {
@@ -483,6 +564,69 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     };
   });
 
+  app.post("/jobs/requeue-skipped", async (req) => {
+    const body = (req.body || {}) as { switchPolicyToAll?: boolean };
+    await PipelineEngineService.ensureTables();
+
+    if (body?.switchPolicyToAll) {
+      PipelineEngineService.persistExecutionPolicyToDisk("all");
+    }
+
+    const skippedJobs = await db
+      .select()
+      .from(schema.pipelineJob)
+      .where(eq(schema.pipelineJob.status, "skipped"))
+      .orderBy(asc(schema.pipelineJob.id));
+
+    if (skippedJobs.length === 0) {
+      return { ok: true, count: 0, message: "No skipped jobs to re-queue." };
+    }
+
+    let stagedCount = 0;
+    for (const job of skippedJobs) {
+      const hasStaged = PipelineEngineService.hasValidStagedFiles(job);
+      const nextMeta = { ...(job.metadata || {}) };
+      delete nextMeta.skippedByPolicy;
+      delete nextMeta.executionPolicy;
+
+      const [updated] = await db
+        .update(schema.pipelineJob)
+        .set({
+          status: hasStaged ? "staged" : "queued",
+          batchId: null,
+          lastError: null,
+          metadata: nextMeta,
+          heartbeatAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.pipelineJob.id, job.id))
+        .returning();
+
+      if (hasStaged) {
+        stagedCount++;
+      } else if (updated) {
+        await dispatchJobDiscovery(updated);
+      }
+    }
+
+    if (stagedCount > 0) {
+      await PipelineEngineService.drainVmRemuxQueue();
+      const sealed = await PipelineEngineService.sealAvailableBatches({
+        forceFlush: false,
+        triggerReason: "requeue_skipped",
+      });
+      for (const bId of sealed) {
+        await dispatchBatchExecution(bId);
+      }
+    }
+
+    return {
+      ok: true,
+      count: skippedJobs.length,
+      message: `Re-queued ${skippedJobs.length} skipped job(s)${body?.switchPolicyToAll ? " (Pipeline policy reset to 'Both Pipelines')" : ""}.`,
+    };
+  });
+
   app.post("/jobs/clear-completed", async () => {
     await PipelineEngineService.ensureTables();
     const completedJobs = await db
@@ -554,10 +698,14 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
 
     if (action === "execute") {
       for (const bId of batchIds) {
+        await PipelineEngineService.reconcileStuckEncodingStates({
+          liveKaggleCheck: true,
+          forceBatchId: bId,
+        });
         const batch = await db.query.pipelineBatch.findFirst({
           where: eq(schema.pipelineBatch.id, bId),
         });
-        if (!batch) continue;
+        if (!batch || batch.status === "completed") continue;
         if (batch.status === "failed") {
           await db
             .update(schema.pipelineBatch)
@@ -575,7 +723,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
       return {
         ok: true,
         affected: batchIds.length,
-        message: `Dispatched execution for ${batchIds.length} selected batch(es).`,
+        message: `Synced live Kaggle state & dispatched execution for ${batchIds.length} selected batch(es).`,
       };
     }
 
@@ -612,10 +760,17 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
   });
 
   app.post("/batches/flush", async () => {
-    log.info("API", "Force-flush triggered manually");
+    log.info("API", "Force-flush & live encoding sync triggered manually");
 
+    // 1. First verify live Kaggle status for all running batches so any Kaggle error frees its slot & re-stages jobs!
+    const syncRes = await PipelineEngineService.reconcileStuckEncodingStates({
+      liveKaggleCheck: true,
+    });
+
+    // 2. Drain Pipeline 1 (2-slot VM Remux queue)
     const startedVmJobIds = await PipelineEngineService.drainVmRemuxQueue();
 
+    // 3. Seal & dispatch Pipeline 2 (Kaggle GPU) batches
     const pendingBatches = await db
       .select({ id: schema.pipelineBatch.id })
       .from(schema.pipelineBatch)
@@ -644,9 +799,10 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
 
     return {
       ok: true,
-      message: `Force flush processed: ${startedVmJobIds.length} VM remux slot(s) started, dispatched ${allDispatchIds.length} GPU batch(es) (${pendingIds.length} resumed, ${sealedBatchIds.length} new)`,
+      message: `Force flush & sync complete: ${startedVmJobIds.length} VM slot(s) started, ${allDispatchIds.length} GPU batch(es) dispatched${syncRes.failedBatches > 0 || syncRes.reconciledJobs > 0 ? `, reconciled ${syncRes.failedBatches} errored batch(es) & ${syncRes.reconciledJobs} stuck job(s)` : ""}.`,
       startedVmJobIds,
       dispatchedBatchIds: allDispatchIds,
+      reconciled: syncRes,
     };
   });
 
@@ -654,10 +810,48 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     const { id } = req.params as { id: string };
     const batchId = parseInt(id, 10);
 
-    const batch = await db.query.pipelineBatch.findFirst({
+    const existingBatch = await db.query.pipelineBatch.findFirst({
       where: eq(schema.pipelineBatch.id, batchId),
     });
 
+    if (!existingBatch) {
+      return reply.status(404).send({ error: "Batch not found" });
+    }
+
+    // First verify live Kaggle status if the batch was in kernel_running or waiting_dataset
+    if (
+      existingBatch.status === "kernel_running" ||
+      existingBatch.status === "waiting_dataset" ||
+      existingBatch.status === "uploading"
+    ) {
+      const syncRes = await PipelineEngineService.reconcileStuckEncodingStates({
+        liveKaggleCheck: true,
+        forceBatchId: batchId,
+      });
+      const refreshed = await db.query.pipelineBatch.findFirst({
+        where: eq(schema.pipelineBatch.id, batchId),
+      });
+      if (refreshed?.status === "failed") {
+        return {
+          ok: true,
+          message: `Kaggle reported error on Batch #${batchId}: ${refreshed.lastError || "Kernel failed"}. Jobs were automatically returned to staged/failed state.`,
+          batch: refreshed,
+          reconciled: syncRes,
+        };
+      }
+      if (refreshed?.status === "completed") {
+        return {
+          ok: true,
+          message: `Batch #${batchId} completed on Kaggle and outputs were finalized!`,
+          batch: refreshed,
+          reconciled: syncRes,
+        };
+      }
+    }
+
+    const batch = await db.query.pipelineBatch.findFirst({
+      where: eq(schema.pipelineBatch.id, batchId),
+    });
     if (!batch) {
       return reply.status(404).send({ error: "Batch not found" });
     }
@@ -683,8 +877,38 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     return { ok: true, message: `Dispatched execution for Batch #${batchId}`, batch };
   });
 
+  app.post("/system/sync-encoding", async () => {
+    log.info("API", "Live encoding & Kaggle status reconciliation triggered manually");
+    const syncRes = await PipelineEngineService.reconcileStuckEncodingStates({
+      liveKaggleCheck: true,
+    });
+    const startedVmJobIds = await PipelineEngineService.drainVmRemuxQueue();
+    const sealedBatchIds = await PipelineEngineService.sealAvailableBatches({
+      forceFlush: false,
+      triggerReason: "sync_encoding",
+    });
+    for (const bId of sealedBatchIds) {
+      await dispatchBatchExecution(bId);
+    }
+
+    return {
+      ok: true,
+      ...syncRes,
+      startedVmJobIds,
+      sealedBatchIds,
+      message:
+        syncRes.failedBatches > 0 || syncRes.completedBatches > 0 || syncRes.reconciledJobs > 0
+          ? `Live Sync resolved ${syncRes.failedBatches} errored batch(es), ${syncRes.completedBatches} completed batch(es), and ${syncRes.reconciledJobs} stuck encoding job(s).`
+          : `Verified all active VM Remux & Kaggle GPU encoding tasks (${startedVmJobIds.length} VM slot(s) started, ${sealedBatchIds.length} batch(es) sealed).`,
+    };
+  });
+
   app.post("/system/recovery", async () => {
     log.info("API", "Recovery watchdog triggered manually");
+    const syncRes = await PipelineEngineService.reconcileStuckEncodingStates({
+      liveKaggleCheck: true,
+    });
+    const startedVmIds = await PipelineEngineService.drainVmRemuxQueue();
     const redelivered = await PipelineEngineService.retryPendingCallbacks().catch(() => 0);
     await inngest
       .send({
@@ -692,7 +916,12 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
         data: { reason: "manual_api" },
       })
       .catch(() => {});
-    return { ok: true, message: `Recovery event sent (synced ${redelivered} pending callback(s))` };
+    return {
+      ok: true,
+      reconciled: syncRes,
+      startedVmIds,
+      message: `Recovery & live Kaggle check completed: ${syncRes.reconciledJobs} stuck job(s) healed, ${syncRes.failedBatches} failed batch(es) cleaned, ${redelivered} callback(s) delivered.`,
+    };
   });
 
   app.post("/system/sync-callbacks", async () => {
@@ -700,3 +929,4 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     return { ok: true, redelivered };
   });
 };
+
