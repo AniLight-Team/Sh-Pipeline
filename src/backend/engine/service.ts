@@ -96,6 +96,7 @@ export class PipelineEngineService {
   public static readonly stage1DiscoveryQueue = stage1DiscoveryQueue;
   private static readonly activeVmRemuxJobIds = new Set<number>();
   private static readonly activeExecutingBatchIds = new Set<number>();
+  private static readonly activeDiscoveringJobIds = new Set<number>();
   private static isDrainingVmRemux = false;
   private static isReconcilingEncoding = false;
 
@@ -202,6 +203,10 @@ export class PipelineEngineService {
 
   public static isBatchCurrentlyExecutingInProcess(batchId: number): boolean {
     return this.activeExecutingBatchIds.has(batchId);
+  }
+
+  public static isJobDiscoveringInProcess(jobId: number): boolean {
+    return this.activeDiscoveringJobIds.has(jobId);
   }
 
   public static getActiveVmRemuxCount(): number {
@@ -888,6 +893,23 @@ export class PipelineEngineService {
       };
     }
 
+    // Prevent duplicate concurrent downloads/discovery for the same jobId (which creates orphaned MKVs on disk)
+    const fiveMinsAgoMs = Date.now() - 5 * 60 * 1000;
+    if (
+      this.activeDiscoveringJobIds.has(jobId) ||
+      (job.status === "downloading" && job.heartbeatAt && job.heartbeatAt.getTime() > fiveMinsAgoMs)
+    ) {
+      log.info(
+        "PipelineEngine",
+        `[Stage 1 Discovery] Job #${jobId} is already actively downloading; skipping duplicate run.`,
+      );
+      return {
+        status: "skipped",
+        jobId,
+        error: "Discovery/download already in progress for this job",
+      };
+    }
+
     const effectivePolicy: PipelineExecutionPolicy =
       job.metadata?.executionPolicy === "vm_remux_only" ||
       job.metadata?.executionPolicy === "kaggle_gpu_only" ||
@@ -988,15 +1010,35 @@ export class PipelineEngineService {
       };
     }
 
+    this.activeDiscoveringJobIds.add(jobId);
+
+    // Clean up any stale/leftover staged files from prior failed/partial attempts for this jobId before re-downloading
+    await this.cleanupJobStagedFiles(job).catch(() => {});
+
     await db
       .update(schema.pipelineJob)
-      .set({ status: "downloading", heartbeatAt: new Date(), updatedAt: new Date() })
+      .set({
+        status: "downloading",
+        stagedFilePath: null,
+        stagedQualities: null,
+        heartbeatAt: new Date(),
+        updatedAt: new Date(),
+      })
       .where(eq(schema.pipelineJob.id, jobId));
 
     const transmission = new TransmissionClient();
     const subtitles = new SubtitleManager();
     const videoManager = new VideoEncodingManager();
     const stagingDir = getKiraStagingDir();
+
+    try {
+      const entries = await fs.promises.readdir(stagingDir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (entry.name.startsWith(`job_${jobId}_`)) {
+          await fs.promises.rm(path.join(stagingDir, entry.name), { recursive: true, force: true }).catch(() => {});
+        }
+      }
+    } catch {}
 
     const heartbeatInterval = setInterval(() => {
       db.update(schema.pipelineJob)
@@ -1635,10 +1677,13 @@ export class PipelineEngineService {
         sizeBytes: totalJobBytes,
       };
     } catch (err: any) {
+      await this.cleanupJobStagedFiles(job).catch(() => {});
       await db
         .update(schema.pipelineJob)
         .set({
           status: "failed",
+          stagedFilePath: null,
+          stagedQualities: null,
           lastError: err?.message || String(err),
           heartbeatAt: new Date(),
           updatedAt: new Date(),
@@ -1649,6 +1694,7 @@ export class PipelineEngineService {
       return { status: "failed", jobId, error: err?.message || String(err) };
     } finally {
       clearInterval(heartbeatInterval);
+      this.activeDiscoveringJobIds.delete(jobId);
     }
   }
 
@@ -2364,10 +2410,13 @@ export class PipelineEngineService {
             })
             .where(eq(schema.pipelineJob.id, job.id));
         } else {
+          await this.cleanupJobStagedFiles(job).catch(() => {});
           await db
             .update(schema.pipelineJob)
             .set({
               status: "failed",
+              stagedFilePath: null,
+              stagedQualities: null,
               lastError: lastJobErr,
               heartbeatAt: new Date(),
               updatedAt: new Date(),
@@ -3263,10 +3312,13 @@ export class PipelineEngineService {
             })
             .where(eq(schema.pipelineJob.id, job.id));
         } else {
+          await this.cleanupJobStagedFiles(job).catch(() => {});
           await db
             .update(schema.pipelineJob)
             .set({
               status: "failed",
+              stagedFilePath: null,
+              stagedQualities: null,
               lastError: failErr,
               heartbeatAt: new Date(),
               updatedAt: new Date(),
@@ -3362,11 +3414,14 @@ export class PipelineEngineService {
           })
           .where(eq(schema.pipelineJob.id, job.id));
       } else {
+        await this.cleanupJobStagedFiles(job).catch(() => {});
         await db
           .update(schema.pipelineJob)
           .set({
             status: "failed",
             batchId: null,
+            stagedFilePath: null,
+            stagedQualities: null,
             lastError: `Batch #${batchId} failed: ${errorMsg}`,
             heartbeatAt: new Date(),
             updatedAt: new Date(),
@@ -3756,6 +3811,7 @@ export class PipelineEngineService {
         jobStatus: string;
       }
     >();
+    const jobIdsWithKnownPaths = new Set<number>();
     const jobById = new Map<
       number,
       {
@@ -3797,6 +3853,7 @@ export class PipelineEngineService {
           });
 
           if (j.stagedFilePath) {
+            jobIdsWithKnownPaths.add(j.id);
             pathToJobInfo.set(path.resolve(j.stagedFilePath), {
               jobId: j.id,
               anilistId: j.anilistId,
@@ -3814,6 +3871,7 @@ export class PipelineEngineService {
           if (sq && typeof sq === "object") {
             for (const [qKey, qPath] of Object.entries(sq)) {
               if (typeof qPath === "string" && qPath.trim()) {
+                jobIdsWithKnownPaths.add(j.id);
                 pathToJobInfo.set(path.resolve(qPath), {
                   jobId: j.id,
                   anilistId: j.anilistId,
@@ -3852,13 +3910,16 @@ export class PipelineEngineService {
 
             totalDiskBytes += sizeBytes;
 
-            let matched = pathToJobInfo.get(fullPath) || null;
+            const exactPathMatched = pathToJobInfo.get(fullPath) || null;
+            let matched = exactPathMatched;
             let inferredQuality: VideoResolutionQuality | null = matched?.quality || null;
+            let isActiveTempWorkDir = false;
 
             if (!matched) {
-              // Try inferring Job ID from filename pattern: job_123_ep1_1080p_... or staged_123_1080p_... or vm_remux_job_123_...
-              const m =
-                entry.name.match(/^(?:job|staged|vm_remux_job)_(\d+)(?:_ep(\d+))?(?:_(1080p|720p|480p))?/i);
+              // Try inferring Job ID from filename/dir pattern: job_123_ep1_1080p_..., staged_123_1080p_..., vm_remux_123_..., vm_remux_job_123_...
+              const m = entry.name.match(
+                /^(?:job|staged|vm_remux(?:_job)?)_(\d+)(?:_ep(\d+))?(?:_(1080p|720p|480p))?/i,
+              );
               if (m) {
                 const parsedJobId = parseInt(m[1], 10);
                 if (m[3]) {
@@ -3871,12 +3932,39 @@ export class PipelineEngineService {
                     quality: inferredQuality,
                   };
                 }
+                if (
+                  entry.isDirectory() &&
+                  /^vm_remux_/i.test(entry.name) &&
+                  (this.activeVmRemuxJobIds.has(parsedJobId) ||
+                    jInfo?.jobStatus === "encoding")
+                ) {
+                  isActiveTempWorkDir = true;
+                }
+              } else if (entry.isDirectory() && /^subs_[a-f0-9]+$/i.test(entry.name)) {
+                // Keep in-flight subtitle extraction temp directories for 15 minutes
+                const ageMs = Date.now() - stat.mtime.getTime();
+                if (ageMs < 15 * 60 * 1000 || this.activeDiscoveringJobIds.size > 0) {
+                  isActiveTempWorkDir = true;
+                }
               }
             }
 
+            // A file is active (not orphan) ONLY if:
+            // - It is an active temp workDir (vm_remux_<id>_* for an active encoding job, or recent subs_*), OR
+            // - Its exact path is currently linked in DB to a downloading/staged/encoding job, OR
+            // - DB wasn't queried and its filename belongs to an active job.
+            // Any superseded duplicate file (same jobId, not in pathToJobInfo) IS marked orphan so cleanup frees it.
+            const hasActiveDbStatus = Boolean(
+              matched && ["downloading", "staged", "encoding"].includes(matched.jobStatus),
+            );
+            const isSupersededDuplicate =
+              !exactPathMatched &&
+              !entry.isDirectory() &&
+              Boolean(matched) &&
+              jobIdsWithKnownPaths.has(matched!.jobId);
+
             const isActiveOwner =
-              matched &&
-              ["downloading", "staged", "encoding"].includes(matched.jobStatus);
+              isActiveTempWorkDir || (hasActiveDbStatus && !isSupersededDuplicate);
             const isOrphan = !isActiveOwner;
 
             if (isOrphan) {

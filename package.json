@@ -17,6 +17,7 @@
     "start:tsx": "tsx src/backend/index.ts",
     "test:kaggle": "tsx src/backend/scripts/test-kaggle.ts",
     "reset:queue": "tsx src/backend/scripts/reset-queue.ts",
+    "reset:pipeline": "tsx src/backend/scripts/reset-queue.ts",
     "db:push": "drizzle-kit push",
     "db:generate": "drizzle-kit generate",
     "db:studio": "drizzle-kit studio",

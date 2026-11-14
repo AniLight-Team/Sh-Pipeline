@@ -199,6 +199,7 @@ async function runAutonomousReconciliationTick() {
         .limit(KIRA_DISCOVERY_CONCURRENCY);
 
       for (const j of stuckQueuedJobs) {
+        if (PipelineEngineService.isJobDiscoveringInProcess(j.id)) continue;
         await db
           .update(schema.pipelineJob)
           .set({ updatedAt: new Date() })

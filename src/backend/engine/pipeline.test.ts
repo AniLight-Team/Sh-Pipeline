@@ -574,4 +574,57 @@ test("PipelineEngineService.filterCandidateBundlesByPolicy skips incompatible an
   assert.equal(p2OnMixedForced.skippedReason, null);
 });
 
+test("PipelineEngineService protects active vm_remux and recent subs temp dirs from orphan classification", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { getKiraStagingDir } = await import("../config.js");
+  const { PipelineEngineService } = await import("./service.js");
+
+  const stagingDir = getKiraStagingDir();
+  fs.mkdirSync(stagingDir, { recursive: true });
+
+  const activeRemuxId = 999991;
+  const activeRemuxDir = path.join(stagingDir, `vm_remux_${activeRemuxId}_test123`);
+  const recentSubsDir = path.join(stagingDir, "subs_abcdef123456");
+  const staleSubsDir = path.join(stagingDir, "subs_001122334455");
+  const orphanFile = path.join(stagingDir, "job_999992_ep1_1080p_deadbeef.mkv");
+
+  const activeRemuxSet = (PipelineEngineService as any).activeVmRemuxJobIds as Set<number>;
+  const activeDiscoverSet = (PipelineEngineService as any).activeDiscoveringJobIds as Set<number>;
+
+  try {
+    fs.mkdirSync(activeRemuxDir, { recursive: true });
+    fs.mkdirSync(recentSubsDir, { recursive: true });
+    fs.mkdirSync(staleSubsDir, { recursive: true });
+    fs.writeFileSync(orphanFile, "test");
+
+    // Make staleSubsDir older than 15 minutes
+    const oldTime = new Date(Date.now() - 20 * 60 * 1000);
+    fs.utimesSync(staleSubsDir, oldTime, oldTime);
+
+    activeRemuxSet.add(activeRemuxId);
+    activeDiscoverSet.add(activeRemuxId);
+    assert.equal(PipelineEngineService.isJobDiscoveringInProcess(activeRemuxId), true);
+    assert.equal(PipelineEngineService.isJobDiscoveringInProcess(999992), false);
+
+    activeDiscoverSet.delete(activeRemuxId);
+
+    const report = await PipelineEngineService.inspectStagedFilesOnDisk();
+    const byName = new Map(report.files.map((f) => [f.filename, f]));
+
+    assert.equal(byName.get(`vm_remux_${activeRemuxId}_test123`)?.isOrphan, false);
+    assert.equal(byName.get("subs_abcdef123456")?.isOrphan, false);
+    assert.equal(byName.get("subs_001122334455")?.isOrphan, true);
+    assert.equal(byName.get("job_999992_ep1_1080p_deadbeef.mkv")?.isOrphan, true);
+  } finally {
+    activeRemuxSet.delete(activeRemuxId);
+    activeDiscoverSet.delete(activeRemuxId);
+    fs.rmSync(activeRemuxDir, { recursive: true, force: true });
+    fs.rmSync(recentSubsDir, { recursive: true, force: true });
+    fs.rmSync(staleSubsDir, { recursive: true, force: true });
+    fs.rmSync(orphanFile, { force: true });
+  }
+});
+
+
 

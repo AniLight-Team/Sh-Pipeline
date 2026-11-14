@@ -22,6 +22,13 @@
       "when": 1794334800000,
       "tag": "0002_dual_pipeline_revamp",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1794336191076,
+      "tag": "0003_careless_hairball",
+      "breakpoints": true
     }
   ]
 }

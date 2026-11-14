@@ -147,10 +147,12 @@ export const recoveryWatchdogFn = inngest.createFunction(
       // 6. Retry any completed job callbacks that failed while Main Backend (localhost:4000) was restarting
       const redeliveredCallbacks = await PipelineEngineService.retryPendingCallbacks();
 
-      // 7. Only dispatch queued jobs if staging buffer is below the 56 GB limit
+      // 7. Only dispatch queued jobs if staging buffer is below the 56 GB limit and not already actively running in-process
       const cap = await PipelineEngineService.checkStorageCapacityForDownload();
       const jobsAllowedToDispatch = cap.allowed
-        ? jobsToRediscover.slice(0, KIRA_DISCOVERY_CONCURRENCY)
+        ? jobsToRediscover
+            .filter((j) => !PipelineEngineService.isJobDiscoveringInProcess(j.id))
+            .slice(0, KIRA_DISCOVERY_CONCURRENCY)
         : [];
 
       const allBatchIdsToDispatch = Array.from(

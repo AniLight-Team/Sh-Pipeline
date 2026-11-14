@@ -19,6 +19,11 @@ export const jobDiscoverStageFn = inngest.createFunction(
         key: "event.data.anilistId || event.data.anidbId || event.data.jobId",
       },
     ],
+    // Never enqueue duplicate concurrent discovery/download runs for the same jobId
+    singleton: {
+      mode: "skip",
+      key: "event.data.jobId",
+    },
     retries: 2,
     triggers: [{ event: "pipeline/job.discover" }],
   },
@@ -55,14 +60,8 @@ export const jobDiscoverStageFn = inngest.createFunction(
         });
       }
 
-      // Wait 45s and re-queue discovery event so the job resumes once staging space drops below 56 GB
-      await step.sleep("wait-storage-capacity-56gb", "45s");
-      await step.sendEvent("retry-discover-after-cap-wait", {
-        name: "pipeline/job.discover",
-        id: `pipe-job-${jobId}-cap-retry-${Date.now()}`,
-        data: event.data,
-      });
-
+      // Job remains 'queued' in DB; onStagingSpaceFreed(), batch-execute phase-6, watchdog,
+      // and the 45s heartbeat will re-dispatch it once staging usage drops below the cap.
       return res;
     }
 
