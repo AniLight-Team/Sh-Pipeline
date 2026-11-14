@@ -446,10 +446,21 @@ export class PipelineEngineService {
    * Deletes all local staged video files for a job (including 1080p, 720p, and 480p quality files).
    */
   public static async cleanupJobStagedFiles(job: {
+    id?: number;
     stagedFilePath?: string | null;
     stagedQualities?: Partial<Record<VideoResolutionQuality, string>> | null;
     metadata?: Record<string, any> | null;
   }): Promise<void> {
+    if (job.id && Number.isSafeInteger(job.id)) {
+      const root = path.resolve(getKiraStagingDir());
+      const entries = await fs.promises.readdir(root, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (entry.isDirectory() && entry.name.startsWith(`vm_remux_${job.id}_`)) {
+          const target = path.resolve(root, entry.name);
+          if (path.dirname(target) === root) await fs.promises.rm(target, { recursive: true, force: true });
+        }
+      }
+    }
     const pathsToDelete = new Set<string>();
     if (job.stagedFilePath) {
       pathsToDelete.add(job.stagedFilePath);
@@ -487,17 +498,16 @@ export class PipelineEngineService {
     stagedQualities?: Partial<Record<VideoResolutionQuality, string>> | null;
     metadata?: Record<string, any> | null;
   }): boolean {
-    if (!job.stagedFilePath || !fs.existsSync(job.stagedFilePath)) {
-      return false;
-    }
     const sq = job.stagedQualities || job.metadata?.stagedQualities;
+    const paths = new Set<string>(job.stagedFilePath ? [job.stagedFilePath] : []);
     if (sq && typeof sq === "object") {
-      const paths = Object.values(sq).filter((p): p is string => typeof p === "string" && p.length > 0);
-      if (paths.length > 0 && !paths.some((p) => fs.existsSync(p))) {
-        return false;
-      }
+      for (const value of Object.values(sq)) if (typeof value === "string" && value) paths.add(value);
     }
-    return true;
+    if (!paths.size) return false;
+    return [...paths].every(file => {
+      try { const stat = fs.statSync(file); return stat.isFile() && stat.size > 0; }
+      catch { return false; }
+    });
   }
 
   /**
@@ -1932,19 +1942,15 @@ export class PipelineEngineService {
           continue;
         }
 
+        const claimed = await db
+          .update(schema.pipelineJob)
+          .set({ status: "encoding", pipelineType: "vm_remux", batchId: null,
+            heartbeatAt: new Date(), updatedAt: new Date() })
+          .where(and(eq(schema.pipelineJob.id, job.id), eq(schema.pipelineJob.status, "staged"), isNull(schema.pipelineJob.batchId)))
+          .returning({ id: schema.pipelineJob.id });
+        if (!claimed.length) continue;
         this.activeVmRemuxJobIds.add(job.id);
         startedJobIds.push(job.id);
-
-        await db
-          .update(schema.pipelineJob)
-          .set({
-            status: "encoding",
-            pipelineType: "vm_remux",
-            batchId: null,
-            heartbeatAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(schema.pipelineJob.id, job.id));
 
         const slotIndex = this.activeVmRemuxJobIds.size;
         log.success(
@@ -2248,6 +2254,7 @@ export class PipelineEngineService {
       .set({
         status: "completed",
         resultPayload: primaryResult,
+        metadata: { ...(job.metadata || {}), callbackDelivered: false },
         lastError: null,
         completedAt: new Date(),
         heartbeatAt: new Date(),
@@ -2255,51 +2262,56 @@ export class PipelineEngineService {
       })
       .where(eq(schema.pipelineJob.id, job.id));
 
-    const targetCallbackUrl =
-      job.callbackUrl || `${MAIN_BACKEND_URL}/api/internal/pipeline/completed`;
-    let allDelivered = true;
+    try {
+      const targetCallbackUrl =
+        job.callbackUrl || `${MAIN_BACKEND_URL}/api/internal/pipeline/completed`;
+      let allDelivered = true;
 
-    for (const payload of trackPayloads) {
-      const ok = await this.deliverCallbackPayload(targetCallbackUrl, payload);
-      if (!ok) {
-        allDelivered = false;
-      } else {
-        log.success(
+      for (const payload of trackPayloads) {
+        const ok = await this.deliverCallbackPayload(targetCallbackUrl, payload);
+        if (!ok) {
+          allDelivered = false;
+        } else {
+          log.success(
+            "PipelineEngine",
+            `Delivered ${payload.type.toUpperCase()} callback (${payload.sources.length} qualities) to Main Backend for Job #${job.id}`,
+          );
+        }
+
+        const targetAnimeId = payload.animeId || payload.anilistId;
+        if (targetAnimeId) {
+          await notifyMainBackendRevalidate({
+            animeId: targetAnimeId,
+            slug: job.metadata?.slug || null,
+            episodeNumber: job.episodeNumber,
+            airType: payload.type,
+          }).catch(() => {});
+        }
+      }
+
+      const updatedMeta = {
+        ...(job.metadata || {}),
+        callbackDelivered: allDelivered,
+        callbackLastAttemptAt: new Date().toISOString(),
+      };
+      await db
+        .update(schema.pipelineJob)
+        .set({ metadata: updatedMeta, updatedAt: new Date() })
+        .where(eq(schema.pipelineJob.id, job.id));
+
+      if (!allDelivered) {
+        log.warn(
           "PipelineEngine",
-          `Delivered ${payload.type.toUpperCase()} callback (${payload.sources.length} qualities) to Main Backend for Job #${job.id}`,
+          `Job #${job.id} completed and saved in DB, but Main Backend callback (${targetCallbackUrl}) is pending retry by Watchdog.`,
         );
       }
 
-      const targetAnimeId = payload.animeId || payload.anilistId;
-      if (targetAnimeId) {
-        await notifyMainBackendRevalidate({
-          animeId: targetAnimeId,
-          slug: job.metadata?.slug || null,
-          episodeNumber: job.episodeNumber,
-          airType: payload.type,
-        }).catch(() => {});
-      }
-    }
-
-    const updatedMeta = {
-      ...(job.metadata || {}),
-      callbackDelivered: allDelivered,
-      callbackLastAttemptAt: new Date().toISOString(),
-    };
-    await db
-      .update(schema.pipelineJob)
-      .set({ metadata: updatedMeta, updatedAt: new Date() })
-      .where(eq(schema.pipelineJob.id, job.id));
-
-    if (!allDelivered) {
-      log.warn(
-        "PipelineEngine",
-        `Job #${job.id} completed and saved in DB, but Main Backend callback (${targetCallbackUrl}) is pending retry by Watchdog.`,
-      );
+    } catch (error) {
+      log.warn("PipelineEngine", `Job #${job.id} is complete; delivery remains pending: ${String(error)}`);
     }
 
     // Delete all staged quality files (1080p, 720p, 480p) immediately so SSD space is freed
-    await this.cleanupJobStagedFiles(job);
+    await this.cleanupJobStagedFiles(job).catch(error => log.warn("PipelineEngine", `Job #${job.id} cleanup pending: ${String(error)}`));
   }
 
   /**
@@ -2309,7 +2321,6 @@ export class PipelineEngineService {
    * and immediately pulls the next staged `vm_remux` job into the freed slot.
    */
   public static async executeVmRemuxJob(jobId: number): Promise<void> {
-    await this.ensureTables();
 
     const heartbeatTimer = setInterval(() => {
       db.update(schema.pipelineJob)
@@ -2319,6 +2330,7 @@ export class PipelineEngineService {
     }, 20_000);
 
     try {
+      await this.ensureTables();
       const job = await db.query.pipelineJob.findFirst({
         where: eq(schema.pipelineJob.id, jobId),
       });
@@ -2363,7 +2375,9 @@ export class PipelineEngineService {
           tracks = job.types.includes("dub") && !job.types.includes("sub") ? [["dub", 0]] : [["sub", 0]];
         }
 
-        const hfAccount = videoManager.getNextHfAccount();
+        const hfAccount = videoManager.getHfAccountForTarget(job.metadata?.hfUploadTarget);
+        job.metadata = { ...(job.metadata || {}), hfUploadTarget: { owner: hfAccount.owner, bucket: hfAccount.bucket } };
+        await db.update(schema.pipelineJob).set({ metadata: job.metadata }).where(eq(schema.pipelineJob.id, job.id));
         const animeId = job.animeId || job.anilistId || job.anidbId || job.id;
 
         const records = await videoManager.remuxAndUploadJobOnVm({
@@ -2410,13 +2424,10 @@ export class PipelineEngineService {
             })
             .where(eq(schema.pipelineJob.id, job.id));
         } else {
-          await this.cleanupJobStagedFiles(job).catch(() => {});
           await db
             .update(schema.pipelineJob)
             .set({
               status: "failed",
-              stagedFilePath: null,
-              stagedQualities: null,
               lastError: lastJobErr,
               heartbeatAt: new Date(),
               updatedAt: new Date(),
@@ -2589,7 +2600,9 @@ export class PipelineEngineService {
             tracks = job.types.includes("dub") && !job.types.includes("sub") ? [["dub", 0]] : [["sub", 0]];
           }
 
-          const hfAccount = videoManager.getNextHfAccount();
+          const hfAccount = videoManager.getHfAccountForTarget(job.metadata?.hfUploadTarget);
+          job.metadata = { ...(job.metadata || {}), hfUploadTarget: { owner: hfAccount.owner, bucket: hfAccount.bucket } };
+          await db.update(schema.pipelineJob).set({ metadata: job.metadata }).where(eq(schema.pipelineJob.id, job.id));
           const animeId = job.animeId || job.anilistId || job.anidbId || job.id;
 
           const records = await videoManager.remuxAndUploadJobOnVm({
@@ -2715,7 +2728,9 @@ export class PipelineEngineService {
         }
       }
 
-      const hfAccount = videoManager.getNextHfAccount();
+      const hfAccount = videoManager.getHfAccountForTarget(job.metadata?.hfUploadTarget);
+        job.metadata = { ...(job.metadata || {}), hfUploadTarget: { owner: hfAccount.owner, bucket: hfAccount.bucket } };
+        await db.update(schema.pipelineJob).set({ metadata: job.metadata }).where(eq(schema.pipelineJob.id, job.id));
       const isRemux = this.isJobVmRemux(job);
       const qualityFilesManifest: Partial<Record<VideoResolutionQuality, string>> = {};
       const sq = (job.stagedQualities || job.metadata?.stagedQualities) as
@@ -3312,13 +3327,10 @@ export class PipelineEngineService {
             })
             .where(eq(schema.pipelineJob.id, job.id));
         } else {
-          await this.cleanupJobStagedFiles(job).catch(() => {});
           await db
             .update(schema.pipelineJob)
             .set({
               status: "failed",
-              stagedFilePath: null,
-              stagedQualities: null,
               lastError: failErr,
               heartbeatAt: new Date(),
               updatedAt: new Date(),
@@ -3414,14 +3426,11 @@ export class PipelineEngineService {
           })
           .where(eq(schema.pipelineJob.id, job.id));
       } else {
-        await this.cleanupJobStagedFiles(job).catch(() => {});
         await db
           .update(schema.pipelineJob)
           .set({
             status: "failed",
             batchId: null,
-            stagedFilePath: null,
-            stagedQualities: null,
             lastError: `Batch #${batchId} failed: ${errorMsg}`,
             heartbeatAt: new Date(),
             updatedAt: new Date(),
@@ -3885,7 +3894,9 @@ export class PipelineEngineService {
             }
           }
         }
-      } catch {}
+      } catch {
+        throw new Error("Cannot verify staged file ownership while the database is unavailable. Cleanup is disabled.");
+      }
     }
 
     try {
@@ -3936,7 +3947,7 @@ export class PipelineEngineService {
                   entry.isDirectory() &&
                   /^vm_remux_/i.test(entry.name) &&
                   (this.activeVmRemuxJobIds.has(parsedJobId) ||
-                    jInfo?.jobStatus === "encoding")
+                    ["encoding", "staged", "failed"].includes(jInfo?.jobStatus || ""))
                 ) {
                   isActiveTempWorkDir = true;
                 }
@@ -3955,7 +3966,7 @@ export class PipelineEngineService {
             // - DB wasn't queried and its filename belongs to an active job.
             // Any superseded duplicate file (same jobId, not in pathToJobInfo) IS marked orphan so cleanup frees it.
             const hasActiveDbStatus = Boolean(
-              matched && ["downloading", "staged", "encoding"].includes(matched.jobStatus),
+              matched && ["downloading", "staged", "encoding", "failed"].includes(matched.jobStatus),
             );
             const isSupersededDuplicate =
               !exactPathMatched &&
@@ -4016,13 +4027,14 @@ export class PipelineEngineService {
     freedBytes: number;
     requeuedMissingJobs: number;
   }> {
+    if (!DATABASE_URL) throw new Error("Database connection is required before orphan cleanup.");
     const report = await this.inspectStagedFilesOnDisk();
     let deletedCount = 0;
     let freedBytes = 0;
     let requeuedMissingJobs = 0;
 
     for (const file of report.files) {
-      if (file.isOrphan) {
+      if (file.isOrphan && Date.now() - new Date(file.modifiedAt).getTime() > 10 * 60_000) {
         try {
           await fs.promises.rm(file.fullPath, { recursive: true, force: true });
           deletedCount++;

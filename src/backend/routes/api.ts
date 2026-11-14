@@ -1,6 +1,6 @@
 import { FastifyInstance, FastifyPluginAsync } from "fastify";
 import { db, schema } from "../db/index.js";
-import { eq, desc, sql, and, inArray, asc } from "drizzle-orm";
+import { eq, desc, sql, and, inArray, asc, notInArray, isNull, or } from "drizzle-orm";
 import { PipelineEngineService } from "../engine/service.js";
 import { AnimeMetadataResolver } from "../engine/metadata-resolver.js";
 import { MAIN_BACKEND_URL } from "../config.js";
@@ -217,59 +217,32 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
   });
 
   app.get("/jobs", async (req) => {
-    const query = req.query as {
-      status?: string;
-      anilistId?: string;
-      animeId?: string;
-      anidbId?: string;
-      limit?: string;
-      offset?: string;
-    };
-    const limit = Math.min(200, Math.max(1, parseInt(query.limit || "100", 10)));
-    const offset = Math.max(0, parseInt(query.offset || "0", 10));
-
+    const query = req.query as Record<string, string | undefined>;
+    const limit = Math.min(200, Math.max(1, Number.parseInt(query.limit || "100", 10) || 100));
+    const offset = Math.max(0, Number.parseInt(query.offset || "0", 10) || 0);
     await PipelineEngineService.ensureTables();
-
     const conditions: any[] = [];
-    if (query.status && query.status !== "all") {
-      conditions.push(eq(schema.pipelineJob.status, query.status));
+    if (query.status === "active") conditions.push(inArray(schema.pipelineJob.status, ["downloading", "encoding"]));
+    else if (query.status && query.status !== "all") conditions.push(eq(schema.pipelineJob.status, query.status as any));
+    for (const key of ["anilistId", "animeId", "anidbId"] as const) {
+      const value = Number(query[key]);
+      if (Number.isSafeInteger(value) && value > 0) conditions.push(eq(schema.pipelineJob[key], value));
     }
-    if (query.anilistId) {
-      const parsed = parseInt(query.anilistId, 10);
-      if (!isNaN(parsed)) conditions.push(eq(schema.pipelineJob.anilistId, parsed));
+    if (query.mode === "vm_remux" || query.mode === "kaggle_gpu") conditions.push(eq(schema.pipelineJob.pipelineType, query.mode));
+    if (query.search?.trim()) {
+      const term = query.search.trim().slice(0, 200);
+      conditions.push(sql`(strpos(lower(coalesce(${schema.pipelineJob.torrentTitle}, '')), lower(${term})) > 0
+        OR strpos(lower(coalesce(${schema.pipelineJob.metadata}->>'primaryTitle', '')), lower(${term})) > 0
+        OR strpos(lower(coalesce(${schema.pipelineJob.knownTitles}::text, '')), lower(${term})) > 0
+        OR ${schema.pipelineJob.id}::text = ${term} OR ${schema.pipelineJob.animeId}::text = ${term}
+        OR ${schema.pipelineJob.anilistId}::text = ${term} OR ${schema.pipelineJob.anidbId}::text = ${term})`);
     }
-    if (query.animeId) {
-      const parsed = parseInt(query.animeId, 10);
-      if (!isNaN(parsed)) conditions.push(eq(schema.pipelineJob.animeId, parsed));
-    }
-    if (query.anidbId) {
-      const parsed = parseInt(query.anidbId, 10);
-      if (!isNaN(parsed)) conditions.push(eq(schema.pipelineJob.anidbId, parsed));
-    }
-
-    let q = db
-      .select()
-      .from(schema.pipelineJob)
-      .orderBy(desc(schema.pipelineJob.id))
-      .limit(limit)
-      .offset(offset);
-
-    if (conditions.length > 0) {
-      q = db
-        .select()
-        .from(schema.pipelineJob)
-        .where(and(...conditions))
-        .orderBy(desc(schema.pipelineJob.id))
-        .limit(limit)
-        .offset(offset) as any;
-    }
-
-    try {
-      const jobs = await q;
-      return { jobs, limit, offset };
-    } catch {
-      return { jobs: [], limit, offset };
-    }
+    const where = and(...conditions);
+    const [jobs, counts] = await Promise.all([
+      db.select().from(schema.pipelineJob).where(where).orderBy(desc(schema.pipelineJob.id)).limit(limit).offset(offset),
+      db.select({ total: sql<number>`count(*)::int` }).from(schema.pipelineJob).where(where),
+    ]);
+    return { jobs, total: counts[0]?.total ?? 0, limit, offset };
   });
 
   app.post("/jobs/:id/retry", async (req, reply) => {
@@ -284,6 +257,9 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
       return reply.status(404).send({ error: "Job not found" });
     }
 
+    if (["downloading", "encoding", "completed"].includes(existing.status) || (existing.batchId && existing.status !== "failed")) {
+      return reply.status(409).send({ error: "This job is active or completed. Only inactive unfinished jobs can be retried." });
+    }
     const hasStagedFile = PipelineEngineService.hasValidStagedFiles(existing);
 
     const [updated] = await db
@@ -292,12 +268,13 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
         status: hasStagedFile ? "staged" : "queued",
         batchId: null,
         lastError: null,
-        attempt: sql`${schema.pipelineJob.attempt} + 1`,
+        attempt: 0,
         heartbeatAt: new Date(),
         updatedAt: new Date(),
       })
-      .where(eq(schema.pipelineJob.id, jobId))
+      .where(and(eq(schema.pipelineJob.id, jobId), eq(schema.pipelineJob.status, existing.status)))
       .returning();
+    if (!updated) return reply.status(409).send({ error: "Job changed while retrying. Refresh and try again." });
 
     if (hasStagedFile) {
       log.info("API", `Job #${jobId} already has staged MKV on SSD; returned directly to 'staged' queue.`);
@@ -322,18 +299,23 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     return { ok: true, job: updated };
   });
 
-  app.post("/jobs/:id/delete", async (req) => {
+  app.post("/jobs/:id/delete", async (req, reply) => {
     const { id } = req.params as { id: string };
     const jobId = parseInt(id, 10);
 
     const existing = await db.query.pipelineJob.findFirst({
       where: eq(schema.pipelineJob.id, jobId),
     });
-    if (existing) {
-      await PipelineEngineService.cleanupJobStagedFiles(existing);
+    if (existing && (["downloading", "encoding"].includes(existing.status) || (existing.batchId && !["failed", "completed"].includes(existing.status)))) {
+      return reply.status(409).send({ error: "This job is active. Wait for processing to stop before deleting files." });
     }
+    if (!existing) return reply.status(404).send({ error: "Job not found" });
+    const deleted = await db.delete(schema.pipelineJob)
+      .where(and(eq(schema.pipelineJob.id, jobId), eq(schema.pipelineJob.status, existing.status)))
+      .returning();
+    if (!deleted.length) return reply.status(409).send({ error: "Job changed while deleting. Refresh and try again." });
+    await PipelineEngineService.cleanupJobStagedFiles(existing);
 
-    await db.delete(schema.pipelineJob).where(eq(schema.pipelineJob.id, jobId));
     log.info("API", `Deleted Job #${jobId}`);
     return { ok: true };
   });
@@ -370,17 +352,20 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
       return { ok: true, affected: 0, message: "No matching jobs found" };
     }
 
+    if (action !== "sync_callbacks" && targetJobs.some(job => ["downloading", "encoding"].includes(job.status) || (job.batchId && !["failed", "completed"].includes(job.status)))) {
+      return reply.status(409).send({ error: "Selection contains active jobs. Wait for processing to stop before changing them." });
+    }
+    if (action === "retry" && targetJobs.some(job => job.status === "completed")) {
+      return reply.status(409).send({ error: "Completed jobs cannot be retried. Use delivery callback recovery instead." });
+    }
     if (action === "delete") {
-      for (const job of targetJobs) {
-        await PipelineEngineService.cleanupJobStagedFiles(job);
-      }
-      await db.delete(schema.pipelineJob).where(inArray(schema.pipelineJob.id, jobIds));
-      log.info("API", `Bulk deleted ${targetJobs.length} job(s) and cleaned staged SSD files.`);
-      return {
-        ok: true,
-        affected: targetJobs.length,
-        message: `Deleted ${targetJobs.length} job(s) and freed associated SSD staging files.`,
-      };
+      const deleted = await db.delete(schema.pipelineJob).where(and(
+        inArray(schema.pipelineJob.id, jobIds),
+        notInArray(schema.pipelineJob.status, ["downloading", "encoding"]),
+        or(isNull(schema.pipelineJob.batchId), inArray(schema.pipelineJob.status, ["failed", "completed"])),
+      )).returning();
+      for (const job of deleted) await PipelineEngineService.cleanupJobStagedFiles(job);
+      return { ok: true, affected: deleted.length, message: `Deleted ${deleted.length} job(s) and their local files; ${targetJobs.length - deleted.length} changed jobs were left untouched.` };
     }
 
     if (action === "retry") {
@@ -395,12 +380,13 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
             status: hasStaged ? "staged" : "queued",
             batchId: null,
             lastError: null,
-            attempt: sql`${schema.pipelineJob.attempt} + 1`,
+            attempt: 0,
             heartbeatAt: new Date(),
             updatedAt: new Date(),
           })
-          .where(eq(schema.pipelineJob.id, job.id))
+          .where(and(eq(schema.pipelineJob.id, job.id), eq(schema.pipelineJob.status, job.status)))
           .returning();
+        if (!updated) continue;
 
         if (hasStaged) {
           stagedRestored++;
@@ -422,8 +408,8 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
 
       return {
         ok: true,
-        affected: targetJobs.length,
-        message: `Retried ${targetJobs.length} job(s) (${stagedRestored} restored from SSD staging, ${rediscovered} queued for discovery).`,
+        affected: stagedRestored + rediscovered,
+        message: `Retried ${stagedRestored + rediscovered} job(s) (${stagedRestored} restored from SSD staging, ${rediscovered} queued for discovery).`,
       };
     }
 
@@ -432,6 +418,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
       let updatedCount = 0;
 
       for (const job of targetJobs) {
+        if (job.status === "completed") continue;
         const hasStaged = PipelineEngineService.hasValidStagedFiles(job);
         const nextStatus =
           job.status === "completed"
@@ -440,7 +427,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
               ? "staged"
               : "queued";
 
-        await db
+        const changed = await db
           .update(schema.pipelineJob)
           .set({
             status: nextStatus,
@@ -452,8 +439,9 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
             },
             updatedAt: new Date(),
           })
-          .where(eq(schema.pipelineJob.id, job.id));
-        updatedCount++;
+          .where(and(eq(schema.pipelineJob.id, job.id), eq(schema.pipelineJob.status, job.status)))
+          .returning({ id: schema.pipelineJob.id });
+        if (changed.length) updatedCount++;
       }
 
       const startedVmIds = await PipelineEngineService.drainVmRemuxQueue();
@@ -533,7 +521,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
           status: hasStaged ? "staged" : "queued",
           batchId: null,
           lastError: null,
-          attempt: sql`${schema.pipelineJob.attempt} + 1`,
+          attempt: 0,
           heartbeatAt: new Date(),
           updatedAt: new Date(),
         })
@@ -632,7 +620,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     const completedJobs = await db
       .select()
       .from(schema.pipelineJob)
-      .where(eq(schema.pipelineJob.status, "completed"));
+      .where(and(eq(schema.pipelineJob.status, "completed"), sql`${schema.pipelineJob.metadata}->>'callbackDelivered' = 'true'`));
 
     for (const job of completedJobs) {
       await PipelineEngineService.cleanupJobStagedFiles(job);
@@ -641,7 +629,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     if (completedJobs.length > 0) {
       await db
         .delete(schema.pipelineJob)
-        .where(eq(schema.pipelineJob.status, "completed"));
+        .where(and(eq(schema.pipelineJob.status, "completed"), sql`${schema.pipelineJob.metadata}->>'callbackDelivered' = 'true'`));
     }
 
     return {
@@ -728,6 +716,10 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     }
 
     if (action === "delete") {
+      const selectedBatches = await db.select().from(schema.pipelineBatch).where(inArray(schema.pipelineBatch.id, batchIds));
+      if (selectedBatches.some(batch => !["completed", "failed"].includes(batch.status))) {
+        return reply.status(409).send({ error: "Active batches cannot be deleted. Wait for them to finish or fail." });
+      }
       // Return any non-completed jobs in these batches back to staged
       const batchJobs = await db
         .select()

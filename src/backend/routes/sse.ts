@@ -1,42 +1,30 @@
-import { FastifyInstance, FastifyPluginAsync } from "fastify";
-import { log, type LogEntry } from "../utils/logger.js";
+import type { FastifyPluginAsync } from "fastify";
+import { log } from "../utils/logger.js";
 import { PipelineEngineService } from "../engine/service.js";
 
-export const sseRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
+export const sseRoutes: FastifyPluginAsync = async app => {
   app.get("/events", (req, reply) => {
-    reply.raw.setHeader("Content-Type", "text/event-stream");
-    reply.raw.setHeader("Cache-Control", "no-cache");
-    reply.raw.setHeader("Connection", "keep-alive");
-    reply.raw.setHeader("Access-Control-Allow-Origin", "*");
-    reply.raw.flushHeaders();
-
-    // 1. Send initial recent logs
-    const recentLogs = log.getRecentLogs(50);
-    reply.raw.write(`event: init_logs\ndata: ${JSON.stringify(recentLogs)}\n\n`);
-
-    // 2. Stream new logs in real-time
-    const unsubscribe = log.subscribe((entry: LogEntry) => {
-      try {
-        reply.raw.write(`event: log\ndata: ${JSON.stringify(entry)}\n\n`);
-      } catch {
-        // Disconnected
-      }
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive", "X-Accel-Buffering": "no",
     });
-
-    // 3. Heartbeat & periodic stats every 5s
-    const statsTimer = setInterval(async () => {
-      try {
-        const stats = await PipelineEngineService.getStats();
-        reply.raw.write(`event: stats\ndata: ${JSON.stringify(stats)}\n\n`);
-      } catch {
-        // Disconnected
-      }
-    }, 5000);
-
-    req.raw.on("close", () => {
-      unsubscribe();
-      clearInterval(statsTimer);
-    });
+    let closed = false, pending = false;
+    const send = (event: string, data: unknown) => {
+      if (closed || reply.raw.destroyed) return;
+      if (!reply.raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)) reply.raw.destroy();
+    };
+    send("init_logs", log.getRecentLogs(50));
+    const unsubscribe = log.subscribe(entry => send("log", entry));
+    const publishStats = async () => {
+      if (closed || pending) return;
+      pending = true;
+      try { send("stats", await PipelineEngineService.getStats()); }
+      catch { reply.raw.destroy(); }
+      finally { pending = false; }
+    };
+    const timer = setInterval(publishStats, 5000);
+    reply.raw.on("close", () => { closed = true; unsubscribe(); clearInterval(timer); });
+    void publishStats();
   });
 };
-

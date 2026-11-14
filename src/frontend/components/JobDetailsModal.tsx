@@ -1,3 +1,4 @@
+import { useDialog } from "../hooks/useDialog.js";
 import React, { useState } from "react";
 import {
   X,
@@ -21,6 +22,7 @@ interface JobDetailsModalProps {
 }
 
 export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProps) {
+  useDialog(Boolean(job), onClose);
   const [copied, setCopied] = useState(false);
   const [copiedUrls, setCopiedUrls] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
@@ -61,6 +63,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
     sources.find((s: any) => s.quality === selectedQuality) || sources[0] || null;
   const activeStreamUrl = activeStreamSource?.downloadUrl || activeStreamSource?.url || "";
 
+  const cannotReprocess = ["downloading", "encoding", "completed"].includes(job.status) || Boolean(job.batchId && job.status !== "failed");
   const tsukihimeId = job.metadata?.tsukihimeId;
   const processingMode = job.pipelineType || job.metadata?.processingMode;
   const selectionTier = job.selectionTier || job.metadata?.selectionTier;
@@ -101,12 +104,13 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
         }),
       });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.message || "Job update failed");
       if (onUpdated) {
         onUpdated(data.message || `Executed ${action} for Job #${job.id}`);
       }
       onClose();
-    } catch {
-      // Ignore transient errors
+    } catch (error) {
+      onUpdated?.(error instanceof Error ? error.message : "Job update failed");
     } finally {
       setActionBusy(null);
     }
@@ -117,16 +121,16 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
       role="dialog"
       aria-modal="true"
       aria-labelledby="job-details-title"
-      className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 bg-[#302e2a]/35 backdrop-blur-sm flex items-center justify-center p-4"
     >
       <div className="surface-panel rounded-xl max-w-3xl w-full p-6 shadow-2xl relative max-h-[92vh] overflow-y-auto">
         {/* Header */}
-        <div className="flex items-start justify-between pb-4 border-b border-[#1e2230]">
+        <div className="flex items-start justify-between pb-4 border-b border-[#e6e3db]">
           <div className="pr-8 min-w-0">
-            <div className="flex flex-wrap items-center gap-2 text-xs font-mono tabular-nums text-[#949bb0]">
+            <div className="flex flex-wrap items-center gap-2 text-xs font-mono tabular-nums text-[#716c63]">
               <span>Job #{job.id}</span>
               <span>·</span>
-              <span className="uppercase text-indigo-400 font-semibold">{job.status}</span>
+              <span className="uppercase text-[#9a563b] font-semibold">{job.status}</span>
               <span>·</span>
               <span>Episode {job.episodeNumber}</span>
               <span>·</span>
@@ -136,7 +140,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
                   <span>·</span>
                   <span
                     className={
-                      processingMode === "vm_remux" ? "text-emerald-400" : "text-violet-400"
+                      processingMode === "vm_remux" ? "text-[#52734c]" : "text-[#9a563b]"
                     }
                   >
                     {processingMode === "vm_remux"
@@ -146,7 +150,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
                 </>
               )}
             </div>
-            <h3 id="job-details-title" className="text-base font-bold text-[#f3f4f8] mt-1 truncate">
+            <h3 id="job-details-title" className="text-base font-bold text-[#302e2a] mt-1 truncate">
               {job.metadata?.primaryTitle || job.torrentTitle || `Anime Job #${job.id}`}
             </h3>
           </div>
@@ -155,45 +159,45 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
             type="button"
             onClick={onClose}
             aria-label="Close job details"
-            className="btn-secondary w-8 h-8 rounded-lg flex items-center justify-center text-[#949bb0] hover:text-white cursor-pointer shrink-0"
+            className="btn-secondary w-8 h-8 rounded-lg flex items-center justify-center text-[#716c63] hover:text-[#302e2a] cursor-pointer shrink-0"
           >
             <X className="w-4 h-4" />
           </button>
         </div>
 
         {/* Direct Job Action Toolbar */}
-        <div className="my-4 p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex flex-wrap items-center justify-between gap-2">
-          <span className="text-xs font-medium text-[#949bb0]">
+        <div className="my-4 p-3 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] flex flex-wrap items-center justify-between gap-2">
+          <span className="text-xs font-medium text-[#716c63]">
             Pipeline Controls
           </span>
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
-              disabled={actionBusy !== null}
+              disabled={actionBusy !== null || cannotReprocess}
               onClick={() => runJobAction("retry")}
               className="btn-secondary px-2.5 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
             >
-              <RefreshCw className="w-3.5 h-3.5 text-indigo-400" />
+              <RefreshCw className="w-3.5 h-3.5 text-[#9a563b]" />
               <span>Retry Job</span>
             </button>
             <button
               type="button"
-              disabled={actionBusy !== null}
+              disabled={actionBusy !== null || cannotReprocess}
               onClick={() => runJobAction("force_remux")}
               className="btn-secondary px-2.5 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
               title="Force direct container & audio conversion on VM (-c:v copy)"
             >
-              <HardDrive className="w-3.5 h-3.5 text-emerald-400" />
+              <HardDrive className="w-3.5 h-3.5 text-[#52734c]" />
               <span>Route to VM Remux</span>
             </button>
             <button
               type="button"
-              disabled={actionBusy !== null}
+              disabled={actionBusy !== null || cannotReprocess}
               onClick={() => runJobAction("force_gpu")}
               className="btn-secondary px-2.5 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
               title="Route job to Kaggle Dual-T4 GPU batch transcoding"
             >
-              <Cpu className="w-3.5 h-3.5 text-violet-400" />
+              <Cpu className="w-3.5 h-3.5 text-[#9a563b]" />
               <span>Route to GPU</span>
             </button>
             {job.status === "completed" && (
@@ -203,7 +207,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
                 onClick={() => runJobAction("sync_callbacks")}
                 className="btn-secondary px-2.5 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
               >
-                <Play className="w-3.5 h-3.5 text-sky-400" />
+                <Play className="w-3.5 h-3.5 text-[#9a563b]" />
                 <span>Sync Webhook</span>
               </button>
             )}
@@ -212,42 +216,42 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
 
         {/* Identifiers & Codec Metadata Row */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
-          <div className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
-            <span className="text-[11px] text-[#636b82] block mb-0.5">AniList ID</span>
+          <div className="p-3 rounded-lg bg-[#f5f3ed] border border-[#e6e3db]">
+            <span className="text-[11px] text-[#817a70] block mb-0.5">AniList ID</span>
             {job.anilistId ? (
               <a
                 href={`https://anilist.co/anime/${job.anilistId}`}
                 target="_blank"
                 rel="noreferrer"
-                className="font-mono tabular-nums font-semibold text-xs text-indigo-400 hover:underline inline-flex items-center gap-1"
+                className="font-mono tabular-nums font-semibold text-xs text-[#9a563b] hover:underline inline-flex items-center gap-1"
               >
                 <span>#{job.anilistId}</span>
                 <ExternalLink className="w-3 h-3" />
               </a>
             ) : (
-              <span className="text-xs font-mono text-[#636b82]">—</span>
+              <span className="text-xs font-mono text-[#817a70]">—</span>
             )}
           </div>
 
-          <div className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
-            <span className="text-[11px] text-[#636b82] block mb-0.5">Tsukihime / AniDB</span>
-            <span className="font-mono tabular-nums font-semibold text-xs text-[#f3f4f8]">
+          <div className="p-3 rounded-lg bg-[#f5f3ed] border border-[#e6e3db]">
+            <span className="text-[11px] text-[#817a70] block mb-0.5">Tsukihime / AniDB</span>
+            <span className="font-mono tabular-nums font-semibold text-xs text-[#302e2a]">
               {tsukihimeId ? `Tsuki #${tsukihimeId}` : "—"} ·{" "}
               {job.anidbId ? `AniDB #${job.anidbId}` : "—"}
             </span>
           </div>
 
-          <div className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
-            <span className="text-[11px] text-[#636b82] block mb-0.5">Release Group & Tier</span>
-            <span className="font-mono text-xs font-semibold text-[#d5d9e6] truncate block">
+          <div className="p-3 rounded-lg bg-[#f5f3ed] border border-[#e6e3db]">
+            <span className="text-[11px] text-[#817a70] block mb-0.5">Release Group & Tier</span>
+            <span className="font-mono text-xs font-semibold text-[#5b554a] truncate block">
               {releaseGroup || "auto"} · {(videoCodec || "h264").toUpperCase()}
               {selectionTier ? ` (${selectionTier})` : ""}
             </span>
           </div>
 
-          <div className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
-            <span className="text-[11px] text-[#636b82] block mb-0.5">Staged Payload</span>
-            <span className="font-mono tabular-nums font-semibold text-xs text-[#d5d9e6]">
+          <div className="p-3 rounded-lg bg-[#f5f3ed] border border-[#e6e3db]">
+            <span className="text-[11px] text-[#817a70] block mb-0.5">Staged Payload</span>
+            <span className="font-mono tabular-nums font-semibold text-xs text-[#5b554a]">
               {job.sizeBytes
                 ? `${(job.sizeBytes / (1024 * 1024)).toFixed(1)} MB`
                 : "—"}{" "}
@@ -258,41 +262,41 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
 
         {/* Selected Release Title & Multi-Quality Staged Files */}
         {(job.torrentTitle || job.stagedFilePath || stagedQualityKeys.length > 0) && (
-          <div className="mb-4 p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230] space-y-2">
+          <div className="mb-4 p-3 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] space-y-2">
             {job.torrentTitle && (
               <div>
-                <span className="text-[11px] text-[#636b82] block mb-1">
+                <span className="text-[11px] text-[#817a70] block mb-1">
                   Selected Primary Release (1080p Subtitle Source)
                 </span>
-                <div className="font-mono text-xs text-[#f3f4f8] break-all">
+                <div className="font-mono text-xs text-[#302e2a] break-all">
                   {job.torrentTitle}
                 </div>
               </div>
             )}
 
             {job.stagedFilePath && (
-              <div className="pt-2 border-t border-[#1e2230]">
-                <span className="text-[11px] text-[#636b82] block mb-1">
+              <div className="pt-2 border-t border-[#e6e3db]">
+                <span className="text-[11px] text-[#817a70] block mb-1">
                   Primary Staged File Path on Local SSD
                 </span>
-                <div className="font-mono text-[11px] text-emerald-300 break-all bg-[#12151f] px-2.5 py-1.5 rounded border border-[#1e2230]">
+                <div className="font-mono text-[11px] text-[#52734c] break-all bg-[#12151f] px-2.5 py-1.5 rounded border border-[#e6e3db]">
                   {job.stagedFilePath}
                 </div>
               </div>
             )}
 
             {stagedQualityKeys.length > 0 && (
-              <div className="pt-2 border-t border-[#1e2230]">
-                <span className="text-[11px] text-[#636b82] block mb-1">
+              <div className="pt-2 border-t border-[#e6e3db]">
+                <span className="text-[11px] text-[#817a70] block mb-1">
                   Same-Group Staged Quality Files ({stagedQualityKeys.join(" · ")})
                 </span>
                 <div className="space-y-1">
                   {stagedQualityKeys.map((qKey) => (
                     <div
                       key={qKey}
-                      className="flex items-center justify-between text-[11px] font-mono text-[#949bb0]"
+                      className="flex items-center justify-between text-[11px] font-mono text-[#716c63]"
                     >
-                      <span className="text-indigo-400 font-semibold">{qKey}</span>
+                      <span className="text-[#9a563b] font-semibold">{qKey}</span>
                       <span className="truncate max-w-md">{stagedQualities[qKey]}</span>
                     </div>
                   ))}
@@ -304,12 +308,12 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
 
         {/* Error Trace if Failed */}
         {job.lastError && (
-          <div className="mb-4 p-3.5 rounded-lg bg-rose-500/10 border border-rose-500/25 text-rose-300 text-xs">
+          <div className="mb-4 p-3.5 rounded-lg bg-rose-500/10 border border-rose-500/25 text-[#ad4a3e] text-xs">
             <div className="font-semibold flex items-center gap-1.5 mb-1 text-rose-200">
               <AlertTriangle className="w-4 h-4" />
               <span>Diagnostic Trace</span>
             </div>
-            <pre className="font-mono text-[11px] whitespace-pre-wrap break-all text-rose-300">
+            <pre className="font-mono text-[11px] whitespace-pre-wrap break-all text-[#ad4a3e]">
               {job.lastError}
             </pre>
           </div>
@@ -317,11 +321,11 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
 
         {/* Multimedia Video Stream Preview Player (When Completed / Sources Available) */}
         {sources.length > 0 && (
-          <div className="mb-4 p-3.5 rounded-lg bg-[#0c0e14] border border-[#1e2230] space-y-3">
+          <div className="mb-4 p-3.5 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2">
-                <Film className="w-4 h-4 text-indigo-400" />
-                <h4 className="text-xs font-semibold text-[#f3f4f8]">
+                <Film className="w-4 h-4 text-[#9a563b]" />
+                <h4 className="text-xs font-semibold text-[#302e2a]">
                   Multimedia Stream Inspector ({sources.length} qualities)
                 </h4>
               </div>
@@ -329,7 +333,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
               <div className="flex flex-wrap items-center gap-2">
                 {/* Audio Track Switcher */}
                 {availableAudioTracks.length > 1 && (
-                  <div className="flex items-center bg-[#151822] p-0.5 rounded-md border border-[#232838] text-[11px] font-mono">
+                  <div className="flex items-center bg-[#f0eee8] p-0.5 rounded-md border border-[#ded8cd] text-[11px] font-mono">
                     {availableAudioTracks.map((aType) => (
                       <button
                         key={aType}
@@ -337,8 +341,8 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
                         onClick={() => setSelectedAudioType(aType)}
                         className={`px-2 py-0.5 rounded uppercase cursor-pointer ${
                           selectedAudioType === aType
-                            ? "bg-indigo-500 text-white font-semibold"
-                            : "text-[#949bb0] hover:text-white"
+                            ? "bg-indigo-500 text-[#302e2a] font-semibold"
+                            : "text-[#716c63] hover:text-[#302e2a]"
                         }`}
                       >
                         {aType}
@@ -348,7 +352,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
                 )}
 
                 {/* Quality Switcher */}
-                <div className="flex items-center bg-[#151822] p-0.5 rounded-md border border-[#232838] text-[11px] font-mono">
+                <div className="flex items-center bg-[#f0eee8] p-0.5 rounded-md border border-[#ded8cd] text-[11px] font-mono">
                   {sources.map((s: any) => (
                     <button
                       key={s.quality}
@@ -356,8 +360,8 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
                       onClick={() => setSelectedQuality(s.quality)}
                       className={`px-2 py-0.5 rounded cursor-pointer ${
                         (activeStreamSource?.quality || "") === s.quality
-                          ? "bg-[#232838] text-white font-semibold"
-                          : "text-[#949bb0] hover:text-white"
+                          ? "bg-[#ded8cd] text-[#302e2a] font-semibold"
+                          : "text-[#716c63] hover:text-[#302e2a]"
                       }`}
                     >
                       {s.quality}
@@ -371,7 +375,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
                   className="btn-secondary px-2.5 py-1 rounded-md text-[11px] font-mono inline-flex items-center gap-1 cursor-pointer"
                 >
                   {copiedUrls ? (
-                    <Check className="w-3 h-3 text-emerald-400" />
+                    <Check className="w-3 h-3 text-[#52734c]" />
                   ) : (
                     <Copy className="w-3 h-3" />
                   )}
@@ -381,7 +385,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
             </div>
 
             {activeStreamUrl && (
-              <div className="rounded-lg overflow-hidden bg-black border border-[#1e2230]">
+              <div className="rounded-lg overflow-hidden bg-black border border-[#e6e3db]">
                 <video
                   key={activeStreamUrl}
                   src={activeStreamUrl}
@@ -410,16 +414,16 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
               {sources.map((s: any, idx: number) => (
                 <div
                   key={idx}
-                  className="p-2 rounded-md bg-[#131620] border border-[#1e2230] flex items-center justify-between text-xs font-mono"
+                  className="p-2 rounded-md bg-[#131620] border border-[#e6e3db] flex items-center justify-between text-xs font-mono"
                 >
                   <div className="flex items-center gap-2.5 min-w-0">
-                    <span className="text-indigo-400 font-semibold">{s.quality}</span>
+                    <span className="text-[#9a563b] font-semibold">{s.quality}</span>
                     {s.sizeBytes && (
-                      <span className="text-[#636b82] text-[11px]">
+                      <span className="text-[#817a70] text-[11px]">
                         {(s.sizeBytes / (1024 * 1024)).toFixed(1)} MB
                       </span>
                     )}
-                    <span className="text-[#949bb0] text-[11px] truncate max-w-md">
+                    <span className="text-[#716c63] text-[11px] truncate max-w-md">
                       {s.downloadUrl || s.url}
                     </span>
                   </div>
@@ -428,7 +432,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
                       href={s.downloadUrl || s.url}
                       target="_blank"
                       rel="noreferrer"
-                      className="btn-secondary p-1.5 rounded-md text-[#949bb0] hover:text-white shrink-0"
+                      className="btn-secondary p-1.5 rounded-md text-[#716c63] hover:text-[#302e2a] shrink-0"
                       title={`Open ${s.quality} MP4 stream`}
                     >
                       <Download className="w-3.5 h-3.5" />
@@ -443,25 +447,25 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
         {/* Extracted 1080p Subtitles */}
         {subtitles.length > 0 && (
           <div className="mb-4">
-            <h4 className="text-xs font-semibold text-[#949bb0] mb-2 flex items-center gap-1.5">
-              <Subtitles className="w-3.5 h-3.5 text-sky-400" />
+            <h4 className="text-xs font-semibold text-[#716c63] mb-2 flex items-center gap-1.5">
+              <Subtitles className="w-3.5 h-3.5 text-[#9a563b]" />
               <span>Cloudflare R2 Subtitles — Extracted from 1080p ({subtitles.length} tracks)</span>
             </h4>
             <div className="space-y-1.5">
               {subtitles.map((sub: any, idx: number) => (
                 <div
                   key={idx}
-                  className="p-2.5 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex items-center justify-between text-xs font-mono"
+                  className="p-2.5 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] flex items-center justify-between text-xs font-mono"
                 >
                   <div className="flex items-center gap-2.5 min-w-0">
-                    <span className="text-sky-400 font-semibold uppercase">
+                    <span className="text-[#9a563b] font-semibold uppercase">
                       {sub.language || "UND"}
                     </span>
-                    <span className="text-[#d5d9e6] text-[11px] truncate">
+                    <span className="text-[#5b554a] text-[11px] truncate">
                       {sub.label || sub.path}
                     </span>
                     {sub.role && (
-                      <span className="text-[#636b82] text-[10px]">· {sub.role}</span>
+                      <span className="text-[#817a70] text-[10px]">· {sub.role}</span>
                     )}
                   </div>
                   {sub.url && (
@@ -469,7 +473,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
                       href={sub.url}
                       target="_blank"
                       rel="noreferrer"
-                      className="btn-secondary p-1.5 rounded-md text-[#949bb0] hover:text-white shrink-0"
+                      className="btn-secondary p-1.5 rounded-md text-[#716c63] hover:text-[#302e2a] shrink-0"
                     >
                       <Download className="w-3.5 h-3.5" />
                     </a>
@@ -481,7 +485,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
         )}
 
         {/* Footer */}
-        <div className="pt-3 border-t border-[#1e2230] flex items-center justify-between text-xs text-[#636b82] font-mono tabular-nums">
+        <div className="pt-3 border-t border-[#e6e3db] flex items-center justify-between text-xs text-[#817a70] font-mono tabular-nums">
           <div>Created {new Date(job.createdAt).toLocaleString()}</div>
           <button
             type="button"
@@ -489,7 +493,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
             className="btn-secondary flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs cursor-pointer"
           >
             {copied ? (
-              <Check className="w-3.5 h-3.5 text-emerald-400" />
+              <Check className="w-3.5 h-3.5 text-[#52734c]" />
             ) : (
               <Copy className="w-3.5 h-3.5" />
             )}

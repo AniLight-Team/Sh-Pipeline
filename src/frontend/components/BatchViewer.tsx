@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   Boxes,
   Play,
@@ -54,16 +54,25 @@ export function BatchViewer({
   const [batchJobsMap, setBatchJobsMap] = useState<Record<number, any[]>>({});
   const [loadingBatchJobsId, setLoadingBatchJobsId] = useState<number | null>(null);
 
+  const pendingFetch = useRef<AbortController | null>(null);
+  const mounted = useRef(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+
   const fetchBatches = async () => {
+    if (pendingFetch.current) return;
+    const controller = new AbortController();
+    pendingFetch.current = controller;
     setLoading(true);
     try {
-      const res = await fetch("/api/batches");
+      const res = await fetch("/api/batches", { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(25000)]) });
       const data = await res.json();
-      setBatches(data.batches || []);
-    } catch {
-      // Ignore transient network errors
+      if (!res.ok) throw new Error(data.error || data.message || "Request failed");
+      if (mounted.current) { setBatches(data.batches || []); setFetchError(null); }
+    } catch (error) {
+      if (mounted.current) setFetchError(error instanceof Error ? error.message : "Could not refresh batches");
     } finally {
-      setLoading(false);
+      pendingFetch.current = null;
+      if (mounted.current) setLoading(false);
     }
   };
 
@@ -72,6 +81,7 @@ export function BatchViewer({
     try {
       const res = await fetch(`/api/batches/${batchId}/execute`, { method: "POST" });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.message || "Request failed");
       onNotice?.(data.message || `Batch #${batchId} verified and dispatched.`);
       await fetchBatches();
     } catch {
@@ -92,6 +102,7 @@ export function BatchViewer({
         body: JSON.stringify({ batchIds: ids, action }),
       });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error || data.message || "Request failed");
       onNotice?.(data.message || `Batch ${action} completed.`);
       if (action === "delete") {
         setSelectedBatchIds(new Set());
@@ -115,6 +126,7 @@ export function BatchViewer({
       try {
         const res = await fetch(`/api/batches/${batchId}/jobs`);
         const data = await res.json();
+        if (!res.ok) throw new Error(data.error || data.message || "Request failed");
         setBatchJobsMap((prev) => ({ ...prev, [batchId]: data.jobs || [] }));
       } catch {
         // Ignore
@@ -125,9 +137,10 @@ export function BatchViewer({
   };
 
   useEffect(() => {
-    fetchBatches();
+    mounted.current = true;
+    void fetchBatches();
     const interval = setInterval(fetchBatches, 10000);
-    return () => clearInterval(interval);
+    return () => { mounted.current = false; clearInterval(interval); pendingFetch.current?.abort(); pendingFetch.current = null; };
   }, []);
 
   const filteredBatches = batches.filter((b) => {
@@ -166,7 +179,7 @@ export function BatchViewer({
     switch (status) {
       case "completed":
         return (
-          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-emerald-400">
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-[#52734c]">
             <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
             <span>Completed</span>
           </span>
@@ -175,21 +188,21 @@ export function BatchViewer({
       case "uploading":
       case "waiting_dataset":
         return (
-          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-sky-400">
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-[#9a563b]">
             <Loader2 className="w-3.5 h-3.5 shrink-0 animate-spin" />
             <span>{status.replace("_", " ")}</span>
           </span>
         );
       case "failed":
         return (
-          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-rose-400">
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-[#ad4a3e]">
             <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
             <span>Failed</span>
           </span>
         );
       default:
         return (
-          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-amber-400">
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-[#92703e]">
             <Clock className="w-3.5 h-3.5 shrink-0" />
             <span>{status === "created" ? "Sealed / Ready" : status}</span>
           </span>
@@ -199,31 +212,32 @@ export function BatchViewer({
 
   return (
     <div className="surface-panel rounded-xl overflow-hidden">
-      <div className="px-5 py-4 border-b border-[#1e2230] flex flex-wrap items-center justify-between gap-3">
+      {fetchError && <div className="inline-error" role="alert">{fetchError}. Showing the last available batch data.</div>}
+      <div className="px-5 py-4 border-b border-[#e6e3db] flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="flex items-center gap-2">
-            <h2 className="text-sm font-semibold text-[#f3f4f8]">
+            <h2 className="text-sm font-semibold text-[#302e2a]">
               Pipeline 2 GPU Batch Executions (Kaggle Dual-T4 GPU · 429 Rate-Limit Protected)
             </h2>
-            <span className="text-xs font-mono tabular-nums text-[#636b82]">
+            <span className="text-xs font-mono tabular-nums text-[#817a70]">
               · {filteredBatches.length} {filteredBatches.length === 1 ? "batch" : "batches"}
             </span>
           </div>
-          <p className="text-xs text-[#636b82] mt-0.5">
+          <p className="text-xs text-[#817a70] mt-0.5">
             Pipeline 1 (H.264) streams 2 jobs at a time directly on the VM (-c:v copy, no batching) · Pipeline 2 (HEVC/AV1) batches up to 10 episodes on Kaggle GPU
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
           {/* Mode Filter */}
-          <div className="flex items-center bg-[#0c0e14] p-1 rounded-lg border border-[#1e2230] text-xs font-mono">
+          <div className="flex items-center bg-[#f5f3ed] p-1 rounded-lg border border-[#e6e3db] text-xs font-mono">
             <button
               type="button"
               onClick={() => setModeFilter("all")}
               className={`px-2.5 py-1 rounded-md cursor-pointer transition-colors ${
                 modeFilter === "all"
-                  ? "bg-[#1c202e] text-white"
-                  : "text-[#949bb0] hover:text-white"
+                  ? "bg-[#ebe7df] text-[#302e2a]"
+                  : "text-[#716c63] hover:text-[#302e2a]"
               }`}
             >
               All
@@ -233,8 +247,8 @@ export function BatchViewer({
               onClick={() => setModeFilter("vm_remux")}
               className={`px-2.5 py-1 rounded-md cursor-pointer transition-colors ${
                 modeFilter === "vm_remux"
-                  ? "bg-[#1c202e] text-emerald-300"
-                  : "text-[#949bb0] hover:text-white"
+                  ? "bg-[#ebe7df] text-[#52734c]"
+                  : "text-[#716c63] hover:text-[#302e2a]"
               }`}
             >
               VM Remux
@@ -244,8 +258,8 @@ export function BatchViewer({
               onClick={() => setModeFilter("kaggle_gpu")}
               className={`px-2.5 py-1 rounded-md cursor-pointer transition-colors ${
                 modeFilter === "kaggle_gpu"
-                  ? "bg-[#1c202e] text-violet-300"
-                  : "text-[#949bb0] hover:text-white"
+                  ? "bg-[#ebe7df] text-[#9a563b]"
+                  : "text-[#716c63] hover:text-[#302e2a]"
               }`}
             >
               Kaggle GPU
@@ -258,7 +272,7 @@ export function BatchViewer({
               onClick={onForceFlush}
               className="btn-secondary px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer"
             >
-              <Layers className="w-3.5 h-3.5 text-indigo-400" />
+              <Layers className="w-3.5 h-3.5 text-[#9a563b]" />
               <span>Drain VM Slots & Seal GPU ({stagedCount})</span>
             </button>
           )}
@@ -266,7 +280,7 @@ export function BatchViewer({
             type="button"
             onClick={fetchBatches}
             aria-label="Refresh batches"
-            className="btn-secondary p-1.5 rounded-lg text-[#949bb0] hover:text-white cursor-pointer"
+            className="btn-secondary p-1.5 rounded-lg text-[#716c63] hover:text-[#302e2a] cursor-pointer"
             title="Refresh batches"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
@@ -278,13 +292,13 @@ export function BatchViewer({
       {selectedBatchIds.size > 0 && (
         <div className="px-5 py-2.5 bg-indigo-500/10 border-b border-indigo-500/30 flex flex-wrap items-center justify-between gap-3 text-xs">
           <div className="flex items-center gap-3 font-mono tabular-nums">
-            <span className="font-semibold text-indigo-300">
+            <span className="font-semibold text-[#9a563b]">
               {selectedBatchIds.size} batch(es) selected
             </span>
             <button
               type="button"
               onClick={() => setSelectedBatchIds(new Set())}
-              className="text-[#949bb0] hover:text-white underline cursor-pointer"
+              className="text-[#716c63] hover:text-[#302e2a] underline cursor-pointer"
             >
               Clear
             </button>
@@ -296,14 +310,14 @@ export function BatchViewer({
               disabled={bulkLoading}
               className="btn-secondary px-2.5 py-1 rounded-md text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
             >
-              <Play className="w-3 h-3 text-indigo-400" />
+              <Play className="w-3 h-3 text-[#9a563b]" />
               <span>Dispatch Selected</span>
             </button>
             <button
               type="button"
               onClick={() => handleBulkBatchAction("delete")}
               disabled={bulkLoading}
-              className="btn-secondary px-2.5 py-1 rounded-md text-xs font-medium text-rose-300 hover:text-rose-200 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              className="btn-secondary px-2.5 py-1 rounded-md text-xs font-medium text-[#ad4a3e] hover:text-rose-200 inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
             >
               <Trash2 className="w-3 h-3" />
               <span>Delete Selected</span>
@@ -314,28 +328,28 @@ export function BatchViewer({
 
       {visibleBatches.length === 0 ? (
         <div className="px-6 py-10 text-center">
-          <Boxes className="w-6 h-6 text-[#636b82] mx-auto mb-2" />
-          <p className="text-xs font-medium text-[#f3f4f8]">
+          <Boxes className="w-6 h-6 text-[#817a70] mx-auto mb-2" />
+          <p className="text-xs font-medium text-[#302e2a]">
             No Kaggle GPU batches match the current filter
           </p>
-          <p className="text-xs text-[#636b82] mt-1 max-w-md mx-auto">
+          <p className="text-xs text-[#817a70] mt-1 max-w-md mx-auto">
             Pipeline 1 (H.264) processes 2 episodes concurrently on the VM with zero batch wait — as soon as one finishes, the next enters immediately. Pipeline 2 (HEVC/AV1) seals into a Kaggle GPU batch (10 eps / 10 GB / 90s idle settle).
           </p>
         </div>
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
-            <thead className="bg-[#0c0e14] text-[#636b82] font-medium border-b border-[#1e2230]">
+            <thead className="bg-[#f5f3ed] text-[#817a70] font-medium border-b border-[#e6e3db]">
               <tr>
                 <th className="py-2.5 px-4 w-9">
                   <button
                     type="button"
                     onClick={toggleSelectAll}
                     aria-label="Select all visible batches"
-                    className="text-[#949bb0] hover:text-white flex items-center justify-center cursor-pointer"
+                    className="text-[#716c63] hover:text-[#302e2a] flex items-center justify-center cursor-pointer"
                   >
                     {allVisibleSelected ? (
-                      <CheckSquare className="w-4 h-4 text-indigo-400" />
+                      <CheckSquare className="w-4 h-4 text-[#9a563b]" />
                     ) : (
                       <Square className="w-4 h-4" />
                     )}
@@ -350,7 +364,7 @@ export function BatchViewer({
                 <th className="py-2.5 px-4 text-right">Actions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-[#1e2230]">
+            <tbody className="divide-y divide-[#e6e3db]">
               {visibleBatches.map((b) => {
                 const isVmRemux =
                   b.kaggleUsername === "local-vm" || b.triggerReason.startsWith("vm_remux");
@@ -365,7 +379,7 @@ export function BatchViewer({
                       className={`transition-colors cursor-pointer ${
                         isSelected
                           ? "bg-indigo-500/10 hover:bg-indigo-500/15"
-                          : "hover:bg-[#151822]/60"
+                          : "hover:bg-[#f0eee8]/60"
                       }`}
                     >
                       <td
@@ -375,22 +389,22 @@ export function BatchViewer({
                         <button
                           type="button"
                           aria-label={`Select Batch #${b.id}`}
-                          className="text-[#949bb0] hover:text-white flex items-center justify-center cursor-pointer"
+                          className="text-[#716c63] hover:text-[#302e2a] flex items-center justify-center cursor-pointer"
                         >
                           {isSelected ? (
-                            <CheckSquare className="w-4 h-4 text-indigo-400" />
+                            <CheckSquare className="w-4 h-4 text-[#9a563b]" />
                           ) : (
                             <Square className="w-4 h-4" />
                           )}
                         </button>
                       </td>
-                      <td className="py-3 px-3 font-mono tabular-nums font-semibold text-[#f3f4f8]">
+                      <td className="py-3 px-3 font-mono tabular-nums font-semibold text-[#302e2a]">
                         <div className="inline-flex items-center gap-1.5">
                           <span>#{b.id}</span>
                           {isExpanded ? (
-                            <ChevronUp className="w-3.5 h-3.5 text-[#636b82]" />
+                            <ChevronUp className="w-3.5 h-3.5 text-[#817a70]" />
                           ) : (
-                            <ChevronDown className="w-3.5 h-3.5 text-[#636b82]" />
+                            <ChevronDown className="w-3.5 h-3.5 text-[#817a70]" />
                           )}
                         </div>
                       </td>
@@ -398,31 +412,31 @@ export function BatchViewer({
                         {renderStatus(b.status)}
                         {b.lastError && b.status === "failed" && (
                           <div
-                            className="text-[11px] text-rose-400 font-mono truncate max-w-xs mt-0.5"
+                            className="text-[11px] text-[#ad4a3e] font-mono truncate max-w-xs mt-0.5"
                             title={b.lastError}
                           >
                             {b.lastError}
                           </div>
                         )}
                       </td>
-                      <td className="py-3 px-4 font-mono text-[#949bb0]">
+                      <td className="py-3 px-4 font-mono text-[#716c63]">
                         {isVmRemux ? (
-                          <span className="text-emerald-400">VM Direct Remux</span>
+                          <span className="text-[#52734c]">VM Direct Remux</span>
                         ) : (
                           <span>{b.triggerReason.replace(/_/g, " ")}</span>
                         )}
                       </td>
-                      <td className="py-3 px-4 font-mono text-[#d5d9e6]">
+                      <td className="py-3 px-4 font-mono text-[#5b554a]">
                         {isVmRemux
                           ? "Local VM (-c:v copy)"
                           : b.kaggleUsername
                             ? `@${b.kaggleUsername}`
                             : "auto-assign"}
                       </td>
-                      <td className="py-3 px-4 font-mono text-[#949bb0] max-w-xs truncate">
+                      <td className="py-3 px-4 font-mono text-[#716c63] max-w-xs truncate">
                         {b.kernelSlug || "awaiting dispatch"}
                       </td>
-                      <td className="py-3 px-4 text-right font-mono tabular-nums text-[#d5d9e6]">
+                      <td className="py-3 px-4 text-right font-mono tabular-nums text-[#5b554a]">
                         {b.jobCount} {b.jobCount === 1 ? "ep" : "eps"} ·{" "}
                         {(b.totalBytes / (1024 * 1024 * 1024)).toFixed(2)} GB
                       </td>
@@ -446,7 +460,7 @@ export function BatchViewer({
                               {executingId === b.id ? (
                                 <Loader2 className="w-3 h-3 animate-spin" />
                               ) : (
-                                <Play className="w-3 h-3 text-indigo-400" />
+                                <Play className="w-3 h-3 text-[#9a563b]" />
                               )}
                               <span>
                                 {b.status === "failed"
@@ -460,7 +474,7 @@ export function BatchViewer({
                           <button
                             type="button"
                             onClick={() => toggleExpandBatch(b.id)}
-                            className="btn-secondary px-2 py-1 rounded-md text-[11px] font-mono text-[#949bb0] hover:text-white cursor-pointer"
+                            className="btn-secondary px-2 py-1 rounded-md text-[11px] font-mono text-[#716c63] hover:text-[#302e2a] cursor-pointer"
                           >
                             {isExpanded ? "Hide" : "Episodes"}
                           </button>
@@ -470,9 +484,9 @@ export function BatchViewer({
 
                     {/* Expanded Batch Episode Manifest */}
                     {isExpanded && (
-                      <tr className="bg-[#0c0e14]">
-                        <td colSpan={8} className="px-6 py-3.5 border-t border-[#1e2230]">
-                          <div className="text-[11px] font-mono text-[#949bb0] mb-2 flex items-center justify-between">
+                      <tr className="bg-[#f5f3ed]">
+                        <td colSpan={8} className="px-6 py-3.5 border-t border-[#e6e3db]">
+                          <div className="text-[11px] font-mono text-[#716c63] mb-2 flex items-center justify-between">
                             <span>
                               Batch #{b.id} Episode Manifest ({b.jobCount} episodes)
                             </span>
@@ -481,12 +495,12 @@ export function BatchViewer({
                             </span>
                           </div>
                           {loadingBatchJobsId === b.id ? (
-                            <div className="py-3 text-xs text-[#636b82] flex items-center gap-2 font-mono">
-                              <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                            <div className="py-3 text-xs text-[#817a70] flex items-center gap-2 font-mono">
+                              <Loader2 className="w-3.5 h-3.5 animate-spin text-[#9a563b]" />
                               <span>Loading batch episodes...</span>
                             </div>
                           ) : manifestJobs.length === 0 ? (
-                            <div className="py-2 text-xs text-[#636b82] font-mono">
+                            <div className="py-2 text-xs text-[#817a70] font-mono">
                               No linked episode records found for this batch.
                             </div>
                           ) : (
@@ -494,20 +508,20 @@ export function BatchViewer({
                               {manifestJobs.map((j: any) => (
                                 <div
                                   key={j.id}
-                                  className="p-2.5 rounded-lg bg-[#12141c] border border-[#1e2230] flex items-center justify-between text-xs font-mono tabular-nums"
+                                  className="p-2.5 rounded-lg bg-[#12141c] border border-[#e6e3db] flex items-center justify-between text-xs font-mono tabular-nums"
                                 >
                                   <div className="min-w-0 pr-2">
-                                    <div className="text-[#f3f4f8] font-medium truncate">
+                                    <div className="text-[#302e2a] font-medium truncate">
                                       Job #{j.id} · Ep {j.episodeNumber} (
                                       {j.types?.join("/").toUpperCase()})
                                     </div>
-                                    <div className="text-[10px] text-[#636b82] truncate">
+                                    <div className="text-[10px] text-[#817a70] truncate">
                                       {j.metadata?.primaryTitle ||
                                         j.torrentTitle ||
                                         `AniList #${j.anilistId || "—"}`}
                                     </div>
                                   </div>
-                                  <span className="text-[11px] text-indigo-300 shrink-0">
+                                  <span className="text-[11px] text-[#9a563b] shrink-0">
                                     {j.status}
                                   </span>
                                 </div>

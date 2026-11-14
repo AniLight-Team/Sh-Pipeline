@@ -8,8 +8,8 @@
     "dev": "concurrently -n \"API,UI\" -c \"cyan,magenta\" \"tsx watch src/backend/index.ts\" \"vite\"",
     "dev:backend": "tsx watch src/backend/index.ts",
     "dev:frontend": "vite",
-    "build": "vite build && tsc -p tsconfig.server.json",
-    "build:ui": "vite build",
+    "build": "node scripts/build.mjs",
+    "build:ui": "node scripts/build.mjs --ui-only",
     "build:server": "tsc -p tsconfig.server.json",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
@@ -21,7 +21,8 @@
     "db:push": "drizzle-kit push",
     "db:generate": "drizzle-kit generate",
     "db:studio": "drizzle-kit studio",
-    "db:migrate": "drizzle-kit migrate"
+    "db:migrate": "drizzle-kit migrate",
+    "test": "node scripts/test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1053.0",

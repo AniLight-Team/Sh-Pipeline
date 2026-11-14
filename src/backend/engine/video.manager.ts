@@ -18,13 +18,14 @@ import type {
 import { inspectMkvStreamsSync } from "./subtitles.manager.js";
 import { loadAccountsFromEnv, KIRA_VM_FFMPEG_THREADS } from "../config.js";
 import { log } from "../utils/logger.js";
+import { uploadHfFiles, HF_UPLOAD_FUNCTION } from "./hf-upload.js";
 
 const execFileAsync = promisify(execFile);
 
 export class VideoEncodingManager {
   private kaggleAccounts: KaggleAccount[];
   private hfAccounts: HuggingFaceAccount[];
-  private currentHfIdx = 0;
+  private static currentHfIdx = 0;
 
   constructor(
     options: {
@@ -218,9 +219,16 @@ export class VideoEncodingManager {
         "No Hugging Face accounts configured in HF_ACCOUNTS or HF_OWNER/BUCKET/TOKEN",
       );
     }
-    const acc = this.hfAccounts[this.currentHfIdx % this.hfAccounts.length];
-    this.currentHfIdx = (this.currentHfIdx + 1) % this.hfAccounts.length;
+    const acc = this.hfAccounts[VideoEncodingManager.currentHfIdx % this.hfAccounts.length];
+    VideoEncodingManager.currentHfIdx = (VideoEncodingManager.currentHfIdx + 1) % this.hfAccounts.length;
     return acc;
+  }
+
+  public getHfAccountForTarget(target?: { owner: string; bucket: string }): HuggingFaceAccount {
+    if (!target) return this.getNextHfAccount();
+    const account = this.hfAccounts.find(a => a.owner === target.owner && a.bucket === target.bucket);
+    if (!account) throw new Error(`Saved Hugging Face target ${target.owner}/${target.bucket} is no longer configured. Restore it before retrying.`);
+    return account;
   }
 
   public determineTracksToEncode(
@@ -265,64 +273,7 @@ export class VideoEncodingManager {
     hf: HuggingFaceAccount,
     addItems: [string, string][],
   ): Promise<void> {
-    if (addItems.length === 0) return;
-
-    const payloadJson = JSON.stringify({
-      bucketId: `${hf.owner}/${hf.bucket}`,
-      token: hf.token,
-      addItems,
-    });
-    const payloadB64 = Buffer.from(payloadJson, "utf8").toString("base64");
-
-    const pyScript = `
-import sys, json, base64, subprocess, os
-
-data = json.loads(base64.b64decode("${payloadB64}").decode("utf-8"))
-try:
-    from huggingface_hub import batch_bucket_files
-except ImportError:
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub"], check=False)
-    from huggingface_hub import batch_bucket_files
-
-pairs = [(item[0], item[1]) for item in data["addItems"]]
-batch_bucket_files(
-    bucket_id=data["bucketId"],
-    add=pairs,
-    token=data["token"],
-)
-print("HF_UPLOAD_OK")
-`;
-
-    const venvDir = path.join(os.tmpdir(), "kira-hf-venv");
-    const venvPy = path.join(venvDir, "bin", "python");
-
-    for (let attempt = 1; attempt <= 4; attempt++) {
-      try {
-        const pyBin = fs.existsSync(venvPy) ? venvPy : "python3";
-        const { stdout } = await execFileAsync(pyBin, ["-c", pyScript], {
-          timeout: 1800_000,
-          maxBuffer: 10 * 1024 * 1024,
-        });
-        if (stdout.includes("HF_UPLOAD_OK")) {
-          return;
-        }
-      } catch (err: any) {
-        const errMsg = String(err?.stderr || err?.message || err);
-        // If PEP 668 externally-managed-environment prevented system pip install, bootstrap cached venv once
-        if (!fs.existsSync(venvPy) && (errMsg.includes("huggingface_hub") || errMsg.includes("externally-managed"))) {
-          try {
-            await execFileAsync("python3", ["-m", "venv", venvDir], { timeout: 120_000 });
-            await execFileAsync(venvPy, ["-m", "pip", "install", "-q", "-U", "huggingface_hub"], { timeout: 300_000 });
-            continue;
-          } catch {}
-        }
-        if (attempt === 4) {
-          throw new Error(`VM Hugging Face Bucket upload failed after 4 attempts: ${errMsg.slice(0, 300)}`);
-        }
-        log.warn("VM:Remux", `HF bucket upload attempt ${attempt}/4 warning: ${errMsg.slice(0, 180)}`);
-        await new Promise((r) => setTimeout(r, 3500 * attempt));
-      }
-    }
+    await uploadHfFiles(hf, addItems);
   }
 
   /**
@@ -352,7 +303,14 @@ print("HF_UPLOAD_OK")
       onProgress,
     } = params;
 
-    const workDir = path.join(workBaseDir, `vm_remux_${jobId}_${crypto.randomUUID().slice(0, 6)}`);
+    const sourceIdentity = Object.entries(stagedQualities).sort().map(([q, file]) => {
+      const stat = fs.statSync(file!);
+      return [q, path.resolve(file!), stat.size, stat.mtimeMs];
+    });
+    const identity = crypto.createHash("sha256").update(JSON.stringify({
+      sourceIdentity, tracks, animeId, episodeNumber, bucket: `${hf.owner}/${hf.bucket}`, version: 1,
+    })).digest("hex").slice(0, 20);
+    const workDir = path.join(workBaseDir, `vm_remux_${jobId}_${identity}`);
     await fs.promises.mkdir(workDir, { recursive: true });
 
     const validQualities = (["1080p", "720p", "480p"] as VideoResolutionQuality[]).filter(
@@ -369,17 +327,26 @@ print("HF_UPLOAD_OK")
         ? tracks.filter((t) => t[0] === "sub" || t[0] === "dub")
         : [["sub", 0]];
 
+    if (!normalizedTracks.length) throw new Error(`Job #${jobId} has no valid audio tracks`);
     const records: KiraBatchHfRecord[] = [];
     const addItems: [string, string][] = [];
     const startTime = Date.now();
+    const checkpointPath = path.join(workDir, "checkpoint.json");
+    let cachedRecords: KiraBatchHfRecord[] = [];
+    try { const data = JSON.parse(await fs.promises.readFile(checkpointPath, "utf8")); if (Array.isArray(data)) cachedRecords = data; }
+    catch {} // An incomplete checkpoint is safe to rebuild.
+    const saveCheckpoint = async () => {
+      await fs.promises.writeFile(checkpointPath + ".tmp", JSON.stringify(records));
+      await fs.promises.rename(checkpointPath + ".tmp", checkpointPath);
+    };
 
     try {
       // Pre-allocate remote folder UUIDs per track ("sub" / "dub")
       const trackRemoteFolders = new Map<string, { f1: string; f2: string }>();
       for (const [tName] of normalizedTracks) {
         trackRemoteFolders.set(tName, {
-          f1: crypto.randomUUID().replace(/-/g, ""),
-          f2: crypto.randomUUID().replace(/-/g, ""),
+          f1: crypto.createHash("sha256").update(`${identity}:${tName}`).digest("hex").slice(0, 32),
+          f2: crypto.createHash("sha256").update(`${jobId}:${identity}:${tName}`).digest("hex").slice(0, 32),
         });
       }
 
@@ -408,6 +375,14 @@ print("HF_UPLOAD_OK")
             audioInfo.channels <= 2;
 
           const outMp4Path = path.join(workDir, `${trackName}_${qName}.mp4`);
+
+          const cached = cachedRecords.find(r => r.type === trackName && r.quality === qName);
+          if (cached && fs.existsSync(outMp4Path) && fs.statSync(outMp4Path).size === cached.metadata?.size &&
+              await this.computeFileSha256(outMp4Path) === cached.sha256) {
+            records.push(cached);
+            addItems.push([outMp4Path, cached.huggingface.path]);
+            continue;
+          }
 
           const runFfmpegRemux = async (copyAudio: boolean, mapAudioSpec: string) => {
             const audioArgs = copyAudio
@@ -467,8 +442,8 @@ print("HF_UPLOAD_OK")
           } catch {
             try {
               await runFfmpegRemux(false, `0:a:${targetAudioIdx}`);
-            } catch {
-              await runFfmpegRemux(false, "0:a:0");
+            } catch (error) {
+              throw new Error(`Audio track ${targetAudioIdx} (${trackName}) could not be converted: ${String(error)}`);
             }
           }
 
@@ -505,6 +480,7 @@ print("HF_UPLOAD_OK")
           });
 
           addItems.push([outMp4Path, remotePath]);
+          await saveCheckpoint();
           if (onProgress) {
             await onProgress().catch(() => {});
           }
@@ -524,8 +500,10 @@ print("HF_UPLOAD_OK")
       );
 
       return records;
-    } finally {
-      await fs.promises.rm(workDir, { recursive: true, force: true }).catch(() => {});
+    } catch (err) {
+      // Keep converted files and destinations until DB completion or explicit deletion.
+      log.warn("VM:Remux", `Job #${jobId}: retaining checkpoint for retry in ${workDir}`);
+      throw err;
     }
   }
 
@@ -1087,13 +1065,13 @@ except ImportError:
     from PIL import Image, ImageDraw, ImageFont
 
 try:
-    from huggingface_hub import batch_bucket_files
+    from huggingface_hub import batch_bucket_files, get_bucket_paths_info
 except ImportError:
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub"], check=True)
     for mod_key in [k for k in list(sys.modules.keys()) if k == "huggingface_hub" or k.startswith("huggingface_hub.")]:
         del sys.modules[mod_key]
     importlib.invalidate_caches()
-    from huggingface_hub import batch_bucket_files
+    from huggingface_hub import batch_bucket_files, get_bucket_paths_info
 
 # 3. Discover mounted dataset files in /kaggle/input (with retry for slow NFS mounts)
 start_search = time.time()
@@ -1272,6 +1250,8 @@ def supports_t4_nvdec(v_codec, pix_fmt):
         return False
     return v_codec in ("h264", "hevc", "vp9", "vp8", "mpeg2video", "vc1")
 
+${HF_UPLOAD_FUNCTION}
+
 # 5. Asynchronous Background Hugging Face Uploader
 upload_lock = threading.Lock()
 completed_records = []
@@ -1285,8 +1265,9 @@ def save_checkpoint():
         "completedJobIds": completed_job_ids,
         "failedJobs": failed_jobs,
     }
-    with open("/kaggle/working/result.json", "w") as rf:
+    with open("/kaggle/working/result.json.tmp", "w") as rf:
         json.dump(payload, rf)
+    os.replace("/kaggle/working/result.json.tmp", "/kaggle/working/result.json")
 
 def push_entries_to_hf(batch_to_push):
     if not batch_to_push:
@@ -1307,11 +1288,7 @@ def push_entries_to_hf(batch_to_push):
         uploaded_ok = False
         for attempt in range(1, 5):
             try:
-                batch_bucket_files(
-                    bucket_id=f"{hf_owner}/{hf_bucket}",
-                    add=combined_add,
-                    token=hf_token,
-                )
+                upload_verified(f"{hf_owner}/{hf_bucket}", combined_add, hf_token)
                 uploaded_ok = True
                 break
             except Exception as exc:

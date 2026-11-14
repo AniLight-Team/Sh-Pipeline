@@ -1,3 +1,4 @@
+import { useDialog } from "../hooks/useDialog.js";
 import React, { useState, useEffect, useMemo } from "react";
 import {
   X,
@@ -114,6 +115,7 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
     return Math.min(Math.max(total, 10), 36);
   }, [preview?.totalEpisodes]);
 
+  useDialog(isOpen, onClose);
   if (!isOpen) return null;
 
   const toggleEpisodeNumber = (ep: number) => {
@@ -246,29 +248,29 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
       role="dialog"
       aria-modal="true"
       aria-labelledby="enqueue-modal-title"
-      className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 bg-[#302e2a]/35 backdrop-blur-sm flex items-center justify-center p-4"
     >
       <div className="surface-panel rounded-xl max-w-lg w-full p-6 shadow-2xl relative max-h-[92vh] overflow-y-auto">
         <button
           type="button"
           onClick={onClose}
           aria-label="Close modal"
-          className="btn-secondary absolute right-4 top-4 w-8 h-8 rounded-lg flex items-center justify-center text-[#949bb0] hover:text-white cursor-pointer"
+          className="btn-secondary absolute right-4 top-4 w-8 h-8 rounded-lg flex items-center justify-center text-[#716c63] hover:text-[#302e2a] cursor-pointer"
         >
           <X className="w-4 h-4" />
         </button>
 
         <div className="mb-5 pr-8">
-          <h3 id="enqueue-modal-title" className="text-base font-bold text-[#f3f4f8]">
+          <h3 id="enqueue-modal-title" className="text-base font-bold text-[#302e2a]">
             Enqueue Anime Episodes
           </h3>
-          <p className="text-xs text-[#636b82] mt-1">
+          <p className="text-xs text-[#817a70] mt-1">
             Resolves Tsukihime & AnimeTosho releases, downloads same-group H.264 qualities, extracts 1080p subtitles to R2, and routes to VM Remux or Kaggle GPU.
           </p>
         </div>
 
         {error && (
-          <div className="mb-4 p-3 rounded-lg bg-rose-500/10 border border-rose-500/25 text-rose-300 text-xs flex items-center gap-2">
+          <div className="mb-4 p-3 rounded-lg bg-rose-500/10 border border-rose-500/25 text-[#ad4a3e] text-xs flex items-center gap-2">
             <AlertCircle className="w-4 h-4 shrink-0" />
             <span>{error}</span>
           </div>
@@ -278,14 +280,14 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
           {/* AniList ID Input */}
           <div>
             <div className="flex items-center justify-between mb-1.5">
-              <label htmlFor="anilist-id-input" className="text-[#f3f4f8] font-medium">
+              <label htmlFor="anilist-id-input" className="text-[#302e2a] font-medium">
                 AniList ID or URL
               </label>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => handleAnilistChange("185874")}
-                  className="text-[11px] font-mono text-indigo-400 hover:underline cursor-pointer"
+                  className="text-[11px] font-mono text-[#9a563b] hover:underline cursor-pointer"
                 >
                   Try #185874 (Bleach Cour 4)
                 </button>
@@ -294,7 +296,7 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                     href={`https://anilist.co/anime/${preview.anilistId}`}
                     target="_blank"
                     rel="noreferrer"
-                    className="text-[11px] font-mono text-[#949bb0] hover:text-white inline-flex items-center gap-1"
+                    className="text-[11px] font-mono text-[#716c63] hover:text-[#302e2a] inline-flex items-center gap-1"
                   >
                     <span>AniList</span>
                     <ExternalLink className="w-2.5 h-2.5" />
@@ -309,12 +311,12 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 placeholder="e.g. 185874 or https://anilist.co/anime/185874"
                 value={anilistInput}
                 onChange={(e) => handleAnilistChange(e.target.value)}
-                className="w-full px-3.5 py-2 rounded-lg bg-[#0c0e14] border border-[#1e2230] text-[#f3f4f8] placeholder-[#636b82] focus:outline-none focus:border-indigo-500 font-mono text-xs transition-colors"
+                className="w-full px-3.5 py-2 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] text-[#302e2a] placeholder-[#817a70] focus:outline-none focus:border-indigo-500 font-mono text-xs transition-colors"
                 required
               />
               {resolving && (
-                <div className="absolute right-3 top-2.5 text-[#949bb0] flex items-center gap-1.5 text-[11px] font-mono">
-                  <Loader2 className="w-3.5 h-3.5 text-indigo-400 animate-spin" />
+                <div className="absolute right-3 top-2.5 text-[#716c63] flex items-center gap-1.5 text-[11px] font-mono">
+                  <Loader2 className="w-3.5 h-3.5 text-[#9a563b] animate-spin" />
                   <span>Resolving...</span>
                 </div>
               )}
@@ -323,34 +325,34 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
 
           {/* Resolved Metadata Preview */}
           {preview && (
-            <div className="p-3.5 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex items-center gap-3.5">
+            <div className="p-3.5 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] flex items-center gap-3.5">
               {preview.coverImage && !imgError ? (
                 <img
                   src={preview.coverImage}
                   alt={preview.primaryTitle}
                   referrerPolicy="no-referrer"
                   onError={() => setImgError(true)}
-                  className="w-11 h-16 object-cover rounded-md shrink-0 border border-[#1e2230]"
+                  className="w-11 h-16 object-cover rounded-md shrink-0 border border-[#e6e3db]"
                 />
               ) : (
-                <div className="w-11 h-16 rounded-md bg-[#151822] border border-[#1e2230] flex items-center justify-center shrink-0">
-                  <Film className="w-4 h-4 text-[#636b82]" />
+                <div className="w-11 h-16 rounded-md bg-[#f0eee8] border border-[#e6e3db] flex items-center justify-center shrink-0">
+                  <Film className="w-4 h-4 text-[#817a70]" />
                 </div>
               )}
               <div className="flex-1 min-w-0">
-                <h4 className="text-xs font-semibold text-[#f3f4f8] truncate">
+                <h4 className="text-xs font-semibold text-[#302e2a] truncate">
                   {preview.primaryTitle}
                 </h4>
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mt-1 text-[11px] font-mono tabular-nums text-[#949bb0]">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mt-1 text-[11px] font-mono tabular-nums text-[#716c63]">
                   {preview.tsukihimeId && (
-                    <span className="text-indigo-400">
+                    <span className="text-[#9a563b]">
                       Tsukihime #{preview.tsukihimeId}
                     </span>
                   )}
                   {preview.anidbId && <span>· AniDB #{preview.anidbId}</span>}
                   {preview.malId && <span>· MAL #{preview.malId}</span>}
                   {preview.totalEpisodes && (
-                    <span className="text-[#f3f4f8]">
+                    <span className="text-[#302e2a]">
                       · {preview.totalEpisodes} eps
                     </span>
                   )}
@@ -363,10 +365,10 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <div className="flex items-center gap-2">
-                <label htmlFor="episodes-input" className="text-[#f3f4f8] font-medium">
+                <label htmlFor="episodes-input" className="text-[#302e2a] font-medium">
                   Episode Numbers
                 </label>
-                <span className="text-[11px] font-mono tabular-nums text-indigo-300">
+                <span className="text-[11px] font-mono tabular-nums text-[#9a563b]">
                   ({selectedEpisodeSet.size} selected)
                 </span>
               </div>
@@ -374,14 +376,14 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 <button
                   type="button"
                   onClick={() => setEpisodes("1")}
-                  className="px-2 py-0.5 rounded bg-[#151822] text-[#949bb0] hover:text-white border border-[#232838] cursor-pointer"
+                  className="px-2 py-0.5 rounded bg-[#f0eee8] text-[#716c63] hover:text-[#302e2a] border border-[#ded8cd] cursor-pointer"
                 >
                   Ep 1
                 </button>
                 <button
                   type="button"
                   onClick={() => setEpisodes("1-10")}
-                  className="px-2 py-0.5 rounded bg-[#151822] text-[#949bb0] hover:text-white border border-[#232838] cursor-pointer"
+                  className="px-2 py-0.5 rounded bg-[#f0eee8] text-[#716c63] hover:text-[#302e2a] border border-[#ded8cd] cursor-pointer"
                 >
                   1-10
                 </button>
@@ -392,14 +394,14 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                       `1-${preview?.totalEpisodes || gridCount}`,
                     )
                   }
-                  className="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 hover:bg-indigo-500/25 cursor-pointer"
+                  className="px-2 py-0.5 rounded bg-indigo-500/15 text-[#9a563b] border border-indigo-500/30 hover:bg-indigo-500/25 cursor-pointer"
                 >
                   All ({preview?.totalEpisodes || gridCount})
                 </button>
                 <button
                   type="button"
                   onClick={() => setShowEpisodeGrid(!showEpisodeGrid)}
-                  className="px-2 py-0.5 rounded bg-[#151822] text-[#949bb0] hover:text-white border border-[#232838] inline-flex items-center gap-1 cursor-pointer"
+                  className="px-2 py-0.5 rounded bg-[#f0eee8] text-[#716c63] hover:text-[#302e2a] border border-[#ded8cd] inline-flex items-center gap-1 cursor-pointer"
                   title="Toggle interactive multi-select episode picker"
                 >
                   <Grid className="w-3 h-3" />
@@ -413,14 +415,14 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
               placeholder="e.g. 1 or 1-10 or 1, 2, 5"
               value={episodes}
               onChange={(e) => setEpisodes(e.target.value)}
-              className="w-full px-3.5 py-2 rounded-lg bg-[#0c0e14] border border-[#1e2230] text-[#f3f4f8] placeholder-[#636b82] focus:outline-none focus:border-indigo-500 font-mono text-xs transition-colors"
+              className="w-full px-3.5 py-2 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] text-[#302e2a] placeholder-[#817a70] focus:outline-none focus:border-indigo-500 font-mono text-xs transition-colors"
               required
             />
 
             {/* Interactive Visual Multi-Select Episode Grid */}
             {showEpisodeGrid && (
-              <div className="mt-2.5 p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230]">
-                <div className="flex items-center justify-between text-[11px] font-mono text-[#636b82] mb-2">
+              <div className="mt-2.5 p-3 rounded-lg bg-[#f5f3ed] border border-[#e6e3db]">
+                <div className="flex items-center justify-between text-[11px] font-mono text-[#817a70] mb-2">
                   <span>Click episodes to toggle multi-selection:</span>
                   <div className="flex items-center gap-2">
                     <button
@@ -432,14 +434,14 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                         }
                         setEpisodes(formatEpisodeArray(inverted));
                       }}
-                      className="text-[#949bb0] hover:text-white underline cursor-pointer"
+                      className="text-[#716c63] hover:text-[#302e2a] underline cursor-pointer"
                     >
                       Invert
                     </button>
                     <button
                       type="button"
                       onClick={() => setEpisodes("")}
-                      className="text-[#949bb0] hover:text-white underline cursor-pointer"
+                      className="text-[#716c63] hover:text-[#302e2a] underline cursor-pointer"
                     >
                       Clear
                     </button>
@@ -456,8 +458,8 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                           onClick={() => toggleEpisodeNumber(epNum)}
                           className={`py-1.5 rounded text-[11px] font-mono tabular-nums font-medium border transition-colors cursor-pointer ${
                             active
-                              ? "bg-indigo-500/25 border-indigo-500/60 text-white"
-                              : "bg-[#12141c] border-[#1e2230] text-[#949bb0] hover:text-white hover:border-[#2e344a]"
+                              ? "bg-indigo-500/25 border-indigo-500/60 text-[#302e2a]"
+                              : "bg-[#12141c] border-[#e6e3db] text-[#716c63] hover:text-[#302e2a] hover:border-[#2e344a]"
                           }`}
                         >
                           {epNum}
@@ -472,26 +474,26 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
 
           {/* Audio Track Selection */}
           <div>
-            <span className="block text-[#f3f4f8] font-medium mb-1.5">
+            <span className="block text-[#302e2a] font-medium mb-1.5">
               Target Audio Tracks
             </span>
             <div className="grid grid-cols-2 gap-2.5">
               <label
                 className={`flex items-center gap-2.5 p-3 rounded-lg border cursor-pointer transition-colors ${
                   isSub
-                    ? "bg-indigo-500/10 border-indigo-500/30 text-[#f3f4f8]"
-                    : "bg-[#0c0e14] border-[#1e2230] text-[#949bb0]"
+                    ? "bg-indigo-500/10 border-indigo-500/30 text-[#302e2a]"
+                    : "bg-[#f5f3ed] border-[#e6e3db] text-[#716c63]"
                 }`}
               >
                 <input
                   type="checkbox"
                   checked={isSub}
                   onChange={(e) => setIsSub(e.target.checked)}
-                  className="rounded border-[#2a3042]"
+                  className="rounded border-[#d5d0c6]"
                 />
                 <div>
                   <div className="font-semibold text-xs">Sub (Japanese)</div>
-                  <div className="text-[11px] text-[#636b82]">
+                  <div className="text-[11px] text-[#817a70]">
                     1080p VTT subtitles to R2
                   </div>
                 </div>
@@ -500,19 +502,19 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
               <label
                 className={`flex items-center gap-2.5 p-3 rounded-lg border cursor-pointer transition-colors ${
                   isDub
-                    ? "bg-indigo-500/10 border-indigo-500/30 text-[#f3f4f8]"
-                    : "bg-[#0c0e14] border-[#1e2230] text-[#949bb0]"
+                    ? "bg-indigo-500/10 border-indigo-500/30 text-[#302e2a]"
+                    : "bg-[#f5f3ed] border-[#e6e3db] text-[#716c63]"
                 }`}
               >
                 <input
                   type="checkbox"
                   checked={isDub}
                   onChange={(e) => setIsDub(e.target.checked)}
-                  className="rounded border-[#2a3042]"
+                  className="rounded border-[#d5d0c6]"
                 />
                 <div>
                   <div className="font-semibold text-xs">Dub (English)</div>
-                  <div className="text-[11px] text-[#636b82]">
+                  <div className="text-[11px] text-[#817a70]">
                     Dual-audio + signs track
                   </div>
                 </div>
@@ -522,7 +524,7 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
 
           {/* Pipeline Execution Policy Override */}
           <div>
-            <span className="block text-[#f3f4f8] font-medium mb-1.5">
+            <span className="block text-[#302e2a] font-medium mb-1.5">
               Pipeline Execution Trigger Policy
             </span>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
@@ -531,12 +533,12 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 onClick={() => setExecutionPolicy("default")}
                 className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer ${
                   executionPolicy === "default"
-                    ? "bg-indigo-500/15 border-indigo-500/40 text-[#f3f4f8]"
-                    : "bg-[#0c0e14] border-[#1e2230] text-[#949bb0] hover:text-white"
+                    ? "bg-indigo-500/15 border-indigo-500/40 text-[#302e2a]"
+                    : "bg-[#f5f3ed] border-[#e6e3db] text-[#716c63] hover:text-[#302e2a]"
                 }`}
               >
                 <div className="font-semibold text-xs">Follow Global Policy</div>
-                <div className="text-[11px] text-[#636b82]">
+                <div className="text-[11px] text-[#817a70]">
                   Uses active dashboard trigger mode
                 </div>
               </button>
@@ -546,12 +548,12 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 onClick={() => setExecutionPolicy("all")}
                 className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer ${
                   executionPolicy === "all"
-                    ? "bg-indigo-500/15 border-indigo-500/40 text-[#f3f4f8]"
-                    : "bg-[#0c0e14] border-[#1e2230] text-[#949bb0] hover:text-white"
+                    ? "bg-indigo-500/15 border-indigo-500/40 text-[#302e2a]"
+                    : "bg-[#f5f3ed] border-[#e6e3db] text-[#716c63] hover:text-[#302e2a]"
                 }`}
               >
                 <div className="font-semibold text-xs">Both Pipelines (Auto)</div>
-                <div className="text-[11px] text-[#636b82]">
+                <div className="text-[11px] text-[#817a70]">
                   H.264 -&gt; VM Remux · HEVC -&gt; GPU
                 </div>
               </button>
@@ -562,13 +564,13 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer ${
                   executionPolicy === "vm_remux_only"
                     ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-200"
-                    : "bg-[#0c0e14] border-[#1e2230] text-[#949bb0] hover:text-white"
+                    : "bg-[#f5f3ed] border-[#e6e3db] text-[#716c63] hover:text-[#302e2a]"
                 }`}
               >
                 <div className="font-semibold text-xs">
                   Pipeline 1 Only (VM H.264)
                 </div>
-                <div className="text-[11px] text-[#636b82]">
+                <div className="text-[11px] text-[#817a70]">
                   Marks non-H.264 anime as Skipped
                 </div>
               </button>
@@ -579,13 +581,13 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer ${
                   executionPolicy === "kaggle_gpu_only"
                     ? "bg-violet-500/15 border-violet-500/40 text-violet-200"
-                    : "bg-[#0c0e14] border-[#1e2230] text-[#949bb0] hover:text-white"
+                    : "bg-[#f5f3ed] border-[#e6e3db] text-[#716c63] hover:text-[#302e2a]"
                 }`}
               >
                 <div className="font-semibold text-xs">
                   Pipeline 2 Only (Kaggle GPU)
                 </div>
-                <div className="text-[11px] text-[#636b82]">
+                <div className="text-[11px] text-[#817a70]">
                   Marks H.264 anime as Skipped
                 </div>
               </button>
@@ -597,7 +599,7 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
             <button
               type="button"
               onClick={() => setShowAdvanced(!showAdvanced)}
-              className="flex items-center gap-1.5 text-[#949bb0] hover:text-white text-xs font-medium cursor-pointer"
+              className="flex items-center gap-1.5 text-[#716c63] hover:text-[#302e2a] text-xs font-medium cursor-pointer"
             >
               {showAdvanced ? (
                 <ChevronUp className="w-3.5 h-3.5" />
@@ -613,10 +615,10 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
           </div>
 
           {showAdvanced && (
-            <div className="space-y-3 pt-3 border-t border-[#1e2230]">
+            <div className="space-y-3 pt-3 border-t border-[#e6e3db]">
               <div className="grid grid-cols-2 gap-2.5">
                 <div>
-                  <label className="block text-[#949bb0] text-[11px] mb-1">
+                  <label className="block text-[#716c63] text-[11px] mb-1">
                     AniDB ID Override
                   </label>
                   <input
@@ -624,11 +626,11 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                     placeholder="e.g. 19079"
                     value={overrideAnidbId}
                     onChange={(e) => setOverrideAnidbId(e.target.value)}
-                    className="w-full px-3 py-1.5 rounded-lg bg-[#0c0e14] border border-[#1e2230] text-[#f3f4f8] font-mono text-xs focus:outline-none focus:border-indigo-500"
+                    className="w-full px-3 py-1.5 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] text-[#302e2a] font-mono text-xs focus:outline-none focus:border-indigo-500"
                   />
                 </div>
                 <div>
-                  <label className="block text-[#949bb0] text-[11px] mb-1">
+                  <label className="block text-[#716c63] text-[11px] mb-1">
                     Main DB Anime ID
                   </label>
                   <input
@@ -636,13 +638,13 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                     placeholder="e.g. 502"
                     value={overrideAnimeId}
                     onChange={(e) => setOverrideAnimeId(e.target.value)}
-                    className="w-full px-3 py-1.5 rounded-lg bg-[#0c0e14] border border-[#1e2230] text-[#f3f4f8] font-mono text-xs focus:outline-none focus:border-indigo-500"
+                    className="w-full px-3 py-1.5 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] text-[#302e2a] font-mono text-xs focus:outline-none focus:border-indigo-500"
                   />
                 </div>
               </div>
 
               <div>
-                <label className="block text-[#949bb0] text-[11px] mb-1">
+                <label className="block text-[#716c63] text-[11px] mb-1">
                   Known Search Titles (Comma-separated)
                 </label>
                 <input
@@ -650,12 +652,12 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                   placeholder="e.g. BLEACH: Thousand-Year Blood War - The Calamity"
                   value={knownTitles}
                   onChange={(e) => setKnownTitles(e.target.value)}
-                  className="w-full px-3 py-1.5 rounded-lg bg-[#0c0e14] border border-[#1e2230] text-[#f3f4f8] text-xs focus:outline-none focus:border-indigo-500"
+                  className="w-full px-3 py-1.5 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] text-[#302e2a] text-xs focus:outline-none focus:border-indigo-500"
                 />
               </div>
 
               <div>
-                <label className="block text-[#949bb0] text-[11px] mb-1">
+                <label className="block text-[#716c63] text-[11px] mb-1">
                   Webhook Callback URL
                 </label>
                 <input
@@ -663,14 +665,14 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                   placeholder="http://127.0.0.1:4000/api/internal/pipeline/completed"
                   value={callbackUrl}
                   onChange={(e) => setCallbackUrl(e.target.value)}
-                  className="w-full px-3 py-1.5 rounded-lg bg-[#0c0e14] border border-[#1e2230] text-[#f3f4f8] font-mono text-xs focus:outline-none focus:border-indigo-500"
+                  className="w-full px-3 py-1.5 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] text-[#302e2a] font-mono text-xs focus:outline-none focus:border-indigo-500"
                 />
               </div>
             </div>
           )}
 
           {/* Submit Footer */}
-          <div className="pt-4 border-t border-[#1e2230] flex items-center justify-end gap-2">
+          <div className="pt-4 border-t border-[#e6e3db] flex items-center justify-end gap-2">
             <button
               type="button"
               onClick={onClose}

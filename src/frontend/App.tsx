@@ -1,409 +1,130 @@
-import React, { useState, useEffect } from "react";
-import { Sidebar } from "./components/Sidebar.js";
-import { Navbar } from "./components/Navbar.js";
-import { DashboardCharts } from "./components/DashboardCharts.js";
+import React, { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { Activity, ArrowRight, Box, Check, ChevronRight, Cloud, Cpu, HardDrive, LayoutDashboard, ListVideo, Loader2, Plus, RefreshCw, Settings2, Sparkles, Terminal, X } from "lucide-react";
 import { JobTable } from "./components/JobTable.js";
-import { BatchViewer } from "./components/BatchViewer.js";
-import { LiveTerminal } from "./components/LiveTerminal.js";
-import { EnqueueModal } from "./components/EnqueueModal.js";
-import { KaggleAccountsModal } from "./components/KaggleAccountsModal.js";
-import { HuggingFaceModal } from "./components/HuggingFaceModal.js";
-import { StagingExplorerModal } from "./components/StagingExplorerModal.js";
-import { MobileBottomDock } from "./components/MobileBottomDock.js";
+const BatchViewer = lazy(() => import("./components/BatchViewer.js").then(m => ({ default: m.BatchViewer })));
+const LiveTerminal = lazy(() => import("./components/LiveTerminal.js").then(m => ({ default: m.LiveTerminal })));
+const EnqueueModal = lazy(() => import("./components/EnqueueModal.js").then(m => ({ default: m.EnqueueModal })));
+const KaggleAccountsModal = lazy(() => import("./components/KaggleAccountsModal.js").then(m => ({ default: m.KaggleAccountsModal })));
+const HuggingFaceModal = lazy(() => import("./components/HuggingFaceModal.js").then(m => ({ default: m.HuggingFaceModal })));
+const StagingExplorerModal = lazy(() => import("./components/StagingExplorerModal.js").then(m => ({ default: m.StagingExplorerModal })));
 import { usePipelineStream } from "./hooks/usePipelineStream.js";
-import type { PipelineExecutionPolicy } from "../backend/engine/types.js";
-import { Plus, Cpu, Cloud, CheckCircle2, HardDrive } from "lucide-react";
+import { api } from "./api.js";
+
+const views = [
+  { id: "dashboard", label: "Overview", icon: LayoutDashboard },
+  { id: "jobs", label: "Episode queue", icon: ListVideo },
+  { id: "batches", label: "Processing", icon: Cpu },
+  { id: "terminal", label: "Activity log", icon: Terminal },
+  { id: "settings", label: "Operations", icon: Settings2 },
+];
+const gb = (n: number) => (n / 1024 ** 3).toFixed(1);
 
 export default function App() {
-  const { stats, logs, connected } = usePipelineStream();
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [activeView, setActiveView] = useState("dashboard");
-  const [isEnqueueOpen, setIsEnqueueOpen] = useState(false);
-  const [isKaggleOpen, setIsKaggleOpen] = useState(false);
-  const [isHfOpen, setIsHfOpen] = useState(false);
-  const [isStagingOpen, setIsStagingOpen] = useState(false);
-  const [actionNotice, setActionNotice] = useState<string | null>(null);
-  const [externalJobStatusFilter, setExternalJobStatusFilter] =
-    useState<string>("all");
-
-  const queuedCount =
-    (stats?.queue?.queued ?? 0) +
-    (stats?.queue?.downloading ?? 0) +
-    (stats?.queue?.staged ?? 0) +
-    (stats?.queue?.encoding ?? 0);
-  const activeSlots = stats?.concurrency?.active ?? 0;
-  const stagedCount = stats?.storage?.stagedCount ?? 0;
-
-  const showNotice = (msg: string) => {
-    setActionNotice(msg);
-    setTimeout(() => setActionNotice(null), 4500);
+  const { stats, logs, connected, lastUpdated } = usePipelineStream();
+  const [view, setView] = useState("dashboard");
+  const [modal, setModal] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [filter, setFilter] = useState("all");
+  const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const actionLock = useRef(false);
+  const showNotice = (message: string) => {
+    if (noticeTimer.current) clearTimeout(noticeTimer.current);
+    setNotice(message); noticeTimer.current = setTimeout(() => setNotice(null), 7000);
   };
-
-  // Keyboard shortcut: Cmd/Ctrl + K to toggle Enqueue modal
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setIsEnqueueOpen((prev) => !prev);
-      }
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); setModal("enqueue"); }
+      if (e.key === "Escape") setModal(null);
     };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener("keydown", onKey);
+    return () => { window.removeEventListener("keydown", onKey); if (noticeTimer.current) clearTimeout(noticeTimer.current); };
   }, []);
-
-  const handleForceFlush = async () => {
+  const action = async (endpoint: string, body?: unknown) => {
+    if (actionLock.current) return;
+    actionLock.current = true; setBusy(endpoint);
     try {
-      const res = await fetch("/api/batches/flush", { method: "POST" });
-      const data = await res.json();
-      showNotice(data.message || "Force flush event dispatched.");
-    } catch {
-      showNotice("Failed to trigger force flush.");
-    }
+      const data = await api(endpoint, { method: "POST", ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}) });
+      showNotice(data.message || "Request completed.");
+    } catch (error) { showNotice(error instanceof Error ? error.message : "Request failed. Try again."); }
+    finally { actionLock.current = false; setBusy(null); }
   };
+  const showJobs = (status: string) => { setFilter(status); setView("jobs"); };
+  const q = stats?.queue;
+  const active = (q?.downloading ?? 0) + (q?.encoding ?? 0);
+  const capacity = stats ? Math.min(100, stats.storage.stagedBytes / Math.max(1, stats.storage.maxStagingBytes) * 100) : 0;
+  const flush = () => { void action("/api/batches/flush"); };
 
-  const handleRunRecovery = async () => {
-    try {
-      const res = await fetch("/api/system/recovery", { method: "POST" });
-      const data = await res.json();
-      showNotice(data.message || "Recovery reconciliation triggered.");
-    } catch {
-      showNotice("Failed to trigger recovery.");
-    }
-  };
-
-  const handleSyncEncoding = async () => {
-    try {
-      const res = await fetch("/api/system/sync-encoding", { method: "POST" });
-      const data = await res.json();
-      showNotice(
-        data.message || "Verified live Kaggle GPU status and reconciled encoding jobs.",
-      );
-    } catch {
-      showNotice("Failed to verify live encoding states.");
-    }
-  };
-
-  const handleChangePolicy = async (policy: PipelineExecutionPolicy) => {
-    try {
-      const res = await fetch("/api/pipeline/policy", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          policy,
-          requeueSkipped: policy === "all",
-        }),
-      });
-      const data = await res.json();
-      showNotice(data.message || `Updated pipeline execution policy to ${policy}.`);
-    } catch {
-      showNotice("Failed to update pipeline execution policy.");
-    }
-  };
-
-  const handleRequeueSkipped = async () => {
-    try {
-      const res = await fetch("/api/jobs/requeue-skipped", { method: "POST" });
-      const data = await res.json();
-      showNotice(data.message || "Re-queued skipped jobs for discovery.");
-    } catch {
-      showNotice("Failed to re-queue skipped jobs.");
-    }
-  };
-
-  return (
-    <div className="min-h-screen bg-[#090a0f] text-[#f3f4f8] flex relative overflow-x-hidden">
-      {/* Desktop Sidebar */}
-      <Sidebar
-        collapsed={sidebarCollapsed}
-        onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
-        activeView={activeView}
-        onSelectView={(v) => setActiveView(v)}
-        stats={stats}
-        onOpenEnqueue={() => setIsEnqueueOpen(true)}
-        onOpenKaggleDetails={() => setIsKaggleOpen(true)}
-        onOpenHfDetails={() => setIsHfOpen(true)}
-      />
-
-      {/* Main Content Container */}
-      <div
-        className={`flex-1 min-w-0 flex flex-col min-h-screen transition-all duration-200 ${
-          sidebarCollapsed ? "md:ml-16" : "md:ml-60"
-        }`}
-      >
-        <Navbar
-          connected={connected}
-          stats={stats}
-          activeView={activeView}
-          onSelectView={(v) => setActiveView(v)}
-          onOpenEnqueue={() => setIsEnqueueOpen(true)}
-          onForceFlush={handleForceFlush}
-          onRunRecovery={handleRunRecovery}
-          onSyncEncoding={handleSyncEncoding}
-          onOpenStagingExplorer={() => setIsStagingOpen(true)}
-          onChangePolicy={handleChangePolicy}
-        />
-
-        {/* Operational Notification Banner */}
-        {actionNotice && (
-          <div className="sticky top-14 z-30 bg-indigo-500/15 backdrop-blur-md text-indigo-200 text-xs font-medium py-2 px-6 border-b border-indigo-500/30 flex items-center justify-between">
-            <span>{actionNotice}</span>
-            <button
-              type="button"
-              onClick={() => setActionNotice(null)}
-              className="text-indigo-300 hover:text-white text-[11px] font-mono cursor-pointer"
-            >
-              Dismiss
-            </button>
-          </div>
-        )}
-
-        {/* Primary Viewport */}
-        <main className="flex-1 max-w-[1400px] w-full mx-auto p-4 sm:p-6 pb-20 md:pb-8 space-y-6">
-          {activeView === "dashboard" && (
-            <>
-              <DashboardCharts
-                stats={stats}
-                logs={logs}
-                onOpenLiveTerminal={() => setActiveView("terminal")}
-                onOpenEnqueue={() => setIsEnqueueOpen(true)}
-                onOpenKaggleDetails={() => setIsKaggleOpen(true)}
-                onOpenHfDetails={() => setIsHfOpen(true)}
-                onOpenStagingExplorer={() => setIsStagingOpen(true)}
-                onForceFlush={handleForceFlush}
-                onSyncEncoding={handleSyncEncoding}
-                onChangePolicy={handleChangePolicy}
-                onRequeueSkipped={handleRequeueSkipped}
-                onSelectStatusFilter={(status) => {
-                  setExternalJobStatusFilter(status);
-                  showNotice(`Filtered multimedia jobs by status: ${status}`);
-                }}
-              />
-
-              <BatchViewer
-                onForceFlush={handleForceFlush}
-                stagedCount={stagedCount}
-                onNotice={showNotice}
-              />
-
-              <JobTable
-                onOpenEnqueue={() => setIsEnqueueOpen(true)}
-                externalStatusFilter={externalJobStatusFilter}
-                onNotice={showNotice}
-              />
-            </>
-          )}
-
-          {activeView === "jobs" && (
-            <div className="space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h1 className="text-lg font-bold text-[#f3f4f8] tracking-tight">
-                    Multimedia Pipeline Manager
-                  </h1>
-                  <p className="text-xs text-[#636b82] mt-0.5">
-                    Multi-select batch controls, stream previewing, same-group H.264 VM Remux (-c:v copy), and Kaggle GPU batches
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setIsEnqueueOpen(true)}
-                  className="btn-primary px-3.5 py-2 rounded-lg font-semibold text-xs flex items-center gap-1.5 cursor-pointer"
-                >
-                  <Plus className="w-4 h-4" />
-                  <span>Enqueue Episode</span>
-                </button>
-              </div>
-              <JobTable
-                onOpenEnqueue={() => setIsEnqueueOpen(true)}
-                externalStatusFilter={externalJobStatusFilter}
-                onNotice={showNotice}
-              />
-            </div>
-          )}
-
-          {activeView === "batches" && (
-            <div className="space-y-6">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h1 className="text-lg font-bold text-[#f3f4f8] tracking-tight">
-                    VM Direct-Remux & GPU Batches
-                  </h1>
-                  <p className="text-xs text-[#636b82] mt-0.5">
-                    Local VM Direct-Remux (-c:v copy, concurrency 1) and Kaggle Dual-T4 GPU notebook execution history
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setIsKaggleOpen(true)}
-                    className="btn-secondary px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <Cpu className="w-3.5 h-3.5 text-indigo-400" />
-                    <span>Inspect Cluster</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setIsHfOpen(true)}
-                    className="btn-secondary px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <Cloud className="w-3.5 h-3.5 text-sky-400" />
-                    <span>Storage Targets</span>
-                  </button>
-                </div>
-              </div>
-
-              {/* Inline Cluster & Storage Summary Grid */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                <div className="surface-panel rounded-xl p-5">
-                  <div className="flex items-center justify-between pb-3 border-b border-[#1e2230]">
-                    <div className="flex items-center gap-2">
-                      <Cpu className="w-4 h-4 text-indigo-400" />
-                      <h2 className="text-sm font-semibold text-[#f3f4f8]">
-                        Kaggle GPU Account Pool
-                      </h2>
-                    </div>
-                    <span className="text-xs font-mono tabular-nums text-[#949bb0]">
-                      {stats?.concurrency?.active ?? 0} /{" "}
-                      {stats?.concurrency?.max ?? 2} slots active
-                    </span>
-                  </div>
-                  <div className="mt-3 space-y-2">
-                    {(stats?.accounts?.kaggle || []).length === 0 ? (
-                      <div className="text-xs text-[#636b82] py-4 text-center">
-                        No Kaggle accounts configured in KAGGLE_ACCOUNTS.
-                      </div>
-                    ) : (
-                      (stats?.accounts?.kaggle || []).map((acc, i) => (
-                        <div
-                          key={acc.username || i}
-                          className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex items-center justify-between text-xs font-mono"
-                        >
-                          <span className="text-[#f3f4f8] font-medium">
-                            @{acc.username}
-                          </span>
-                          <div className="flex items-center gap-3 text-[#949bb0] tabular-nums">
-                            <span>
-                              Slot 1: {acc.slots?.[0] ? "Running" : "Idle"}
-                            </span>
-                            <span>·</span>
-                            <span>
-                              Slot 2: {acc.slots?.[1] ? "Running" : "Idle"}
-                            </span>
-                          </div>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </div>
-
-                <div className="surface-panel rounded-xl p-5">
-                  <div className="flex items-center justify-between pb-3 border-b border-[#1e2230]">
-                    <div className="flex items-center gap-2">
-                      <Cloud className="w-4 h-4 text-sky-400" />
-                      <h2 className="text-sm font-semibold text-[#f3f4f8]">
-                        Hugging Face & Cloudflare R2 Targets
-                      </h2>
-                    </div>
-                    <span className="text-xs font-mono text-[#949bb0]">
-                      1080p · 720p · 480p MP4
-                    </span>
-                  </div>
-                  <div className="mt-3 space-y-2">
-                    {(stats?.accounts?.huggingFace || []).length === 0 ? (
-                      <div className="text-xs text-[#636b82] py-4 text-center">
-                        No Hugging Face accounts configured in HF_ACCOUNTS.
-                      </div>
-                    ) : (
-                      (stats?.accounts?.huggingFace || []).map((hf, i) => (
-                        <div
-                          key={i}
-                          className="p-3 rounded-lg bg-[#0c0e14] border border-[#1e2230] flex items-center justify-between text-xs font-mono"
-                        >
-                          <div className="flex items-center gap-2">
-                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                            <span className="text-[#f3f4f8] font-medium">
-                              {hf.owner}
-                            </span>
-                          </div>
-                          <span className="text-[#949bb0]">
-                            datasets/{hf.owner}/{hf.bucket}
-                          </span>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              <BatchViewer
-                onForceFlush={handleForceFlush}
-                stagedCount={stagedCount}
-                onNotice={showNotice}
-              />
-            </div>
-          )}
-
-          {activeView === "terminal" && (
-            <div className="space-y-4">
-              <div>
-                <h1 className="text-lg font-bold text-[#f3f4f8] tracking-tight">
-                  Live Telemetry Console
-                </h1>
-                <p className="text-xs text-[#636b82] mt-0.5">
-                  Real-time SSE event log stream from Tsukihime, AnimeTosho, Transmission, R2 Subtitles, VM Remux, and Kaggle GPU kernels
-                </p>
-              </div>
-              <LiveTerminal logs={logs} />
-            </div>
-          )}
-        </main>
-
-        {/* Quiet Footer */}
-        <footer className="border-t border-[#1e2230] py-4 px-6 text-xs text-[#636b82] flex flex-wrap items-center justify-between max-w-[1400px] mx-auto w-full mb-12 md:mb-0">
-          <span>AniLight Kira Pipeline Operations Console</span>
-          <span className="font-mono text-[11px] tabular-nums">
-            Providers: Tsukihime v1 · AnimeTosho · VM Direct-Remux (-c:v copy) · Kaggle Dual-GPU · Cloudflare R2
-          </span>
-        </footer>
+  return <div className="workspace">
+    <aside className="workspace-nav">
+      <a className="brand" href="#" onClick={e => { e.preventDefault(); setView("dashboard"); }}>
+        <span className="brand-mark"><Sparkles size={22} /></span><span>AniLight<span className="brand-sub">PIPELINE WORKSPACE</span></span>
+      </a>
+      <button className="btn-primary nav-create" onClick={() => setModal("enqueue")}><Plus size={17} /> Add episodes <kbd>⌘ K</kbd></button>
+      <span className="nav-label">Workspace</span>
+      <nav aria-label="Main navigation">{views.map(({ id, label, icon: Icon }) =>
+        <button key={id} aria-current={view === id ? "page" : undefined} className={view === id ? "nav-item selected" : "nav-item"} onClick={() => setView(id)}>
+          <Icon size={18} /><span>{label}</span>{id === "jobs" && !!q?.failed && <span className="nav-count">{q.failed}</span>}
+        </button>)}</nav>
+      <div className="nav-bottom">
+        <span className="nav-label">Connected services</span>
+        <button className="nav-item" onClick={() => setModal("kaggle")}><Cpu size={17} /> GPU accounts <ChevronRight size={14} /></button>
+        <button className="nav-item" onClick={() => setModal("hf")}><Cloud size={17} /> Hugging Face <ChevronRight size={14} /></button>
+        <div className="nav-health"><span className={connected ? "status-dot live" : "status-dot"} /><div>{connected ? "Live connection" : "Reconnecting…"}<small>{lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "Waiting for pipeline"}</small></div></div>
       </div>
+    </aside>
+    <div className="workspace-main">
+      <header className="workspace-top"><span>Workspace <ChevronRight size={13} /> <strong>{views.find(v => v.id === view)?.label}</strong></span><div className="top-status"><span className={connected ? "status-dot live" : "status-dot"} />{!connected ? "Connection interrupted" : stats?.engine.isPaused ? "Pipeline paused" : "Live updates"}<button className="icon-button" aria-label="Open operations" onClick={() => setView("settings")}><Settings2 size={18} /></button></div></header>
+      <main className="workspace-content">
+        {!connected && <div className="connection-notice" role="status">Connecting to the pipeline. {stats ? "Showing the last received data; it may be out of date." : "Your queue will appear when the service responds."}</div>}
+        <div className="page-heading"><div><span className="eyebrow">ANILIGHT / KIRA</span><h1>{view === "dashboard" ? "A little clarity for your pipeline." : views.find(v => v.id === view)?.label}</h1><p>{view === "dashboard" ? "From discovery to delivery. Everything moving, all in one place." : view === "jobs" ? "Find an episode, follow its progress, or pick up where it stopped." : view === "batches" ? "Follow local conversion and GPU batch processing." : view === "terminal" ? "A live record of what your pipeline is doing." : "Manage execution, storage, and recovery."}</p></div><button className="btn-primary" onClick={() => setModal("enqueue")}><Plus size={16} /> Add episodes</button></div>
 
-      {/* Mobile Navigation Dock */}
-      <MobileBottomDock
-        activeView={activeView}
-        onSelectView={(v) => setActiveView(v)}
-        onOpenEnqueue={() => setIsEnqueueOpen(true)}
-        queuedCount={queuedCount}
-        activeSlots={activeSlots}
-      />
-
-      {/* Modals */}
-      <EnqueueModal
-        isOpen={isEnqueueOpen}
-        onClose={() => setIsEnqueueOpen(false)}
-        onSuccess={() =>
-          showNotice(
-            "Episode(s) enqueued for Tsukihime & AnimeTosho discovery.",
-          )
-        }
-      />
-
-      <KaggleAccountsModal
-        isOpen={isKaggleOpen}
-        onClose={() => setIsKaggleOpen(false)}
-        stats={stats}
-      />
-
-      <HuggingFaceModal
-        isOpen={isHfOpen}
-        onClose={() => setIsHfOpen(false)}
-        stats={stats}
-      />
-
-      <StagingExplorerModal
-        isOpen={isStagingOpen}
-        onClose={() => setIsStagingOpen(false)}
-        onNotice={showNotice}
-      />
+        {view === "dashboard" && <>
+          <div className="metric-grid">
+            {[
+              { label: "In progress", value: active, detail: "Downloading & processing", status: "encoding", icon: Activity },
+              { label: "Ready to process", value: q?.staged, detail: "Safely staged on disk", status: "staged", icon: Box },
+              { label: "Delivered", value: q?.completed, detail: "Completed episodes", status: "completed", icon: Check },
+              { label: "Needs attention", value: q?.failed, detail: "Review errors & retry", status: "failed", icon: RefreshCw },
+            ].map(({ label, value, detail, status, icon: Icon }) => <button key={label} className={status === "failed" && q?.failed ? "metric-card attention" : "metric-card"} onClick={() => showJobs(status === "encoding" ? "active" : status)}>
+              <span className="metric-label">{label}<Icon size={17} /></span><strong>{stats ? (value ?? 0).toLocaleString() : "—"}</strong><span className="metric-detail">{detail}<ArrowRight size={14} /></span>
+            </button>)}
+          </div>
+          <div className="overview-grid">
+            <section className="panel flow-panel"><div className="section-heading"><div><span className="eyebrow">THE BIG PICTURE</span><h2>Your delivery flow</h2></div><span className="pill">{stats ? stats.engine.isPaused ? "Paused" : stats.engine.isRunning ? "Running" : "Idle" : "Connecting"}</span></div>
+              <div className="flow-steps">{[{ label: "Waiting", count: q?.queued, status: "queued" }, { label: "Downloading", count: q?.downloading, status: "downloading" }, { label: "Staged", count: q?.staged, status: "staged" }, { label: "Processing", count: q?.encoding, status: "encoding" }].map((step, i) => <React.Fragment key={step.label}><button onClick={() => showJobs(step.status)}><span className="step-number">0{i + 1}</span><strong>{stats ? step.count : "—"}</strong><span>{step.label}</span></button>{i < 3 && <ChevronRight className="flow-arrow" size={18} />}</React.Fragment>)}</div>
+              <div className="flow-note"><HardDrive size={16} /><span>{q?.paused ? `${q.paused} download(s) waiting for storage space.` : "Staged files stay available for recovery."}</span><button onClick={() => setModal("staging")}>Inspect storage <ArrowRight size={14} /></button></div>
+            </section>
+            <section className="panel resource-panel"><div className="section-heading"><h2>Resources</h2><button className="text-button" onClick={() => setView("settings")}>Manage</button></div>
+              <div className="resource-row"><span><HardDrive size={16} /> Staging space</span><strong>{stats ? `${gb(stats.storage.stagedBytes)} / ${gb(stats.storage.maxStagingBytes)} GB` : "—"}</strong></div>
+              <progress aria-label="Staging space used" value={capacity} max={100} />
+              <div className="resource-row"><span><Cpu size={16} /> Local workers</span><strong>{stats ? `${stats.concurrency.vmActive ?? 0} / ${stats.concurrency.vmMax ?? 2}` : "—"}</strong></div>
+              <div className="resource-row"><span><Cloud size={16} /> GPU slots</span><strong>{stats ? `${stats.concurrency.active} / ${stats.concurrency.max}` : "—"}</strong></div>
+              <div className="resource-footer">{stats?.engine.pendingCallbacks ? `${stats.engine.pendingCallbacks} delivery callback(s) awaiting retry` : "Storage and worker availability at a glance"}</div>
+            </section>
+          </div>
+          <JobTable compact onOpenEnqueue={() => setModal("enqueue")} onNotice={showNotice} onViewAll={() => showJobs("all")} />
+          <section className="panel activity-preview"><div className="section-heading"><h2>Recent activity</h2><button className="text-button" onClick={() => setView("terminal")}>Open log <ArrowRight size={14} /></button></div>{logs.length ? logs.slice(-3).reverse().map(entry => <div className="activity-row" key={entry.id}><span className={`status-dot ${entry.level === "error" ? "error" : entry.level === "success" ? "live" : ""}`} /><p>{entry.message}</p><time>{new Date(entry.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></div>) : <p className="empty-description">Activity will appear here as jobs move through the pipeline.</p>}</section>
+        </>}
+        {view === "jobs" && <JobTable key={filter} externalStatusFilter={filter} onOpenEnqueue={() => setModal("enqueue")} onNotice={showNotice} />}
+        {view === "batches" && <Suspense fallback={<div className="panel" role="status">Loading processing…</div>}><BatchViewer onForceFlush={flush} stagedCount={stats?.storage.stagedCount ?? 0} onNotice={showNotice} /></Suspense>}
+        {view === "terminal" && <Suspense fallback={<div className="panel" role="status">Loading activity…</div>}><LiveTerminal logs={logs} /></Suspense>}
+        {view === "settings" && <div className="operations-grid">
+          <section className="panel"><h2>Processing preference</h2><p className="empty-description">Choose which workers can accept new work.</p><label className="field-label" htmlFor="policy">Execution policy</label><select id="policy" value={stats?.executionPolicy ?? "all"} disabled={!!busy || !stats} onChange={e => void action("/api/pipeline/policy", { policy: e.target.value, requeueSkipped: e.target.value === "all" })}><option value="all">Local + GPU processing</option><option value="vm_remux_only">Local conversion only</option><option value="kaggle_gpu_only">GPU encoding only</option></select></section>
+          <section className="panel"><h2>Storage & accounts</h2><p className="empty-description">Inspect retained files and configured upload destinations.</p><div className="operation-buttons"><button className="btn-secondary" onClick={() => setModal("staging")}><HardDrive size={16} /> Staged files</button><button className="btn-secondary" onClick={() => setModal("hf")}><Cloud size={16} /> Hugging Face</button><button className="btn-secondary" onClick={() => setModal("kaggle")}><Cpu size={16} /> GPU accounts</button></div></section>
+          <section className="panel"><h2>Recovery & reconciliation</h2><p className="empty-description">Recover stale work and verify remote worker status.</p><div className="operation-buttons"><button className="btn-secondary" disabled={!!busy} onClick={() => void action("/api/jobs/retry-all-failed")}>Retry failed episodes</button><button className="btn-secondary" disabled={!!busy} onClick={() => void action("/api/system/sync-callbacks")}>Retry delivery callbacks</button><button className="btn-secondary" disabled={!!busy} onClick={() => void action("/api/system/recovery")}>Run recovery</button><button className="btn-secondary" disabled={!!busy} onClick={() => void action("/api/system/sync-encoding")}>Check GPU status</button><button className="btn-secondary" disabled={!!busy} onClick={() => void action("/api/jobs/requeue-skipped")}>Recheck skipped episodes</button></div></section>
+          <section className="panel"><h2>Start a partial GPU batch</h2><p className="empty-description">Send available staged GPU jobs to processing without waiting for a full batch.</p><button className="btn-secondary" disabled={!!busy} onClick={flush}>Process staged batch <ArrowRight size={16} /></button></section>
+        </div>}
+        <footer className="workspace-footer"><span>AniLight · A quieter place to keep things moving.</span><span>{connected ? "Live · refreshes automatically" : "Awaiting connection"}</span></footer>
+      </main>
     </div>
-  );
+    {notice && <div className="toast" role="status"><span>{notice}</span><button aria-label="Dismiss notification" onClick={() => setNotice(null)}><X size={17} /></button></div>}
+    {busy && <div className="action-progress" role="status"><Loader2 size={15} className="animate-spin" /> Working…</div>}
+    <Suspense fallback={<div className="action-progress" role="status">Opening…</div>}>
+    {modal === "enqueue" && <EnqueueModal isOpen={modal === "enqueue"} onClose={() => setModal(null)} onSuccess={() => showNotice("Episodes added to the discovery queue.")} />}
+    {modal === "kaggle" && <KaggleAccountsModal isOpen={modal === "kaggle"} onClose={() => setModal(null)} stats={stats} />}
+    {modal === "hf" && <HuggingFaceModal isOpen={modal === "hf"} onClose={() => setModal(null)} stats={stats} />}
+    {modal === "staging" && <StagingExplorerModal isOpen={modal === "staging"} onClose={() => setModal(null)} onNotice={showNotice} />}
+    </Suspense>
+  </div>;
 }
