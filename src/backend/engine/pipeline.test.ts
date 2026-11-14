@@ -626,5 +626,203 @@ test("PipelineEngineService protects active vm_remux and recent subs temp dirs f
   }
 });
 
+test("ReleaseFilter parses titles containing 'Special' / Season formats and ranks Tsukihime #9827 Dub & Dual-Audio candidates accurately", () => {
+  const knownTitles = [
+    "Kikansha no Mahou wa Tokubetsu desu 2nd Season",
+    "A Returner's Magic Should be Special Season 2",
+  ];
+
+  const entries = [
+    {
+      id: 39289,
+      state: "completed",
+      name: "[Judas] Kikansha no Mahou wa Tokubetsu desu (A Returner's Magic Should Be Special) - S02E06 [1080p][HEVC x265 10bit][Dual-Audio][Multi-Subs] (Weekly)",
+      btih: "42c8cb015fc78b4179c95e03e80619b123fdc520",
+      totalsize: 453746976,
+      filecount: 1,
+      audiolangs: ["ja", "en"],
+      sublangs: ["en"],
+      episode_no: null,
+      group: { id: 8, name: "Judas", is_fansub: 0 },
+    },
+    {
+      id: 36488,
+      state: "completed",
+      name: "[VARYG] A Returners Magic Should Be Special S02E16 1080p CR WEB-DL DUAL AAC2.0 H.264 (Kikansha no Mahou wa Tokubetsu desu 2nd Season, Multi-Subs)",
+      btih: "fed66e3d60abf8fbe4c5a60d1824ec10bd92ea52",
+      totalsize: 1510165811,
+      filecount: 1,
+      audiolangs: ["ja", "en"],
+      sublangs: ["en"],
+      episode_no: 16,
+      group: { id: 7, name: "VARYG", is_fansub: 0 },
+    },
+    {
+      id: 36487,
+      state: "completed",
+      name: "[Yameii] A Returner's Magic Should Be Special - S02E04 [English Dub] [CR WEB-DL 720p H264 AAC] [9A697681] (Kikansha no Mahou wa Tokubetsu Desu Season 2 | S2)",
+      btih: "431f908fe3682714d40ab026e2d6483172fa3e19",
+      totalsize: 740221065,
+      filecount: 1,
+      audiolangs: ["en-US"],
+      sublangs: ["en-US"],
+      episode_no: 4,
+      group: { id: 12, name: "Yameii", is_fansub: 0 },
+    },
+    {
+      id: 36485,
+      state: "completed",
+      name: "[AnoZu] A Returner's Magic Should Be Special S02E04 1080p CR WEB-DL Dual-Audio DDP 2.0 H.264 | Kikansha no Mahou wa Tokubetsu desu 2nd Season",
+      btih: "bd68a811ea166b96d859652a38d3c98619197f9d",
+      totalsize: 1516741132,
+      filecount: 1,
+      audiolangs: ["ja-JP", "en-US"],
+      sublangs: ["en-US"],
+      episode_no: 4,
+      group: { id: 139, name: "AnoZu", is_fansub: 0 },
+    },
+    {
+      id: 36484,
+      state: "completed",
+      name: "[Yameii] A Returner's Magic Should Be Special - S02E04 [English Dub] [CR WEB-DL 1080p H264 AAC] [3D5FF516] (Kikansha no Mahou wa Tokubetsu Desu Season 2 | S2)",
+      btih: "f0a8fd0b66ed4a9def989d1461a2b2e4dee837fa",
+      totalsize: 1448913961,
+      filecount: 1,
+      audiolangs: ["en-US"],
+      sublangs: ["en-US"],
+      episode_no: 4,
+      group: { id: 12, name: "Yameii", is_fansub: 0 },
+    },
+    {
+      id: 36479,
+      state: "completed",
+      name: "[ToonsHub] A Returners Magic Should Be Special S02E04 1080p CR WEB-DL DUAL AAC2.0 H.264 (Dual-Audio, Multi-Subs)",
+      btih: "1df430df31bebf399af6a6d6da605aabdeb57d20",
+      totalsize: 1505441656,
+      filecount: 1,
+      audiolangs: ["ja", "en"],
+      sublangs: ["en"],
+      episode_no: 4,
+      group: { id: 1, name: "ToonsHub", is_fansub: 0 },
+    },
+    {
+      id: 36482,
+      state: "completed",
+      name: "[SubsPlease] Kikansha no Mahou wa Tokubetsu desu - 16 (1080p) [7579A878].mkv",
+      btih: "f8b0c15d494091c08a378034bcdcf81dd524846c",
+      totalsize: 1443813912,
+      filecount: 1,
+      audiolangs: ["ja"],
+      sublangs: ["en"],
+      episode_no: 4,
+      group: { id: 10, name: "SubsPlease", is_fansub: 0 },
+    },
+    {
+      id: 36481,
+      state: "completed",
+      name: "[SubsPlease] Kikansha no Mahou wa Tokubetsu desu - 16 (720p) [76DADA99].mkv",
+      btih: "34f25684c085a137799ace4b481e8ec24dd807e2",
+      totalsize: 735165017,
+      filecount: 1,
+      audiolangs: ["ja"],
+      sublangs: ["en"],
+      episode_no: 4,
+      group: { id: 10, name: "SubsPlease", is_fansub: 0 },
+    },
+    {
+      id: 36480,
+      state: "completed",
+      name: "[SubsPlease] Kikansha no Mahou wa Tokubetsu desu - 16 (480p) [C655D733].mkv",
+      btih: "91847b598f17f0d38427746a89388de635e845f3",
+      totalsize: 382982256,
+      filecount: 1,
+      audiolangs: ["ja"],
+      sublangs: ["en"],
+      episode_no: 4,
+      group: { id: 10, name: "SubsPlease", is_fansub: 0 },
+    },
+    {
+      id: 36477,
+      state: "completed",
+      name: "[Erai-raws] Kikansha no Mahou wa Tokubetsu desu 2nd Season - 04 [720p CR WEB-DL AVC AAC][MultiSub][C291E5DB]",
+      btih: "502ff9bbcbe5d8b133ac275aa8c3f5a9d51eeded",
+      totalsize: 426597660,
+      filecount: 1,
+      audiolangs: ["ja"],
+      sublangs: ["en"],
+      episode_no: 4,
+      group: { id: 3, name: "Erai-raws", is_fansub: 0 },
+    },
+  ];
+
+  const items = entries.map((e) => TsukihimeClient.toAnimeToshoItem(e));
+  for (const item of items) {
+    const parsed = ReleaseFilter.parseTitle(item.title, knownTitles, item);
+    assert.equal(parsed.isBonusOrExtra, false, `Unexpected isBonusOrExtra=true for ${item.title}`);
+  }
+
+  // Dub-only target for Ep 4 should select Yameii (h264_multi), ToonsHub, AnoZu, and VARYG (via +12 offset -> effectiveEp 16)
+  const dubBundles = ReleaseFilter.selectTopCandidateBundles(items, 4, "dub", {
+    knownTitles,
+    maxBundles: 10,
+  });
+  assert.equal(dubBundles.length, 4);
+  assert.equal(dubBundles[0].groupLower, "yameii");
+  assert.equal(dubBundles[0].selectionTier, "h264_multi");
+  assert.ok(dubBundles[0].qualities["1080p"]);
+  assert.ok(dubBundles[0].qualities["720p"]);
+
+  const dubGroups = new Map(dubBundles.map((b) => [b.groupLower, b]));
+  assert.equal(dubGroups.get("toonshub")?.selectionTier, "h264_single_1080p");
+  assert.equal(dubGroups.get("anozu")?.selectionTier, "h264_single_1080p");
+  assert.equal(dubGroups.get("varyg")?.selectionTier, "h264_single_1080p");
+  assert.equal(dubGroups.get("varyg")?.primaryEntry.effectiveEp, 16);
+
+  // Sub+Dub ("all") target for Ep 4 should rank Dual-Audio H.264 ahead of Sub-only (SubsPlease) and Dub-only (Yameii)
+  const allBundles = ReleaseFilter.selectTopCandidateBundles(items, 4, "all", {
+    knownTitles,
+    maxBundles: 10,
+  });
+  assert.equal(allBundles[0].isDualAudio, true);
+  assert.equal(allBundles[0].isH264, true);
+  const subsPleaseIdx = allBundles.findIndex((b) => b.groupLower === "subsplease");
+  const yameiiIdx = allBundles.findIndex((b) => b.groupLower === "yameii");
+  assert.equal(subsPleaseIdx > 0, true);
+  assert.equal(yameiiIdx > subsPleaseIdx, true);
+
+  // Season/S2 episode formats should not misparse as [2, 4] ranges or season batches
+  const seasonDashParsed = ReleaseFilter.parseTitle(
+    "[Group] Anime Title Season 2 - 04 [English Dub] [1080p]",
+    ["Anime Title"],
+  );
+  assert.equal(seasonDashParsed.singleEp, 4);
+  assert.equal(seasonDashParsed.epRange, null);
+  assert.equal(seasonDashParsed.isBatch, false);
+  assert.equal(seasonDashParsed.isSeasonBatch, false);
+
+  const s2DashParsed = ReleaseFilter.parseTitle(
+    "[Group] Anime Title S2 - 04 [English Dub] [1080p]",
+    ["Anime Title"],
+  );
+  assert.equal(s2DashParsed.singleEp, 4);
+  assert.equal(s2DashParsed.epRange, null);
+  assert.equal(s2DashParsed.isBatch, false);
+  assert.equal(s2DashParsed.isSeasonBatch, false);
+
+  // Single-track English dub audio mapping
+  const vm = new VideoEncodingManager();
+  const dubOnlyProbe: MkvStreamProbe = {
+    video: [{}],
+    audio: [{}],
+    subtitles: [],
+    isDualAudio: false,
+    classifiedAudio: [],
+    japaneseStreamIndex: 0,
+    englishStreamIndex: 0,
+  };
+  assert.deepEqual(vm.determineTracksToEncode(dubOnlyProbe, "all"), [["dub", 0]]);
+  assert.deepEqual(vm.determineTracksToEncode(dubOnlyProbe, "dub"), [["dub", 0]]);
+});
+
 
 

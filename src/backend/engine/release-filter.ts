@@ -21,6 +21,7 @@ export class ReleaseFilter {
   public static readonly TRUSTED_GROUPS_TIER_2 = new Set([
     "asw", "kaizoku", "dubs-empire", "blackrabbit", "minikaizoku",
     "anitsu", "jaaj", "varyg", "neohevc", "psa", "horriblesubs",
+    "anozu", "strikes", "cartel",
   ]);
 
   // Groups known to encode exclusively in HEVC/10-bit unless explicitly tagged H.264/x264
@@ -48,13 +49,80 @@ export class ReleaseFilter {
   ]);
 
   public static readonly BONUS_OR_EXTRA_PATTERN =
-    /(?:\b|_)(?:ncop|nced|creditless|clean\s*op|clean\s*ed|menu|pv|cm|trailer|preview|teaser|making\s*of|interview|bd\s*menu|extra|bonus|omake|heroines|ova|oad|special|sp\d*|recap|s00|season\s*00?)(?:\b|\d|_)/i;
+    /(?:\b|_)(?:ncop|nced|creditless|clean\s*op|clean\s*ed|menu|pv|cm|trailer|preview|teaser|making\s*of|interview|bd\s*menu|extra|bonus|omake|ova|oad|special|sp\d*|recap|s00|season\s*00?)(?:\b|\d|_)/i;
+
+  public static readonly HARD_BONUS_OR_EXTRA_PATTERN =
+    /(?:\b|_)(?:ncop\d*|nced\d*|creditless|clean\s*op|clean\s*ed|bd\s*menu|pv\d*|cm\d*|s00|season\s*00?)(?:\b|\d|_)/i;
 
   public static readonly WEIRD_OR_PROMO_PATTERN =
     /(?:\b|_)(?:twitch(?:-rip|\.tv)?|youtube|yt-dlp|yt-rip|tiktok|livestream|stream-rip|preview|prerelease|pre-air|preair|screener|dvdscr|bdscr|workprint|sample|test\s*clip|promo|promotional|watermarked?|leaked?)(?:\b|\d|_)/i;
 
   public static readonly UNSUPPORTED_CONTAINER_PATTERN =
     /(?:\b|_)(?:bdmv|dvd-iso|bd-iso|\.iso|\.rar|\.zip|\.7z)(?:\b|\d|_)/i;
+
+  private static expandKnownTitleVariants(
+    knownTitles?: (string | null | undefined)[],
+  ): RegExp[] {
+    if (!knownTitles || knownTitles.length === 0) return [];
+    const variants = new Set<string>();
+    const trailingSeasonSuffixRx =
+      /\s*(?:[-:–~|/]+\s*)?(?:(?:\d+(?:st|nd|rd|th)\s+Season)|(?:Season\s*\d+)|(?:S\d+)|(?:Part\s*\d+)|(?:Cour\s*\d+))\s*$/i;
+
+    for (const raw of knownTitles) {
+      if (!raw) continue;
+      const trimmed = raw.trim();
+      if (!trimmed) continue;
+      variants.add(trimmed);
+      const base = trimmed.replace(trailingSeasonSuffixRx, "").trim();
+      if (base && base.length >= 2) {
+        variants.add(base);
+      }
+    }
+
+    const sorted = Array.from(variants).sort((a, b) => b.length - a.length);
+    const regexes: RegExp[] = [];
+
+    for (const title of sorted) {
+      let pattern = "";
+      let i = 0;
+      while (i < title.length) {
+        const ch = title[i];
+        if (ch === "'" || ch === "’" || ch === "`") {
+          pattern += "['’`]?";
+          i++;
+        } else if (/[\s:\-–—]/.test(ch)) {
+          let hadColonOrDash = false;
+          let hadSpace = false;
+          while (i < title.length && /[\s:\-–—]/.test(title[i])) {
+            if (title[i] === ":" || title[i] === "-" || title[i] === "–" || title[i] === "—") {
+              hadColonOrDash = true;
+            } else {
+              hadSpace = true;
+            }
+            i++;
+          }
+          if (hadColonOrDash && !hadSpace) {
+            pattern += "[\\s._:\\-–—]*";
+          } else if (hadColonOrDash) {
+            pattern += "[\\s._:\\-–—]+";
+          } else {
+            pattern += "[\\s._-]+";
+          }
+        } else {
+          pattern += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          i++;
+        }
+      }
+      if (!pattern) continue;
+      const startsAlnum = /^[a-zA-Z0-9]/.test(title);
+      const endsAlnum = /[a-zA-Z0-9]$/.test(title);
+      const prefix = startsAlnum ? "(?<![a-zA-Z0-9])" : "";
+      const suffix = endsAlnum ? "(?![a-zA-Z0-9])" : "";
+      regexes.push(new RegExp(`${prefix}${pattern}${suffix}`, "gi"));
+    }
+
+    return regexes;
+  }
 
   public static stripNoiseForEpisodeParsing(
     text: string,
@@ -64,21 +132,21 @@ export class ReleaseFilter {
     s = s.replace(/\.(?:mkv|mp4|avi|webm|ass|srt|vtt)$/i, "");
     s = s.replace(/^\s*\[[^\]]+\]\s*/, "");
     s = s.replace(/[\[\(][0-9A-Fa-f]{8}[\]\)]/g, " ");
+
+    const titleRegexes = this.expandKnownTitleVariants(knownTitles);
+    for (const rx of titleRegexes) {
+      s = s.replace(rx, " ");
+    }
+
     s = s.replace(/\[(?![0-9]{1,4}\s*[-~–]\s*[0-9]{1,4}\])[^\]]*\]/g, " ");
     s = s.replace(/\((?![0-9]{1,4}\s*[-~–]\s*[0-9]{1,4}\))[^\)]*\)/g, " ");
 
-    if (knownTitles) {
-      const validTitles = (knownTitles.filter(Boolean) as string[]).sort(
-        (a, b) => b.length - a.length,
-      );
-      for (const t of validTitles) {
-        const escaped = t.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        s = s.replace(new RegExp(escaped, "gi"), " ");
-      }
+    for (const rx of titleRegexes) {
+      s = s.replace(rx, " ");
     }
 
     s = s.replace(
-      /\b(?:2160p|1080p|720p|576p|540p|480p|360p|4k|uhd|fhd|hd|sd|hevc|av1|x264|x265|h\.?264|h\.?265|avc1?|10\s*-?bit|8\s*-?bit|hi10p|aac\d*(?:\.\d)?|eac3|ac3|flac|opus|ddp\d*(?:\.\d)?|dts(?:-hd)?|web-dl|webrip|bluray|bdrip|bdremux|remux|hdtv|cr|amzn|nf|dsnp|hidive|b-global|dual[\s._-]*audio|multi[\s._-]*(?:audio|subs?)|(?:19|20)\d{2})\b/gi,
+      /\b(?:2160p|1080p|720p|576p|540p|480p|360p|4k|uhd|fhd|hd|sd|hevc|av1|x264|x265|h\.?264|h\.?265|avc1?|10\s*-?bit|8\s*-?bit|hi10p|aac[\s._-]*\d*(?:\.\d)?|eac3[\s._-]*\d*(?:\.\d)?|ac3[\s._-]*\d*(?:\.\d)?|flac|opus|ddp[\s._-]*\d*(?:\.\d)?|dts(?:-hd)?|web-dl|webrip|bluray|bdrip|bdremux|remux|hdtv|cr|amzn|nf|dsnp|hidive|b-global|dual[\s._-]*audio|multi[\s._-]*(?:audio|subs?)|(?:19|20)\d{2})\b/gi,
       " ",
     );
     return s;
@@ -129,6 +197,10 @@ export class ReleaseFilter {
       if (!hasEnglishSub && !lower.includes("multi") && !lower.includes("eng") && !lower.includes("dual")) {
         isForeign = true;
       }
+    }
+
+    if (!isForeign && /\b(?:dub|simuldub|eng(?:lish)?[\s._-]*dub|dubbed)\b/i.test(lower)) {
+      isEnglishDub = true;
     }
 
     // Use explicit audio/subtitle language arrays from Tsukihime when available
@@ -193,17 +265,33 @@ export class ReleaseFilter {
         ? "720p"
         : "1080p";
 
-    const isBonusOrExtra = this.BONUS_OR_EXTRA_PATTERN.test(path.basename(titleClean));
     const isWeirdOrPromo = this.WEIRD_OR_PROMO_PATTERN.test(lower);
     const isUnsupportedContainer = this.UNSUPPORTED_CONTAINER_PATTERN.test(lower) || is4k;
 
     const cleaned = this.stripNoiseForEpisodeParsing(titleClean, knownTitles);
+    let cleanedForEp = cleaned;
 
     let seasonNum: number | null = null;
     let singleEp: number | null = null;
     let epRange: [number, number] | null = null;
 
-    const rangeMatch = cleaned.match(
+    const ordinalSeasonMatch = cleanedForEp.match(/\b(\d{1,2})(?:st|nd|rd|th)\s+Season\b/i);
+    if (ordinalSeasonMatch) {
+      seasonNum = parseInt(ordinalSeasonMatch[1], 10);
+      cleanedForEp = cleanedForEp.replace(/\b\d{1,2}(?:st|nd|rd|th)\s+Season\b/gi, " ");
+    }
+
+    const prefixSeasonMatch = cleanedForEp.match(/\bS(?:eason)?\s*0?(\d{1,2})(?=\b|[\s._-])/i);
+    if (prefixSeasonMatch && seasonNum === null) {
+      seasonNum = parseInt(prefixSeasonMatch[1], 10);
+    }
+
+    cleanedForEp = cleanedForEp.replace(
+      /\b(?:Season|Part|Cour|Stage|Act|Vol(?:ume)?)\s*0?\d{1,2}(?=\b|[\s._-])/gi,
+      " ",
+    );
+
+    const rangeMatch = cleanedForEp.match(
       /(?:(?:S(?:eason\s*)?0?(\d{1,2})[\s._-]*)?E(?:p(?:isode)?\s*)?0*(\d{1,4})|(?:\b|[\(\[\s_-])0*(\d{1,4}))\s*[-~–]\s*(?:(?:S(?:eason\s*)?0?\d{1,2}[\s._-]*)?E(?:p(?:isode)?\s*)?|(?:\b|[\(\[\s_-]))?0*(\d{1,4})(?:v\d+)?(?=\b|[\)\]\s_.-]|$)/i,
     );
     if (rangeMatch) {
@@ -218,22 +306,22 @@ export class ReleaseFilter {
     }
 
     if (!epRange) {
-      const seMatch = cleaned.match(
+      const seMatch = cleanedForEp.match(
         /\bS(?:eason\s*)?0?(\d{1,2})[\s._-]*E(?:p(?:isode)?\s*)?0*(\d{1,4})(?:v\d+)?\b/i,
       );
       if (seMatch) {
         seasonNum = parseInt(seMatch[1], 10);
         singleEp = parseInt(seMatch[2], 10);
       } else {
-        const seasonMatch = cleaned.match(/\bS(?:eason\s*)?0?(\d{1,2})\b/i);
-        if (seasonMatch) {
+        const seasonMatch = cleanedForEp.match(/\bS(?:eason\s*)?0?(\d{1,2})\b/i);
+        if (seasonMatch && seasonNum === null) {
           seasonNum = parseInt(seasonMatch[1], 10);
         }
       }
 
       if (singleEp === null) {
         const explicitMatches = Array.from(
-          cleaned.matchAll(
+          cleanedForEp.matchAll(
             /(?:-\s+|\b[eE][pP](?:isode)?[\s._-]*|\b[eE])0*(\d{1,4})(?:v\d+)?(?=\b|[\s\(\[\._-]|$)/g,
           ),
         );
@@ -241,7 +329,7 @@ export class ReleaseFilter {
           singleEp = parseInt(explicitMatches[explicitMatches.length - 1][1], 10);
         } else {
           const tailMatches = Array.from(
-            cleaned.trim().matchAll(/(?:^|[\s._-])0*(\d{2,3})(?:v\d+)?(?=\s*$)/g),
+            cleanedForEp.trim().matchAll(/(?:^|[\s._-])0*(\d{2,3})(?:v\d+)?(?=\s*$)/g),
           );
           if (tailMatches.length > 0) {
             singleEp = parseInt(tailMatches[tailMatches.length - 1][1], 10);
@@ -250,6 +338,13 @@ export class ReleaseFilter {
       }
     }
 
+    const isHardBonus = this.HARD_BONUS_OR_EXTRA_PATTERN.test(path.basename(titleClean));
+    const hasRegularNumberedEp =
+      (seasonNum !== null && seasonNum > 0 && singleEp !== null && singleEp > 0) ||
+      (typeof item?.tsukihime_episode_no === "number" && item.tsukihime_episode_no > 0);
+    const isSoftBonus = !hasRegularNumberedEp && this.BONUS_OR_EXTRA_PATTERN.test(cleaned);
+    const isBonusOrExtra = isHardBonus || isSoftBonus || seasonNum === 0;
+
     const isBatch =
       /\b(?:batch|complete|collection|full\s*season)\b/.test(lower) ||
       epRange !== null ||
@@ -257,7 +352,10 @@ export class ReleaseFilter {
 
     const isSeasonBatch =
       /\b(?:complete|collection|full\s*season|all\s*episodes)\b/i.test(lower) ||
-      (/\bs(?:eason)?\s*0?(\d{1,2})\b/i.test(lower) && !/\be(?:p(?:isode)?)?\s*0*(\d{1,4})\b/i.test(lower));
+      (/\bs(?:eason)?\s*0?(\d{1,2})\b/i.test(lower) &&
+        singleEp === null &&
+        epRange === null &&
+        !/\be(?:p(?:isode)?)?\s*0*(\d{1,4})\b/i.test(lower));
 
     return {
       group,
@@ -281,7 +379,7 @@ export class ReleaseFilter {
       is720p,
       is480p,
       resolution,
-      isBonusOrExtra: isBonusOrExtra || seasonNum === 0,
+      isBonusOrExtra,
       isWeirdOrPromo,
       isUnsupportedContainer,
       titleRaw: titleClean,
@@ -301,6 +399,7 @@ export class ReleaseFilter {
     const isTier2 = this.TRUSTED_GROUPS_TIER_2.has(parsed.groupLower);
     const isSeadex = Boolean(item.is_seadex);
     const isDub = String(langType).toLowerCase() === "dub";
+    const isAll = String(langType).toLowerCase() === "all";
     const isSingleEpTarget = String(targetEp).toLowerCase() !== "all";
 
     // Never stop pagination early on a batch torrent when searching for a single episode
@@ -320,6 +419,8 @@ export class ReleaseFilter {
       if (isTier2 && (parsed.isDualAudio || parsed.isEnglishDub) && seeders >= 3) return true;
       return false;
     }
+
+    if (isAll && !parsed.isDualAudio) return false;
 
     if (parsed.isEnglishDub && !parsed.isDualAudio) return false;
     if (parsed.isForeign && !parsed.isDualAudio) return false;
@@ -517,9 +618,21 @@ export class ReleaseFilter {
 
     for (const t of torrentList) {
       if ((t.seeders || 0) <= 0) continue;
-      const parsed = this.parseTitle(t.title || "", knownTitles);
+      const parsed = this.parseTitle(t.title || "", knownTitles, t);
       if (parsed.isBonusOrExtra || parsed.seasonNum === 0 || parsed.isWeirdOrPromo || parsed.isUnsupportedContainer) {
         continue;
+      }
+
+      if (
+        typeof t.tsukihime_episode_no === "number" &&
+        t.tsukihime_episode_no > 0 &&
+        parsed.singleEp !== null &&
+        parsed.singleEp > t.tsukihime_episode_no
+      ) {
+        const diff = parsed.singleEp - t.tsukihime_episode_no;
+        if (this.VALID_COUR_OFFSETS.has(diff)) {
+          offsets.add(diff);
+        }
       }
 
       if (parsed.singleEp !== null && parsed.singleEp > 0) {
@@ -772,6 +885,7 @@ export class ReleaseFilter {
 
     const bundles: ReleaseCandidateBundle[] = [];
     const isSingleEpTarget = String(targetEp).toLowerCase() !== "all";
+    const isAllLang = String(langType).toLowerCase() === "all";
 
     for (const b of bundleMap.values()) {
       const q1080 = b.qualities["1080p"];
@@ -812,7 +926,13 @@ export class ReleaseFilter {
       // Solo vs Batch priority: Live solo releases ALWAYS outrank batch torrents when targeting a single episode
       const hasLiveSeeders = (primaryEntry.item.seeders ?? 1) > 0;
       const soloBonus = isSingleEpTarget && b.isSolo && hasLiveSeeders ? 10000 : 0;
-      const bundleScore = soloBonus + tierBonus + primaryEntry.score;
+      const dualAudioPreferenceBonus =
+        isAllLang && b.isDualAudio
+          ? 1500
+          : isAllLang && b.isEnglishDub && !b.isDualAudio
+            ? -2500
+            : 0;
+      const bundleScore = soloBonus + tierBonus + dualAudioPreferenceBonus + primaryEntry.score;
 
       bundles.push({
         group: b.group,

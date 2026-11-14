@@ -247,10 +247,17 @@ export class VideoEncodingManager {
           ["dub", enIdx],
         ];
       }
+      if (
+        probe.englishStreamIndex !== null &&
+        probe.englishStreamIndex !== undefined &&
+        probe.japaneseStreamIndex === probe.englishStreamIndex
+      ) {
+        return [["dub", probe.englishStreamIndex]];
+      }
       return [["sub", jpIdx]];
     }
     if (lType === "dub") {
-      return [["dub", isDual ? enIdx : jpIdx]];
+      return [["dub", probe.englishStreamIndex ?? (isDual ? enIdx : jpIdx)]];
     }
     return [["sub", jpIdx]];
   }

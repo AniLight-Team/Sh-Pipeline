@@ -1184,6 +1184,9 @@ export class PipelineEngineService {
         maxPages: 6,
       };
 
+      const hasViableDubBundle = () =>
+        topBundles.some((b) => b.isDualAudio || b.isEnglishDub);
+
       const searchByAnidbId = async (aid: number) => {
         const [allResItems, hdItems] = await Promise.all([
           AnimeToshoClient.fetchTorrents(aid, "", opts),
@@ -1193,11 +1196,11 @@ export class PipelineEngineService {
         mergeTorrents(hdItems);
         topBundles = evaluateBundles();
 
-        if (topBundles.length === 0 && wantsDub) {
+        if (wantsDub && !hasViableDubBundle()) {
           mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "dual-audio", opts));
           topBundles = evaluateBundles();
         }
-        if (topBundles.length === 0 && wantsDub) {
+        if (wantsDub && !hasViableDubBundle()) {
           mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "dub", opts));
           topBundles = evaluateBundles();
         }
@@ -1207,20 +1210,21 @@ export class PipelineEngineService {
       const hasSoloMultiQualityH264 = topBundles.some(
         (b) => b.selectionTier === "h264_multi" && b.isSolo,
       );
-      if (job.anidbId && !hasSoloMultiQualityH264) {
+      if (job.anidbId && (!hasSoloMultiQualityH264 || (wantsDub && !hasViableDubBundle()))) {
         await searchByAnidbId(job.anidbId);
       }
 
       // 3. Search canonical AniDB ID if different
       const canonicalAnidb =
         tsukihimeAnidbId ||
-        (topBundles.length === 0 && job.anilistId
+        ((topBundles.length === 0 || (wantsDub && !hasViableDubBundle())) && job.anilistId
           ? await AnimeMetadataResolver.resolveAnimapAnidbId(job.anilistId)
           : null);
       if (
         canonicalAnidb &&
         canonicalAnidb !== job.anidbId &&
-        !topBundles.some((b) => b.selectionTier === "h264_multi" && b.isSolo)
+        (!topBundles.some((b) => b.selectionTier === "h264_multi" && b.isSolo) ||
+          (wantsDub && !hasViableDubBundle()))
       ) {
         log.info(
           "PipelineEngine",
@@ -1229,8 +1233,8 @@ export class PipelineEngineService {
         await searchByAnidbId(canonicalAnidb);
       }
 
-      // 4. Fallback: Search via known titles if ID searches yielded 0 viable candidates
-      if (topBundles.length === 0 && effectiveKnownTitles.length > 0) {
+      // 4. Fallback: Search via known titles if ID searches yielded 0 viable candidates (or no dub/dual-audio when dub is requested)
+      if ((topBundles.length === 0 || (wantsDub && !hasViableDubBundle())) && effectiveKnownTitles.length > 0) {
         for (const title of effectiveKnownTitles) {
           if (!title || !title.trim()) continue;
           const clean = title.trim();
@@ -1242,16 +1246,16 @@ export class PipelineEngineService {
           mergeTorrents(allTitleItems);
           mergeTorrents(hdTitleItems);
           topBundles = evaluateBundles();
-          if (topBundles.length > 0) break;
+          if (topBundles.length > 0 && (!wantsDub || hasViableDubBundle())) break;
 
-          if (wantsDub) {
+          if (wantsDub && !hasViableDubBundle()) {
             mergeTorrents(await AnimeToshoClient.fetchTorrentsByTitle(clean, "dual-audio", opts));
             topBundles = evaluateBundles();
-            if (topBundles.length > 0) break;
+            if (hasViableDubBundle()) break;
 
             mergeTorrents(await AnimeToshoClient.fetchTorrentsByTitle(clean, "dub", opts));
             topBundles = evaluateBundles();
-            if (topBundles.length > 0) break;
+            if (hasViableDubBundle()) break;
           }
         }
       }

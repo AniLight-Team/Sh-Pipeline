@@ -430,6 +430,20 @@ export class TsukihimeClient {
       const epItems = await this.fetchEpisodeTorrents(anime.id, targetEpNum);
       addItems(epItems);
 
+      const inferredOffsets = ReleaseFilter.inferCumulativeOffsets(
+        allItems,
+        targetEpNum,
+        mergedKnownTitles,
+        episodeCount,
+      );
+      for (const off of inferredOffsets) {
+        const offsetEp: number = targetEpNum + off;
+        if (offsetEp > 0 && offsetEp !== targetEpNum) {
+          const offsetEpItems = await this.fetchEpisodeTorrents(anime.id, offsetEp);
+          addItems(offsetEpItems);
+        }
+      }
+
       const epCandidates = ReleaseFilter.selectTopCandidates(
         allItems,
         targetEpNum,
@@ -445,11 +459,25 @@ export class TsukihimeClient {
         ReleaseFilter.isHighQualityCandidate(item, effectiveEp, langType, mergedKnownTitles),
       );
 
+      const langLower = String(langType).toLowerCase();
+      const hasRequiredLangMatch =
+        langLower === "dub"
+          ? epCandidates.some(([item]) => {
+              const parsed = ReleaseFilter.parseTitle(item.title || "", mergedKnownTitles, item);
+              return Boolean(parsed.isH264 && (parsed.isDualAudio || parsed.isEnglishDub));
+            })
+          : langLower === "all"
+            ? epCandidates.some(([item]) => {
+                const parsed = ReleaseFilter.parseTitle(item.title || "", mergedKnownTitles, item);
+                return Boolean(parsed.isH264 && parsed.isDualAudio);
+              })
+            : true;
+
       // If episode endpoint already yielded strong candidates, return immediately without full pagination
-      if (hasTopQuality && epCandidates.length >= 2) {
+      if (hasTopQuality && epCandidates.length >= 2 && hasRequiredLangMatch) {
         log.success(
           "Tsukihime",
-          `Episode endpoint /animes/${anime.id}/episodes/${targetEpNum} yielded ${epItems.length} torrents (${epCandidates.length} top candidates).`,
+          `Episode endpoint /animes/${anime.id}/episodes/${targetEpNum} yielded ${allItems.length} torrents (${epCandidates.length} top candidates).`,
         );
         return { anime, torrents: allItems };
       }
