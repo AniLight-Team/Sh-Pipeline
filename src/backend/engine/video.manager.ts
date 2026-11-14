@@ -227,7 +227,14 @@ export class VideoEncodingManager {
   public getHfAccountForTarget(target?: { owner: string; bucket: string }): HuggingFaceAccount {
     if (!target) return this.getNextHfAccount();
     const account = this.hfAccounts.find(a => a.owner === target.owner && a.bucket === target.bucket);
-    if (!account) throw new Error(`Saved Hugging Face target ${target.owner}/${target.bucket} is no longer configured. Restore it before retrying.`);
+    if (!account) {
+      const fallback = this.getNextHfAccount();
+      log.warn(
+        "HF:Account",
+        `Saved Hugging Face target ${target.owner}/${target.bucket} is no longer in HF_ACCOUNTS; dynamically falling back to ${fallback.owner}/${fallback.bucket}.`,
+      );
+      return fallback;
+    }
     return account;
   }
 

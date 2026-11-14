@@ -112,11 +112,12 @@ print("VERIFIED")
   assert.match(await runUploadProcess(process.env.KIRA_TEST_PYTHON!, ["-c", script]), /VERIFIED/);
 });
 
-test("saved bucket selection survives account order changes and refuses silent retargeting", () => {
+test("saved bucket selection survives account order changes and dynamically falls back when target is removed", () => {
   const accounts = [{ owner: "one", bucket: "bucket", token: "rotated-token" }, { owner: "two", bucket: "bucket", token: "fake" }];
   const vm = new VideoEncodingManager({ kaggleAccounts: [], hfAccounts: accounts.reverse() });
   assert.equal(vm.getHfAccountForTarget({ owner: "one", bucket: "bucket" }).token, "rotated-token");
-  assert.throws(() => vm.getHfAccountForTarget({ owner: "missing", bucket: "bucket" }), /no longer configured/);
+  const fallback = vm.getHfAccountForTarget({ owner: "missing", bucket: "bucket" });
+  assert.ok(fallback.owner === "one" || fallback.owner === "two");
 });
 
 test("staging validation requires every declared quality and rejects empty files", async () => {
