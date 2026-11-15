@@ -16,7 +16,7 @@ export const jobDiscoverStageFn = inngest.createFunction(
       { limit: KIRA_DISCOVERY_CONCURRENCY },
       {
         limit: KIRA_DISCOVERY_PER_ANIME_CONCURRENCY,
-        key: "event.data.anilistId || event.data.anidbId || event.data.jobId",
+        key: "event.data.animeKey || event.data.anilistId || event.data.anidbId || event.data.jobId",
       },
     ],
     // Never enqueue duplicate concurrent discovery/download runs for the same jobId
@@ -106,7 +106,7 @@ export const jobDiscoverStageFn = inngest.createFunction(
       if (sealCheck.stagedGpuCount > 0) {
         await step.sendEvent("arm-batch-timer", {
           name: "pipeline/batch.arm-timer",
-          data: { reason: "new_staged_gpu_episode", jobId: Number(jobId) },
+          data: {},
         });
       }
     }

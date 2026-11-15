@@ -206,21 +206,21 @@ export class ReleaseFilter {
     // Use explicit audio/subtitle language arrays from Tsukihime when available
     if (Array.isArray(item?.audiolangs) && item.audiolangs.length > 0) {
       const audioLangs = item.audiolangs.map((l) => String(l).toLowerCase().trim());
-      const hasJaAudio = audioLangs.some(
-        (l) => l === "ja" || l === "jp" || l === "jpn" || l.startsWith("ja-") || l.startsWith("jpn"),
+      const hasOriginalAudio = audioLangs.some(
+        lang => /^(?:ja|jp|jpn|japanese|zh|zho|chi|cmn|chinese|ko|kor|korean)(?:[-_]|$)/.test(lang),
       );
       const hasEnAudio = audioLangs.some(
         (l) => l === "en" || l === "eng" || l.startsWith("en-") || l.startsWith("eng"),
       );
-      if (hasJaAudio && hasEnAudio) {
+      if (hasOriginalAudio && hasEnAudio) {
         isDualAudio = true;
         isEnglishDub = true;
         isForeign = false;
-      } else if (hasEnAudio && !hasJaAudio) {
+      } else if (hasEnAudio && !hasOriginalAudio) {
         isDualAudio = false;
         isEnglishDub = true;
         isForeign = false;
-      } else if (hasJaAudio && !hasEnAudio) {
+      } else if (hasOriginalAudio && !hasEnAudio) {
         isDualAudio = false;
         isEnglishDub = false;
       } else {
@@ -367,6 +367,8 @@ export class ReleaseFilter {
       isSeasonBatch,
       isDualAudio,
       isEnglishDub,
+      lacksSubtitles: /\b(?:raw|no[ ._-]*subs?(?:titles?)?|unsubbed)\b/i.test(lower)
+        || (Array.isArray(item?.sublangs) && item.sublangs.length === 0),
       isForeign,
       isCam,
       isBluray,
@@ -452,7 +454,7 @@ export class ReleaseFilter {
       if (parsed.isForeign && !parsed.isEnglishDub && !parsed.isDualAudio) return false;
       if (!parsed.isEnglishDub && !parsed.isDualAudio && !parsed.groupLower.includes("dub")) return false;
     } else if (lang === "sub") {
-      if (parsed.isForeign && !parsed.isDualAudio) return false;
+      if (parsed.lacksSubtitles || (parsed.isForeign && !parsed.isDualAudio)) return false;
       if (parsed.isEnglishDub && !parsed.isDualAudio) return false;
     } else {
       // lang === "all"

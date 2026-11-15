@@ -8,6 +8,7 @@ import {
   KIRA_DISCOVERY_CONCURRENCY,
 } from "../../config.js";
 import { log } from "../../utils/logger.js";
+import { discoveryEvent, queuedDiscoveryCondition } from "../../engine/job-scheduling.js";
 
 export const batchExecuteFn = inngest.createFunction(
   {
@@ -136,33 +137,17 @@ export const batchExecuteFn = inngest.createFunction(
       });
 
       const cap = await PipelineEngineService.checkStorageCapacityForDownload();
-      let resumedJobs: {
-        id: number;
-        anilistId: number | null;
-        animeId: number | null;
-        anidbId: number | null;
-        episodeNumber: number;
-        types: ("sub" | "dub")[];
-        knownTitles: string[];
-      }[] = [];
+      let resumedJobs: ReturnType<typeof discoveryEvent>[] = [];
 
       if (cap.allowed) {
         const queuedRows = await db
           .select()
           .from(schema.pipelineJob)
-          .where(eq(schema.pipelineJob.status, "queued"))
+          .where(queuedDiscoveryCondition())
           .orderBy(asc(schema.pipelineJob.id))
           .limit(KIRA_DISCOVERY_CONCURRENCY);
 
-        resumedJobs = queuedRows.map((j) => ({
-          id: j.id,
-          anilistId: j.anilistId,
-          animeId: j.animeId,
-          anidbId: j.anidbId,
-          episodeNumber: j.episodeNumber,
-          types: j.types,
-          knownTitles: j.knownTitles || [],
-        }));
+        resumedJobs = queuedRows.map(job => discoveryEvent(job, "batch-freed"));
       }
 
       return {
@@ -179,20 +164,8 @@ export const batchExecuteFn = inngest.createFunction(
       });
     }
 
-    for (const rJob of drainResult.resumedJobs) {
-      await step.sendEvent(`resume-queued-job-${rJob.id}`, {
-        name: "pipeline/job.discover",
-        id: `pipe-job-${rJob.id}-freed-${Date.now()}`,
-        data: {
-          jobId: rJob.id,
-          anilistId: rJob.anilistId,
-          animeId: rJob.animeId,
-          anidbId: rJob.anidbId,
-          episodeNumber: rJob.episodeNumber,
-          types: rJob.types,
-          knownTitles: rJob.knownTitles,
-        },
-      });
+    for (const event of drainResult.resumedJobs) {
+      await step.sendEvent(`resume-queued-job-${event.data.jobId}`, event);
     }
 
     return {

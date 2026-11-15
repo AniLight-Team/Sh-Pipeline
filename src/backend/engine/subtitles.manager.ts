@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import { createHash } from "node:crypto";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
@@ -46,7 +47,7 @@ export interface MkvStreamProbe {
   subtitles: any[];
   isDualAudio: boolean;
   classifiedAudio: ClassifiedAudioTrack[];
-  japaneseStreamIndex: number;
+  japaneseStreamIndex: number | null;
   englishStreamIndex: number | null;
   videoCodec: string;
   pixelFormat: string;
@@ -60,6 +61,7 @@ export function inspectMkvStreamsSync(filepath: string): Promise<MkvStreamProbe>
     execFile(
       "ffprobe",
       ["-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", filepath],
+      { timeout: 30_000 },
       (err, stdout, stderr) => {
         if (err) {
           return reject(new Error(`Failed to probe media streams for ${filepath}: ${stderr || err.message}`));
@@ -124,58 +126,24 @@ export function inspectMkvStreamsSync(filepath: string): Promise<MkvStreamProbe>
             if (isCommentary) continue;
 
             if (
-              ORIGINAL_LANGS.has(lang) ||
-              ["japanese", "jpn", "original", "mandarin", "korean"].some((k) => title.includes(k))
+              ORIGINAL_LANGS.has(lang) || lang.startsWith("ja-") ||
+              (lang === "und" && /\b(?:japanese|jpn|original|mandarin|korean)\b/.test(title))
             ) {
               originalCandidates.push(idx);
             } else if (
-              ENGLISH_LANGS.has(lang) ||
-              ["english", "eng", "dub"].some((k) => title.includes(k))
+              ENGLISH_LANGS.has(lang) || lang.startsWith("en-") ||
+              (lang === "und" && /\b(?:english|eng)\b/.test(title))
             ) {
               englishCandidates.push(idx);
             }
           }
 
-          let nonCommentary = classifiedAudio.filter((a) => !a.isCommentary).map((a) => a.audioIndex);
-          if (nonCommentary.length === 0 && classifiedAudio.length > 0) {
-            nonCommentary = [0];
-          }
-
-          let japaneseStreamIdx = originalCandidates[0] ?? null;
-          let englishStreamIdx = englishCandidates[0] ?? null;
-
-          if (nonCommentary.length >= 2) {
-            if (japaneseStreamIdx !== null && englishStreamIdx === null) {
-              for (const idx of nonCommentary) {
-                if (idx !== japaneseStreamIdx) {
-                  const otherLang = classifiedAudio[idx].language;
-                  if (["und", "eng", "en", ""].includes(otherLang)) {
-                    englishStreamIdx = idx;
-                    break;
-                  }
-                }
-              }
-            } else if (englishStreamIdx !== null && japaneseStreamIdx === null) {
-              for (const idx of nonCommentary) {
-                if (idx !== englishStreamIdx) {
-                  const otherLang = classifiedAudio[idx].language;
-                  if (["und", "jpn", "ja", ""].includes(otherLang)) {
-                    japaneseStreamIdx = idx;
-                    break;
-                  }
-                }
-              }
-            }
-          }
-
-          const isDual =
-            japaneseStreamIdx !== null &&
-            englishStreamIdx !== null &&
-            japaneseStreamIdx !== englishStreamIdx;
-
-          if (japaneseStreamIdx === null) {
-            japaneseStreamIdx = nonCommentary[0] ?? 0;
-          }
+          const englishStreamIdx = englishCandidates[0] ?? null;
+          const mainAudio = classifiedAudio.filter(track => !track.isCommentary);
+          const untaggedOriginal = englishStreamIdx === null && mainAudio.length === 1 &&
+            ["und", ""].includes(mainAudio[0].language) ? mainAudio[0].audioIndex : null;
+          const japaneseStreamIdx = originalCandidates[0] ?? untaggedOriginal;
+          const isDual = japaneseStreamIdx !== null && englishStreamIdx !== null;
 
           resolve({
             video: videoStreams.length > 0 ? videoStreams : streams.filter((s: any) => s.codec_type === "video"),
@@ -235,16 +203,16 @@ export class SubtitleManager {
       tha: "th", th: "th",
       vie: "vi", vi: "vi",
     };
-    return mapping[lang] || lang;
+    return mapping[lang] || lang.replaceAll("_", "-");
   }
 
   public async extractSubtitlesFromMkv(
     mkvPath: string,
     outputDir: string,
+    probe?: MkvStreamProbe,
   ): Promise<ExtractedSubtitleTrack[]> {
     await fs.promises.mkdir(outputDir, { recursive: true });
-    const probe = await inspectMkvStreamsSync(mkvPath);
-    const subStreams = probe.subtitles || [];
+    const subStreams = (probe ?? await inspectMkvStreamsSync(mkvPath)).subtitles;
 
     const extracted: ExtractedSubtitleTrack[] = [];
     const usedLangKeys = new Set<string>();
@@ -265,7 +233,7 @@ export class SubtitleManager {
       }
 
       const rawLang = tags.language || `sub${idx}`;
-      const baseLang = SubtitleManager.normalizeLangCode(rawLang, idx);
+      const baseLang = SubtitleManager.normalizeLangCode(rawLang, idx).replace(/[^a-z0-9-]/g, "-").slice(0, 48);
       const rawTitle = (tags.title || "").trim();
       const titleLower = rawTitle.toLowerCase();
 
@@ -275,7 +243,7 @@ export class SubtitleManager {
         !titleLower.includes("full");
       const isSdh =
         Boolean(disposition.hearing_impaired) ||
-        ["sdh", "cc", "hearing"].some((k) => titleLower.includes(k));
+        /\b(?:sdh|cc|hearing)\b/.test(titleLower);
 
       let langKey: string;
       let label: string;
@@ -315,8 +283,8 @@ export class SubtitleManager {
       ];
 
       try {
-        await execFileAsync("ffmpeg", cmdArgs);
-        if (fs.existsSync(vttPath) && fs.statSync(vttPath).size > 50) {
+        await execFileAsync("ffmpeg", cmdArgs, { timeout: 60_000 });
+        if ((await fs.promises.readFile(vttPath, "utf8")).includes(" --> ")) {
           extracted.push({
             language: uniqueLangKey,
             baseLanguage: baseLang,
@@ -332,15 +300,6 @@ export class SubtitleManager {
       }
     }
 
-    if (extracted.length > 0 && !extracted.some((x) => x.isDefaultSub)) {
-      const dialogueTracks = extracted.filter((x) => x.role === "dialogue");
-      if (dialogueTracks.length > 0) {
-        dialogueTracks[0].isDefaultSub = true;
-      } else {
-        extracted[0].isDefaultSub = true;
-      }
-    }
-
     return extracted;
   }
 
@@ -350,47 +309,38 @@ export class SubtitleManager {
     epNum: number,
     langType: string,
   ): Promise<R2SubtitleRecord[]> {
-    if (!this.s3Client) {
-      log.warn("Subtitles", "Captions R2 client not configured. Subtitle upload skipped.");
-      return [];
-    }
+    if (subtitles.length === 0) return [];
+    if (!this.s3Client) throw new Error("Captions R2 client is not configured");
 
     const effectiveBucketType = langType === "dub" ? "dub" : "sub";
     const uploadedRecords: R2SubtitleRecord[] = [];
 
     for (const sub of subtitles) {
-      const key = `captions/${animeId}/${epNum}/${effectiveBucketType}/${sub.language}.vtt`;
-      const publicUrl = DEFAULT_SUBTITLE_PUBLIC_BASE
-        ? `${DEFAULT_SUBTITLE_PUBLIC_BASE}/${key}`
-        : key;
-      try {
-        const fileBuffer = await fs.promises.readFile(sub.filePath);
-        await this.s3Client.send(
-          new PutObjectCommand({
-            Bucket: this.bucket,
-            Key: key,
-            Body: fileBuffer,
-            ContentType: "text/vtt; charset=utf-8",
-          }),
-        );
+      const fileBuffer = await fs.promises.readFile(sub.filePath);
+      const hash = createHash("sha256").update(fileBuffer).digest("hex");
+      const key = `captions/${animeId}/${epNum}/${effectiveBucketType}/${hash}/${sub.language}.vtt`;
+      const publicUrl = DEFAULT_SUBTITLE_PUBLIC_BASE ? `${DEFAULT_SUBTITLE_PUBLIC_BASE}/${key}` : key;
+      await this.s3Client.send(new PutObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+        Body: fileBuffer,
+        ContentType: "text/vtt; charset=utf-8",
+        CacheControl: "public, max-age=31536000, immutable",
+      }), { abortSignal: AbortSignal.timeout(30_000) });
 
-        uploadedRecords.push({
-          anime_id: animeId,
-          episode_number: epNum,
-          type: effectiveBucketType,
-          language: sub.language,
-          path: key,
-          role: sub.role,
-          label: sub.label,
-          url: publicUrl,
-          default_sub: sub.isDefaultSub,
-          default_dub: sub.isDefaultDub,
-        });
-
-        log.success("Subtitles", `Subtitle uploaded to R2: ${key} (${sub.label})`);
-      } catch (err: any) {
-        log.error("Subtitles", `Failed to upload ${key} to R2: ${err?.message || err}`);
-      }
+      uploadedRecords.push({
+        anime_id: animeId,
+        episode_number: epNum,
+        type: effectiveBucketType,
+        language: sub.language,
+        path: key,
+        role: sub.role,
+        label: sub.label,
+        url: publicUrl,
+        default_sub: sub.isDefaultSub,
+        default_dub: sub.isDefaultDub,
+      });
+      log.success("Subtitles", `Subtitle uploaded to R2: ${key} (${sub.label})`);
     }
 
     return uploadedRecords;
@@ -400,17 +350,18 @@ export class SubtitleManager {
     r2SubRecords: R2SubtitleRecord[],
     streamType: "sub" | "dub",
   ): PipelineSubtitleTrack[] {
-    return (r2SubRecords || []).map((r) => {
-      const isDefault = Boolean(streamType === "dub" ? r.default_dub : r.default_sub);
-      const url = r.url || (DEFAULT_SUBTITLE_PUBLIC_BASE ? `${DEFAULT_SUBTITLE_PUBLIC_BASE}/${r.path}` : r.path);
-      return {
-        language: r.language,
-        label: r.label || r.language.toUpperCase(),
-        role: (r.role as "dialogue" | "signs" | "sdh") || "dialogue",
-        path: r.path,
-        url,
-        isDefault,
-      };
-    });
+    const tracks = r2SubRecords.filter(record => record.type === streamType)
+      .sort((a, b) => a.language.localeCompare(b.language));
+    const preferred = streamType === "dub"
+      ? tracks.find(track => track.default_dub)
+      : tracks.find(track => track.default_sub) ?? tracks.find(track => track.role !== "signs");
+    return tracks.map(record => ({
+      language: record.language,
+      label: record.label || record.language.toUpperCase(),
+      role: (record.role as PipelineSubtitleTrack["role"]) || "dialogue",
+      path: record.path,
+      url: record.url || (DEFAULT_SUBTITLE_PUBLIC_BASE ? `${DEFAULT_SUBTITLE_PUBLIC_BASE}/${record.path}` : record.path),
+      isDefault: record === preferred,
+    }));
   }
 }

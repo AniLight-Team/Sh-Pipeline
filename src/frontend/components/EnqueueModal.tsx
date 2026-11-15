@@ -94,7 +94,6 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
   const [overrideAnidbId, setOverrideAnidbId] = useState("");
   const [overrideAnimeId, setOverrideAnimeId] = useState("");
   const [knownTitles, setKnownTitles] = useState("");
-  const [callbackUrl, setCallbackUrl] = useState("");
 
   useEffect(() => {
     if (!isOpen) {
@@ -220,7 +219,6 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
           .split(",")
           .map((t) => t.trim())
           .filter(Boolean),
-        callbackUrl: callbackUrl.trim() || undefined,
       };
 
       const res = await fetch("/api/pipeline/enqueue", {
@@ -656,18 +654,6 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 />
               </div>
 
-              <div>
-                <label className="block text-[#716c63] text-[11px] mb-1">
-                  Webhook Callback URL
-                </label>
-                <input
-                  type="url"
-                  placeholder="http://127.0.0.1:4000/api/internal/pipeline/completed"
-                  value={callbackUrl}
-                  onChange={(e) => setCallbackUrl(e.target.value)}
-                  className="w-full px-3 py-1.5 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] text-[#302e2a] font-mono text-xs focus:outline-none focus:border-indigo-500"
-                />
-              </div>
             </div>
           )}
 

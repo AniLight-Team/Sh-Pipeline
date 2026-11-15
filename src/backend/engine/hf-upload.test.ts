@@ -144,7 +144,7 @@ test("completion persists callback intent atomically and does not requeue on cal
   t.mock.method(db, "update", () => ({ set: (values: any) => {
     writes.push(values); return { where: async () => {} };
   } }) as any);
-  t.mock.method(PipelineEngineService as any, "deliverCallbackPayload", async () => { throw new Error("simulated callback outage"); });
+  t.mock.method(PipelineEngineService, "retryJobCallback", async () => { throw new Error("simulated callback outage"); });
   t.mock.method(PipelineEngineService, "cleanupJobStagedFiles", async () => {});
   await (PipelineEngineService as any).persistAndDeliverJobCompletion({
     id: 123, types: ["sub"], episodeNumber: 1, metadata: { callbackDelivered: true },

@@ -41,6 +41,8 @@ export type CandidateSelectionTier =
 export type PipelineExecutionType = "vm_remux" | "kaggle_gpu";
 
 export type PipelineExecutionPolicy = "all" | "vm_remux_only" | "kaggle_gpu_only";
+export type StreamType = "sub" | "dub";
+export type JobKind = "release" | "stream_refresh" | "caption_refresh";
 
 export interface ParsedReleaseTitle {
   group: string;
@@ -52,6 +54,7 @@ export interface ParsedReleaseTitle {
   isSeasonBatch?: boolean;
   isDualAudio: boolean;
   isEnglishDub: boolean;
+  lacksSubtitles: boolean;
   isForeign: boolean;
   isCam: boolean;
   isBluray: boolean;
@@ -108,7 +111,7 @@ export interface MkvStreamProbe {
   subtitles: any[];
   isDualAudio: boolean;
   classifiedAudio: ClassifiedAudioTrack[];
-  japaneseStreamIndex: number;
+  japaneseStreamIndex: number | null;
   englishStreamIndex: number | null;
   videoCodec?: string;
   pixelFormat?: string;
@@ -199,6 +202,9 @@ export interface PipelineEpisodeResult {
   anidbId?: number | null;
   episodeNumber: number;
   type: "sub" | "dub";
+  kind?: JobKind;
+  sourceJobId?: number | null;
+  sourceUrl?: string;
   sources: PipelineEncodedSource[];
   subtitles: PipelineSubtitleTrack[];
   metadata?: Record<string, any>;
@@ -210,11 +216,14 @@ export interface EnqueueRequest {
   anilistId?: number;
   animeId?: number;
   anidbId?: number;
-  episodeNumbers: number[];
+  episodeNumbers?: number[];
+  episodes?: { episodeNumber: number; types: StreamType[]; sourceJobId?: number | null; sourceUrl?: string }[];
+  kind?: JobKind;
+  requestId?: string;
   types?: ("sub" | "dub")[];
   knownTitles?: string[];
+  episodeCount?: number;
   metadata?: Record<string, any>;
-  callbackUrl?: string;
   executionPolicy?: PipelineExecutionPolicy;
 }
 

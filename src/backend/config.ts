@@ -31,7 +31,7 @@ export const NODE_ENV = process.env.NODE_ENV || "development";
 export const IS_PROD = NODE_ENV === "production";
 export const MAIN_BACKEND_URL = (process.env.MAIN_BACKEND_URL || "http://127.0.0.1:4000").replace(/\/+$/, "");
 export const INNGEST_BASE_URL = (process.env.INNGEST_BASE_URL || "http://127.0.0.1:8288").replace(/\/+$/, "");
-export const INTERNAL_SECRET = process.env.INTERNAL_SECRET || "anilight-pipeline-internal-secret-2026";
+export const INTERNAL_SECRET = process.env.INTERNAL_SECRET || "";
 export const DATABASE_URL = process.env.DATABASE_URL || "";
 
 // ── Captions Cloudflare R2 Credentials ─────────────────────────

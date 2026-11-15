@@ -3,9 +3,9 @@ import path from "path";
 import crypto from "crypto";
 import PQueue from "p-queue";
 import { db, schema } from "../db/index.js";
-import { eq, and, inArray, isNull, asc, sql } from "drizzle-orm";
+import { eq, and, inArray, isNull, isNotNull, asc, sql, or, lte } from "drizzle-orm";
 import { TransmissionClient } from "./transmission.client.js";
-import { SubtitleManager, inspectMkvStreamsSync } from "./subtitles.manager.js";
+import { SubtitleManager, inspectMkvStreamsSync, type ExtractedSubtitleTrack, type MkvStreamProbe } from "./subtitles.manager.js";
 import { VideoEncodingManager } from "./video.manager.js";
 import { AnimeToshoClient, type FetchTorrentsOptions } from "./animetosho.client.js";
 import { TsukihimeClient } from "./tsukihime.client.js";
@@ -34,7 +34,7 @@ import {
   getKiraStagingDir,
   loadAccountsFromEnv,
 } from "../config.js";
-import { notifyMainBackendRevalidate } from "../utils/notifier.js";
+import { CALLBACK_DELAYS_MS, RELEASE_DISCOVERY_DELAYS_MS, discoveryEvent, jobAnimeCondition, queuedDiscoveryCondition } from "./job-scheduling.js";
 import { inngest } from "../inngest/client.js";
 import type {
   AnimeToshoItem,
@@ -97,6 +97,7 @@ export class PipelineEngineService {
   private static readonly activeVmRemuxJobIds = new Set<number>();
   private static readonly activeExecutingBatchIds = new Set<number>();
   private static readonly activeDiscoveringJobIds = new Set<number>();
+  private static readonly torrentFileTransfers = new Map<string, Promise<unknown>>();
   private static isDrainingVmRemux = false;
   private static isReconcilingEncoding = false;
 
@@ -294,6 +295,8 @@ export class PipelineEngineService {
         ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "quality_count" integer DEFAULT 1 NOT NULL;
         ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "staged_qualities" jsonb;
         ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "qualities_payload" jsonb;
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "discover_after" timestamp with time zone;
+        ALTER TABLE "pipeline_encoding_job" ADD COLUMN IF NOT EXISTS "callback_after" timestamp with time zone;
       `);
 
       await db.execute(sql`
@@ -307,6 +310,8 @@ export class PipelineEngineService {
         CREATE INDEX IF NOT EXISTS "sh_pipeline_job_anime_idx" ON "pipeline_encoding_job" ("anime_id");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_job_anidb_idx" ON "pipeline_encoding_job" ("anidb_id", "episode_number");
         CREATE INDEX IF NOT EXISTS "sh_pipeline_job_batch_idx" ON "pipeline_encoding_job" ("batch_id");
+        CREATE INDEX IF NOT EXISTS "sh_pipeline_job_discover_after_idx" ON "pipeline_encoding_job" ("status", "discover_after");
+        CREATE INDEX IF NOT EXISTS "sh_pipeline_job_callback_after_idx" ON "pipeline_encoding_job" ("status", "callback_after");
       `);
 
       tablesInitialized = true;
@@ -556,7 +561,6 @@ export class PipelineEngineService {
       types = ["sub", "dub"],
       knownTitles = [],
       metadata = {},
-      callbackUrl,
     } = req;
 
     if (!anilistId && metadata?.anilistId) {
@@ -568,10 +572,7 @@ export class PipelineEngineService {
       if (!isNaN(parsed) && parsed > 0) animeId = parsed;
     }
 
-    const effectiveCallbackUrl =
-      callbackUrl || `${MAIN_BACKEND_URL}/api/internal/pipeline/completed`;
-
-    if (anilistId) {
+    if (anilistId && (!anidbId || !animeId || knownTitles.length === 0)) {
       try {
         const resolved = await AnimeMetadataResolver.resolve(anilistId);
         if (resolved) {
@@ -605,86 +606,88 @@ export class PipelineEngineService {
       }
     }
 
-    const normalizedTypes = Array.from(new Set(types.filter((t) => t === "sub" || t === "dub"))) as ("sub" | "dub")[];
-    if (normalizedTypes.length === 0) {
-      normalizedTypes.push("sub");
+    const kind = req.kind ?? "stream_refresh";
+    const episodes: NonNullable<EnqueueRequest["episodes"]> = req.episodes ?? (episodeNumbers ?? []).map(episodeNumber => ({ episodeNumber, types }));
+    const targets = new Map<string, { episodeNumber: number; type: "sub" | "dub"; sourceJobId?: number | null; sourceUrl?: string }>();
+    for (const episode of episodes) {
+      for (const type of episode.types) {
+        targets.set(`${episode.episodeNumber}:${type}`, {
+          episodeNumber: episode.episodeNumber,
+          type,
+          sourceJobId: episode.sourceJobId,
+          sourceUrl: episode.sourceUrl,
+        });
+      }
     }
 
-    const queuedJobs: EnqueueResponse["queuedJobs"] = [];
-    let skippedExisting = 0;
+    // Serialize overlapping enqueue requests for the same anime across processes.
+    const animeKey = animeId ? `anime:${animeId}` : anilistId ? `anilist:${anilistId}` : `anidb:${anidbId}`;
+    return db.transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`kira-enqueue:${animeKey}`}, 0))`);
+      const queuedJobs: EnqueueResponse["queuedJobs"] = [];
+      let skippedExisting = 0;
+      const pending = ["queued", "downloading", "staged", "encoding", "download_paused"];
 
-    for (const ep of episodeNumbers) {
-      const conditions = [
-        eq(schema.pipelineJob.episodeNumber, ep),
-        inArray(schema.pipelineJob.status, ["queued", "downloading", "staged", "encoding"]),
-      ];
-
-      if (anilistId) {
-        conditions.push(eq(schema.pipelineJob.anilistId, anilistId));
-      } else if (anidbId) {
-        conditions.push(eq(schema.pipelineJob.anidbId, anidbId));
-      } else if (animeId) {
-        conditions.push(eq(schema.pipelineJob.animeId, animeId));
-      }
-
-      const existing = await db.query.pipelineJob.findFirst({
-        where: and(...conditions),
-      });
-
-      if (existing) {
-        const existingTypes = Array.isArray(existing.types) ? existing.types : ["sub"];
-        const mergedTypes = Array.from(new Set([...existingTypes, ...normalizedTypes])) as ("sub" | "dub")[];
-        if (existing.status === "queued" && mergedTypes.length > existingTypes.length) {
-          await db
-            .update(schema.pipelineJob)
-            .set({
-              types: mergedTypes,
-              updatedAt: new Date(),
-            })
-            .where(eq(schema.pipelineJob.id, existing.id));
+      for (const { episodeNumber, type, sourceJobId, sourceUrl } of targets.values()) {
+        const existing = await tx.query.pipelineJob.findFirst({
+          columns: { id: true },
+          where: and(
+            jobAnimeCondition({ animeId, anilistId, anidbId }),
+            eq(schema.pipelineJob.episodeNumber, episodeNumber),
+            sql`${schema.pipelineJob.types} @> ${JSON.stringify([type])}::jsonb`,
+            or(
+              req.requestId ? sql`${schema.pipelineJob.metadata}->>'requestId' = ${req.requestId}` : undefined,
+              kind === "release"
+                ? or(
+                    sql`${schema.pipelineJob.metadata}->>'kind' = 'release'`,
+                    and(sql`${schema.pipelineJob.metadata}->>'kind' is null`, inArray(schema.pipelineJob.status, pending)),
+                  )
+                : and(
+                    inArray(schema.pipelineJob.status, pending),
+                    sql`coalesce(${schema.pipelineJob.metadata}->>'kind', 'stream_refresh') = ${kind}`,
+                    kind === "caption_refresh"
+                      ? sql`${schema.pipelineJob.metadata}->>'sourceJobId' is not distinct from ${sourceJobId == null ? null : String(sourceJobId)}::text`
+                      : undefined,
+                    kind === "caption_refresh" && sourceJobId == null
+                      ? sql`${schema.pipelineJob.metadata}->>'sourceUrl' is not distinct from ${sourceUrl ?? null}::text`
+                      : undefined,
+                  ),
+            ),
+          ),
+        });
+        if (existing) {
+          skippedExisting++;
+          continue;
         }
-        skippedExisting++;
-        continue;
-      }
 
-      const [inserted] = await db
-        .insert(schema.pipelineJob)
-        .values({
-          anilistId: anilistId || null,
-          animeId: animeId || null,
-          anidbId: anidbId || null,
-          episodeNumber: ep,
-          types: normalizedTypes,
-          status: "queued",
-          pipelineType: "vm_remux",
+        const [job] = await tx.insert(schema.pipelineJob).values({
+          animeId,
+          anilistId,
+          anidbId,
+          episodeNumber,
+          types: [type],
           knownTitles,
           metadata: {
             ...metadata,
-            animeId: animeId || null,
-            anilistId: anilistId || null,
+            kind,
+            totalEpisodes: req.episodeCount ?? metadata.totalEpisodes,
+            requestId: req.requestId,
+            sourceJobId: kind === "caption_refresh" ? sourceJobId ?? null : undefined,
+            sourceUrl: kind === "caption_refresh" ? sourceUrl : undefined,
             ...(req.executionPolicy ? { executionPolicy: req.executionPolicy } : {}),
           },
-          callbackUrl: effectiveCallbackUrl,
-          heartbeatAt: new Date(),
-        })
-        .returning();
-
-      queuedJobs.push({
-        id: inserted.id,
-        anilistId: inserted.anilistId,
-        animeId: inserted.animeId,
-        anidbId: inserted.anidbId,
-        episodeNumber: inserted.episodeNumber,
-        types: inserted.types,
-      });
-
-      log.info(
-        "PipelineEngine",
-        `Enqueued Job #${inserted.id} -> AniList: ${anilistId || "n/a"} | AnimeId: ${animeId || "n/a"} | AniDB: ${anidbId || "n/a"} Ep ${ep} (${normalizedTypes.join("/")})`,
-      );
-    }
-
-    return { queuedJobs, skippedExisting };
+        }).returning({
+          id: schema.pipelineJob.id,
+          animeId: schema.pipelineJob.animeId,
+          anilistId: schema.pipelineJob.anilistId,
+          anidbId: schema.pipelineJob.anidbId,
+          episodeNumber: schema.pipelineJob.episodeNumber,
+          types: schema.pipelineJob.types,
+        });
+        queuedJobs.push(job);
+      }
+      return { queuedJobs, skippedExisting };
+    });
   }
 
   /**
@@ -696,7 +699,24 @@ export class PipelineEngineService {
    * - If the batch torrent is a single monolithic combined file or archive where 1 episode cannot be isolated,
    *   it immediately aborts and removes the torrent (`no fallback to download the whole batch`).
    */
-  private static async downloadCandidateEpisodeToStaging(params: {
+  private static async downloadCandidateEpisodeToStaging(
+    params: Parameters<typeof PipelineEngineService.transferEpisodeFile>[0],
+  ) {
+    const { candidate, effectiveEp } = params;
+    const torrentKey = candidate.info_hash || candidate.magnet_uri?.match(/urn:btih:([^&]+)/i)?.[1]
+      || candidate.torrent_url || candidate.title;
+    const key = `${torrentKey.toLowerCase()}:${effectiveEp}`;
+    const previous = this.torrentFileTransfers.get(key) ?? Promise.resolve();
+    const transfer = previous.catch(() => {}).then(() => this.transferEpisodeFile(params));
+    this.torrentFileTransfers.set(key, transfer);
+    try {
+      return await transfer;
+    } finally {
+      if (this.torrentFileTransfers.get(key) === transfer) this.torrentFileTransfers.delete(key);
+    }
+  }
+
+  private static async transferEpisodeFile(params: {
     jobId: number;
     episodeNumber: number;
     knownTitles: string[];
@@ -877,7 +897,7 @@ export class PipelineEngineService {
    * 6. For Tier 1 (`h264_multi`), downloads same-group 720p & 480p in parallel!
    */
   public static async discoverAndStageJob(jobId: number): Promise<{
-    status: "staged" | "download_paused" | "skipped" | "failed";
+    status: "staged" | "completed" | "retry_scheduled" | "download_paused" | "skipped" | "failed";
     jobId: number;
     pipelineType?: PipelineExecutionType;
     selectionTier?: CandidateSelectionTier;
@@ -894,21 +914,11 @@ export class PipelineEngineService {
       return { status: "failed", jobId, error: "Job not found" };
     }
 
-    if (job.status === "completed" || job.status === "encoding") {
-      return {
-        status: "staged",
-        jobId,
-        pipelineType: this.isJobVmRemux(job) ? "vm_remux" : "kaggle_gpu",
-        sizeBytes: job.sizeBytes || 0,
-      };
-    }
+    if (job.status !== "queued" && job.status !== "staged") return { status: "skipped", jobId };
+    if (job.discoverAfter && job.discoverAfter.getTime() > Date.now()) return { status: "skipped", jobId };
 
     // Prevent duplicate concurrent downloads/discovery for the same jobId (which creates orphaned MKVs on disk)
-    const fiveMinsAgoMs = Date.now() - 5 * 60 * 1000;
-    if (
-      this.activeDiscoveringJobIds.has(jobId) ||
-      (job.status === "downloading" && job.heartbeatAt && job.heartbeatAt.getTime() > fiveMinsAgoMs)
-    ) {
+    if (this.activeDiscoveringJobIds.has(jobId)) {
       log.info(
         "PipelineEngine",
         `[Stage 1 Discovery] Job #${jobId} is already actively downloading; skipping duplicate run.`,
@@ -1005,7 +1015,7 @@ export class PipelineEngineService {
           heartbeatAt: new Date(),
           updatedAt: new Date(),
         })
-        .where(eq(schema.pipelineJob.id, jobId));
+        .where(and(eq(schema.pipelineJob.id, jobId), eq(schema.pipelineJob.status, job.status)));
 
       await this.drainVmRemuxQueue().catch(() => {});
       await this.sealAvailableBatches({
@@ -1020,26 +1030,30 @@ export class PipelineEngineService {
       };
     }
 
+    const [claimed] = await db.update(schema.pipelineJob).set({
+      status: "downloading",
+      stagedFilePath: null,
+      stagedQualities: null,
+      discoverAfter: null,
+      heartbeatAt: new Date(),
+      updatedAt: new Date(),
+    }).where(and(
+      eq(schema.pipelineJob.id, jobId),
+      job.status === "queued" ? queuedDiscoveryCondition() : eq(schema.pipelineJob.status, "staged"),
+    )).returning({ id: schema.pipelineJob.id });
+    if (!claimed) return { status: "skipped", jobId };
+
     this.activeDiscoveringJobIds.add(jobId);
-
-    // Clean up any stale/leftover staged files from prior failed/partial attempts for this jobId before re-downloading
     await this.cleanupJobStagedFiles(job).catch(() => {});
-
-    await db
-      .update(schema.pipelineJob)
-      .set({
-        status: "downloading",
-        stagedFilePath: null,
-        stagedQualities: null,
-        heartbeatAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.pipelineJob.id, jobId));
 
     const transmission = new TransmissionClient();
     const subtitles = new SubtitleManager();
     const videoManager = new VideoEncodingManager();
     const stagingDir = getKiraStagingDir();
+    const tempSubsDir = path.join(stagingDir, `subs_${crypto.randomUUID()}`);
+    const downloadedPaths = new Set<string>();
+    const kind = job.metadata?.kind;
+    const captionsOnly = kind === "caption_refresh";
 
     try {
       const entries = await fs.promises.readdir(stagingDir, { withFileTypes: true }).catch(() => []);
@@ -1094,7 +1108,7 @@ export class PipelineEngineService {
             if (Array.isArray(item.audiolangs) && item.audiolangs.length > 0 && !existing.audiolangs?.length) {
               existing.audiolangs = item.audiolangs;
             }
-            if (Array.isArray(item.sublangs) && item.sublangs.length > 0 && !existing.sublangs?.length) {
+            if (Array.isArray(item.sublangs) && (existing.sublangs === undefined || (item.sublangs.length > 0 && existing.sublangs.length === 0))) {
               existing.sublangs = item.sublangs;
             }
             if (item.group_name && !existing.group_name) existing.group_name = item.group_name;
@@ -1135,127 +1149,176 @@ export class PipelineEngineService {
 
       let topBundles: ReleaseCandidateBundle[] = [];
 
-      // 1. Search Tsukihime API first (returns all resolutions 1080p/720p/480p for the episode)
-      let tsukihimeAnidbId: number | null = null;
-      try {
-        const tsukiLookup = {
-          tsukihimeId: job.metadata?.tsukihimeId ? Number(job.metadata.tsukihimeId) : null,
-          anilistId: job.anilistId,
-          malId: job.metadata?.malId ? Number(job.metadata.malId) : null,
-          anidbId: job.anidbId,
-        };
-        const { anime: tsukiAnime, torrents: tsukiTorrents } = await TsukihimeClient.fetchTorrents(
-          tsukiLookup,
-          {
-            targetEp: job.episodeNumber,
-            langType: langTypeForSearch,
-            knownTitles: effectiveKnownTitles,
-            episodeCount: totalExpectedEps,
-            maxPages: 4,
+      const sourceJobId = captionsOnly ? job.metadata?.sourceJobId : null;
+      if (captionsOnly) {
+        // Reuse the input for the published video so the extracted tracks match its timing.
+        const sourceUrl = job.metadata?.sourceUrl;
+        const source = await db.query.pipelineJob.findFirst({
+          where: and(
+            jobAnimeCondition(job),
+            eq(schema.pipelineJob.episodeNumber, job.episodeNumber),
+            eq(schema.pipelineJob.status, "completed"),
+            sourceJobId ? eq(schema.pipelineJob.id, sourceJobId) : sql`exists (
+              select from jsonb_array_elements(coalesce(${schema.pipelineJob.resultPayload}->'allTrackPayloads',
+                jsonb_build_array(${schema.pipelineJob.resultPayload}))) track
+              cross join lateral jsonb_array_elements(track->'sources') source
+              where track->>'type' = ${job.types[0]} and
+                (source->>'url' = ${sourceUrl ?? null} or source->>'downloadUrl' = ${sourceUrl ?? null})
+            )`,
+          ),
+        });
+        if (!source?.torrentMagnet || !source.torrentTitle || !source.types.some(type => job.types.includes(type))) {
+          throw new Error("The torrent for the published stream could not be recovered. Rebuild the stream to record its source.");
+        }
+        const quality = (Object.keys(source.qualitiesPayload ?? {})[0] ?? "1080p") as VideoResolutionQuality;
+        const isMagnet = source.torrentMagnet.startsWith("magnet:?");
+        const primaryEntry = {
+          quality,
+          item: {
+            title: source.torrentTitle,
+            magnet_uri: isMagnet ? source.torrentMagnet : undefined,
+            torrent_url: isMagnet ? undefined : source.torrentMagnet,
           },
-        );
-        if (tsukiAnime) {
-          if (!totalExpectedEps && tsukiAnime.total_episodes && tsukiAnime.total_episodes > 0) {
-            totalExpectedEps = tsukiAnime.total_episodes;
+          effectiveEp: source.qualitiesPayload?.[quality]?.effectiveEp ??
+            ReleaseFilter.parseTitle(source.torrentTitle, source.knownTitles ?? []).singleEp ?? job.episodeNumber,
+          score: 0,
+        };
+        topBundles = [{
+          group: source.releaseGroup ?? "",
+          groupLower: (source.releaseGroup ?? "").toLowerCase(),
+          isH264: source.videoCodec === "h264",
+          isDualAudio: source.types.length > 1,
+          isEnglishDub: source.types.includes("dub"),
+          isSolo: !source.isBatchTorrent,
+          selectionTier: "h264_single_1080p",
+          pipelineType: "vm_remux",
+          bundleScore: 0,
+          primaryEntry,
+          qualities: { [quality]: primaryEntry },
+        }];
+      } else {
+        // Search both indexes for the target episode and requested language.
+        let tsukihimeAnidbId: number | null = null;
+        try {
+          const tsukiLookup = {
+            tsukihimeId: job.metadata?.tsukihimeId ? Number(job.metadata.tsukihimeId) : null,
+            anilistId: job.anilistId,
+            malId: job.metadata?.malId ? Number(job.metadata.malId) : null,
+            anidbId: job.anidbId,
+          };
+          const { anime: tsukiAnime, torrents: tsukiTorrents } = await TsukihimeClient.fetchTorrents(
+            tsukiLookup,
+            {
+              targetEp: job.episodeNumber,
+              langType: langTypeForSearch,
+              knownTitles: effectiveKnownTitles,
+              episodeCount: totalExpectedEps,
+              maxPages: 4,
+            },
+          );
+          if (tsukiAnime) {
+            if (!totalExpectedEps && tsukiAnime.total_episodes && tsukiAnime.total_episodes > 0) {
+              totalExpectedEps = tsukiAnime.total_episodes;
+            }
+            if (tsukiAnime.title && !effectiveKnownTitles.includes(tsukiAnime.title)) {
+              effectiveKnownTitles.push(tsukiAnime.title);
+            }
+            if (tsukiAnime.english_title && !effectiveKnownTitles.includes(tsukiAnime.english_title)) {
+              effectiveKnownTitles.push(tsukiAnime.english_title);
+            }
+            if (tsukiAnime.anidb && tsukiAnime.anidb > 0) {
+              tsukihimeAnidbId = tsukiAnime.anidb;
+            }
           }
-          if (tsukiAnime.title && !effectiveKnownTitles.includes(tsukiAnime.title)) {
-            effectiveKnownTitles.push(tsukiAnime.title);
+          if (tsukiTorrents.length > 0) {
+            mergeTorrents(tsukiTorrents);
+            topBundles = evaluateBundles();
           }
-          if (tsukiAnime.english_title && !effectiveKnownTitles.includes(tsukiAnime.english_title)) {
-            effectiveKnownTitles.push(tsukiAnime.english_title);
-          }
-          if (tsukiAnime.anidb && tsukiAnime.anidb > 0) {
-            tsukihimeAnidbId = tsukiAnime.anidb;
-          }
+        } catch (tsukiErr: any) {
+          log.warn("PipelineEngine", `[Job #${job.id}] Tsukihime search warning: ${tsukiErr?.message || tsukiErr}`);
         }
-        if (tsukiTorrents.length > 0) {
-          mergeTorrents(tsukiTorrents);
-          topBundles = evaluateBundles();
-        }
-      } catch (tsukiErr: any) {
-        log.warn("PipelineEngine", `[Job #${job.id}] Tsukihime search warning: ${tsukiErr?.message || tsukiErr}`);
-      }
 
-      const opts: FetchTorrentsOptions = {
-        targetEp: job.episodeNumber,
-        langType: langTypeForSearch,
-        knownTitles: effectiveKnownTitles,
-        episodeCount: totalExpectedEps,
-        maxPages: 6,
-      };
+        const opts: FetchTorrentsOptions = {
+          targetEp: job.episodeNumber,
+          langType: langTypeForSearch,
+          knownTitles: effectiveKnownTitles,
+          episodeCount: totalExpectedEps,
+          maxPages: 6,
+        };
 
-      const hasViableDubBundle = () =>
-        topBundles.some((b) => b.isDualAudio || b.isEnglishDub);
+        const hasViableDubBundle = () =>
+          topBundles.some((b) => b.isDualAudio || b.isEnglishDub);
 
-      const searchByAnidbId = async (aid: number) => {
-        const [allResItems, hdItems] = await Promise.all([
-          AnimeToshoClient.fetchTorrents(aid, "", opts),
-          AnimeToshoClient.fetchTorrents(aid, "1080p", opts),
-        ]);
-        mergeTorrents(allResItems);
-        mergeTorrents(hdItems);
-        topBundles = evaluateBundles();
-
-        if (wantsDub && !hasViableDubBundle()) {
-          mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "dual-audio", opts));
-          topBundles = evaluateBundles();
-        }
-        if (wantsDub && !hasViableDubBundle()) {
-          mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "dub", opts));
-          topBundles = evaluateBundles();
-        }
-      };
-
-      // 2. If Tsukihime didn't already give us a Solo Tier 1 (h264_multi) bundle, also query AnimeTosho so we find all 720p/480p siblings
-      const hasSoloMultiQualityH264 = topBundles.some(
-        (b) => b.selectionTier === "h264_multi" && b.isSolo,
-      );
-      if (job.anidbId && (!hasSoloMultiQualityH264 || (wantsDub && !hasViableDubBundle()))) {
-        await searchByAnidbId(job.anidbId);
-      }
-
-      // 3. Search canonical AniDB ID if different
-      const canonicalAnidb =
-        tsukihimeAnidbId ||
-        ((topBundles.length === 0 || (wantsDub && !hasViableDubBundle())) && job.anilistId
-          ? await AnimeMetadataResolver.resolveAnimapAnidbId(job.anilistId)
-          : null);
-      if (
-        canonicalAnidb &&
-        canonicalAnidb !== job.anidbId &&
-        (!topBundles.some((b) => b.selectionTier === "h264_multi" && b.isSolo) ||
-          (wantsDub && !hasViableDubBundle()))
-      ) {
-        log.info(
-          "PipelineEngine",
-          `[Job #${job.id}] Searching AnimeTosho via canonical AniDB #${canonicalAnidb} for AniList #${job.anilistId || "n/a"}...`,
-        );
-        await searchByAnidbId(canonicalAnidb);
-      }
-
-      // 4. Fallback: Search via known titles if ID searches yielded 0 viable candidates (or no dub/dual-audio when dub is requested)
-      if ((topBundles.length === 0 || (wantsDub && !hasViableDubBundle())) && effectiveKnownTitles.length > 0) {
-        for (const title of effectiveKnownTitles) {
-          if (!title || !title.trim()) continue;
-          const clean = title.trim();
-          log.info("PipelineEngine", `Searching AnimeTosho by title "${clean}" Ep ${job.episodeNumber}...`);
-          const [allTitleItems, hdTitleItems] = await Promise.all([
-            AnimeToshoClient.fetchTorrentsByTitle(clean, "", opts),
-            AnimeToshoClient.fetchTorrentsByTitle(clean, "1080p", opts),
+        const searchByAnidbId = async (aid: number) => {
+          const [allResItems, hdItems] = await Promise.all([
+            AnimeToshoClient.fetchTorrents(aid, "", opts),
+            AnimeToshoClient.fetchTorrents(aid, "1080p", opts),
           ]);
-          mergeTorrents(allTitleItems);
-          mergeTorrents(hdTitleItems);
+          mergeTorrents(allResItems);
+          mergeTorrents(hdItems);
           topBundles = evaluateBundles();
-          if (topBundles.length > 0 && (!wantsDub || hasViableDubBundle())) break;
 
           if (wantsDub && !hasViableDubBundle()) {
-            mergeTorrents(await AnimeToshoClient.fetchTorrentsByTitle(clean, "dual-audio", opts));
+            mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "dual-audio", opts));
             topBundles = evaluateBundles();
-            if (hasViableDubBundle()) break;
+          }
+          if (wantsDub && !hasViableDubBundle()) {
+            mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "dub", opts));
+            topBundles = evaluateBundles();
+          }
+        };
 
-            mergeTorrents(await AnimeToshoClient.fetchTorrentsByTitle(clean, "dub", opts));
+        // 2. If Tsukihime didn't already give us a Solo Tier 1 (h264_multi) bundle, also query AnimeTosho so we find all 720p/480p siblings
+        const hasSoloMultiQualityH264 = topBundles.some(
+          (b) => b.selectionTier === "h264_multi" && b.isSolo,
+        );
+        if (job.anidbId && (!hasSoloMultiQualityH264 || (wantsDub && !hasViableDubBundle()))) {
+          await searchByAnidbId(job.anidbId);
+        }
+
+        // 3. Search canonical AniDB ID if different
+        const canonicalAnidb =
+          tsukihimeAnidbId ||
+          ((topBundles.length === 0 || (wantsDub && !hasViableDubBundle())) && job.anilistId
+            ? await AnimeMetadataResolver.resolveAnimapAnidbId(job.anilistId)
+            : null);
+        if (
+          canonicalAnidb &&
+          canonicalAnidb !== job.anidbId &&
+          (!topBundles.some((b) => b.selectionTier === "h264_multi" && b.isSolo) ||
+            (wantsDub && !hasViableDubBundle()))
+        ) {
+          log.info(
+            "PipelineEngine",
+            `[Job #${job.id}] Searching AnimeTosho via canonical AniDB #${canonicalAnidb} for AniList #${job.anilistId || "n/a"}...`,
+          );
+          await searchByAnidbId(canonicalAnidb);
+        }
+
+        // 4. Fallback: Search via known titles if ID searches yielded 0 viable candidates (or no dub/dual-audio when dub is requested)
+        if ((topBundles.length === 0 || (wantsDub && !hasViableDubBundle())) && effectiveKnownTitles.length > 0) {
+          for (const title of effectiveKnownTitles) {
+            if (!title || !title.trim()) continue;
+            const clean = title.trim();
+            log.info("PipelineEngine", `Searching AnimeTosho by title "${clean}" Ep ${job.episodeNumber}...`);
+            const [allTitleItems, hdTitleItems] = await Promise.all([
+              AnimeToshoClient.fetchTorrentsByTitle(clean, "", opts),
+              AnimeToshoClient.fetchTorrentsByTitle(clean, "1080p", opts),
+            ]);
+            mergeTorrents(allTitleItems);
+            mergeTorrents(hdTitleItems);
             topBundles = evaluateBundles();
-            if (hasViableDubBundle()) break;
+            if (topBundles.length > 0 && (!wantsDub || hasViableDubBundle())) break;
+
+            if (wantsDub && !hasViableDubBundle()) {
+              mergeTorrents(await AnimeToshoClient.fetchTorrentsByTitle(clean, "dual-audio", opts));
+              topBundles = evaluateBundles();
+              if (hasViableDubBundle()) break;
+
+              mergeTorrents(await AnimeToshoClient.fetchTorrentsByTitle(clean, "dub", opts));
+              topBundles = evaluateBundles();
+              if (hasViableDubBundle()) break;
+            }
           }
         }
       }
@@ -1271,11 +1334,8 @@ export class PipelineEngineService {
         job.metadata?.processingMode === "vm_remux" || job.metadata?.processingMode === "kaggle_gpu"
           ? (job.metadata.processingMode as PipelineExecutionType)
           : null;
-      const policyDecision = this.filterCandidateBundlesByPolicy(
-        topBundles,
-        effectivePolicy,
-        forcedMode,
-      );
+      const policyDecision = captionsOnly ? { allowedBundles: topBundles, skippedReason: null, naturalPipeline: null }
+        : this.filterCandidateBundlesByPolicy(topBundles, effectivePolicy, forcedMode);
 
       if (policyDecision.skippedReason) {
         const naturalBundle = topBundles[0];
@@ -1314,7 +1374,8 @@ export class PipelineEngineService {
       }
 
       // Hydrate all quality entries (1080p, 720p, 480p) in the policy-allowed bundles with Tsukihime tracker URLs & seeders
-      topBundles = await TsukihimeClient.hydrateCandidateBundles(policyDecision.allowedBundles);
+      topBundles = captionsOnly ? policyDecision.allowedBundles
+        : await TsukihimeClient.hydrateCandidateBundles(policyDecision.allowedBundles);
 
       let selectedBundle: ReleaseCandidateBundle | null = null;
       let primaryStagedPath: string | null = null;
@@ -1323,7 +1384,10 @@ export class PipelineEngineService {
       let primaryQuality: VideoResolutionQuality = "1080p";
       let isBatchExtracted = false;
       const qualitiesPayload: Record<string, any> = {};
-      let lastCandidateErr: any = null;
+      let lastCandidateErr: unknown;
+      let primaryProbe: MkvStreamProbe | undefined;
+      let tracksConfig: [string, number][] = [];
+      let extractedSubs: ExtractedSubtitleTrack[] = [];
 
       // Try up to top 4 candidate bundles in strict waterfall order:
       // Solo Tier 1 (h264_multi) -> Solo Tier 2 (h264_single_1080p) -> Solo Tier 3 (hevc_av1_gpu) -> Selective-Batch fallbacks
@@ -1350,6 +1414,28 @@ export class PipelineEngineService {
         });
 
         if (dlRes.ok) {
+          downloadedPaths.add(dlRes.stagedPath);
+          try {
+            const probe = await inspectMkvStreamsSync(dlRes.stagedPath);
+            if (probe.video.length === 0) throw new Error("No video stream in candidate");
+            const tracks = videoManager.determineTracksToEncode(probe, langTypeForSearch);
+            if (tracks.length === 0) throw new Error("Requested audio language is missing");
+            const candidateSubs = await subtitles.extractSubtitlesFromMkv(dlRes.stagedPath, tempSubsDir, probe);
+            const hasFullCaptions = candidateSubs.some(track => track.role !== "signs");
+            const verifiedTracks = tracks.filter(([type]) => type !== "sub" || hasFullCaptions);
+            if (verifiedTracks.length === 0 || (captionsOnly && candidateSubs.length === 0)) {
+              throw new Error("Candidate has no usable captions for the requested language");
+            }
+            primaryProbe = probe;
+            tracksConfig = verifiedTracks;
+            extractedSubs = candidateSubs;
+          } catch (error) {
+            lastCandidateErr = error;
+            log.warn("PipelineEngine", `[Job #${job.id}] Rejecting ${primaryEntry.item.title}: ${String(error)}`);
+            await fs.promises.unlink(dlRes.stagedPath).catch(() => {});
+            continue;
+          }
+
           selectedBundle = bundle;
           primaryStagedPath = dlRes.stagedPath;
           primarySizeBytes = dlRes.sizeBytes;
@@ -1362,6 +1448,7 @@ export class PipelineEngineService {
             sizeBytes: dlRes.sizeBytes,
             isBatchExtracted: dlRes.isBatchExtracted,
             fileIndex: dlRes.fileIndex,
+            effectiveEp: primaryEntry.effectiveEp,
           };
           break;
         }
@@ -1393,7 +1480,7 @@ export class PipelineEngineService {
         );
       }
 
-      if (!primaryStagedPath || !selectedBundle) {
+      if (!primaryStagedPath || !selectedBundle || !primaryProbe) {
         throw lastCandidateErr || new Error("All torrent candidate bundles failed to download");
       }
 
@@ -1403,26 +1490,32 @@ export class PipelineEngineService {
         `Primary (${primaryQuality}) video staged for Job #${job.id}: ${primaryStagedPath} (${fSizeMb} MB)`,
       );
 
-      // Probe primary (1080p) MKV streams for audio track mapping AND actual video codec verification
-      let tracksConfig: [string, number][] = [["sub", 0]];
-      let detectedVideoCodec = selectedBundle.isH264 ? "h264" : "hevc";
-      let isBrowserCompatibleH264 = selectedBundle.isH264;
-
-      try {
-        const probe = await inspectMkvStreamsSync(primaryStagedPath);
-        const langMode = wantsSub && wantsDub ? "all" : wantsDub ? "dub" : "sub";
-        tracksConfig = videoManager.determineTracksToEncode(probe, langMode);
-        if (probe.videoCodec) {
-          detectedVideoCodec = probe.videoCodec;
-          isBrowserCompatibleH264 = Boolean(probe.isBrowserCompatibleH264);
+      const detectedVideoCodec = primaryProbe.videoCodec;
+      const isBrowserCompatibleH264 = primaryProbe.isBrowserCompatibleH264;
+      const uploadCaptions = async (): Promise<R2SubtitleRecord[]> => {
+        const records: R2SubtitleRecord[] = [];
+        const animeId = job.animeId || job.anilistId || job.anidbId || job.id;
+        for (const [type] of tracksConfig) {
+          records.push(...await subtitles.uploadSubtitles(extractedSubs, animeId, job.episodeNumber, type));
         }
-        log.info(
-          "PipelineEngine",
-          `Job #${job.id} stream probe -> codec=${detectedVideoCodec} (h264DirectRemux=${isBrowserCompatibleH264}), dualAudio=${probe.isDualAudio}, tracks=${JSON.stringify(tracksConfig)}`,
-        );
-      } catch (probeErr: any) {
-        log.warn("PipelineEngine", `Job #${job.id} ffprobe warning, defaulting track config: ${probeErr?.message || probeErr}`);
-        tracksConfig = wantsDub && !wantsSub ? [["dub", 0]] : [["sub", 0]];
+        return records;
+      };
+
+      if (captionsOnly) {
+        const records = await uploadCaptions();
+        const type = job.types[0];
+        await this.persistAndDeliverPayloads({
+          ...job,
+          torrentMagnet: primaryMagnet,
+          torrentTitle: selectedBundle.primaryEntry.item.title,
+          stagedFilePath: primaryStagedPath,
+          subtitlesPayload: records,
+        }, [{
+          ...this.completionIdentity(job, type),
+          sources: [],
+          subtitles: SubtitleManager.formatForCallback(records, type),
+        }]);
+        return { status: "completed", jobId };
       }
 
       const stagedQualities: Partial<Record<VideoResolutionQuality, string>> = {
@@ -1510,36 +1603,6 @@ export class PipelineEngineService {
       }
 
 
-      // Run 1080p R2 subtitle extraction AND (if Tier 1 h264_multi) parallel sibling 720p/480p downloads concurrently!
-      const extract1080pSubtitlesTask = async (): Promise<R2SubtitleRecord[]> => {
-        const taskToken = crypto.randomUUID().slice(0, 8);
-        const tempSubsDir = path.join(stagingDir, `subs_${taskToken}`);
-        await fs.promises.mkdir(tempSubsDir, { recursive: true });
-        const records: R2SubtitleRecord[] = [];
-        try {
-          const extractedSubs = await subtitles.extractSubtitlesFromMkv(primaryStagedPath!, tempSubsDir);
-          if (extractedSubs.length > 0) {
-            const animeIdForPath = job.animeId || job.anilistId || job.anidbId || job.id;
-            for (const [trackType] of tracksConfig) {
-              const uploaded = await subtitles.uploadSubtitles(
-                extractedSubs,
-                animeIdForPath,
-                job.episodeNumber,
-                trackType,
-              );
-              records.push(...uploaded);
-            }
-            log.info(
-              "PipelineEngine",
-              `Job #${job.id}: Extracted & uploaded ${records.length} subtitle track(s) from ${primaryQuality} source only.`,
-            );
-          }
-        } finally {
-          await fs.promises.rm(tempSubsDir, { recursive: true, force: true }).catch(() => {});
-        }
-        return records;
-      };
-
       const downloadSiblingQualitiesTask = async (): Promise<void> => {
         // Only download 720p/480p siblings when in Tier 1 (h264_multi) and primary is verified H.264!
         // In Tier 2 (h264_single_1080p), we strictly only process 1 quality (1080p).
@@ -1586,17 +1649,18 @@ export class PipelineEngineService {
             });
 
             if (sibDl.ok) {
+              downloadedPaths.add(sibDl.stagedPath);
+              let compatible = false;
               try {
-                const sibProbe = await inspectMkvStreamsSync(sibDl.stagedPath);
-                if (sibProbe.videoCodec && !sibProbe.isBrowserCompatibleH264) {
-                  log.warn(
-                    "PipelineEngine",
-                    `[Job #${job.id}] Sibling ${siblingQ} is ${sibProbe.videoCodec} (not 8-bit H.264); discarding sibling file.`,
-                  );
-                  await fs.promises.unlink(sibDl.stagedPath).catch(() => {});
-                  return;
-                }
+                const probe = await inspectMkvStreamsSync(sibDl.stagedPath);
+                compatible = probe.isBrowserCompatibleH264 && tracksConfig.every(([type]) =>
+                  videoManager.determineTracksToEncode(probe, type).length > 0);
               } catch {}
+              if (!compatible) {
+                log.warn("PipelineEngine", `[Job #${job.id}] Sibling ${siblingQ} has incompatible video or missing audio`);
+                await fs.promises.unlink(sibDl.stagedPath).catch(() => {});
+                return;
+              }
 
               stagedQualities[siblingQ] = sibDl.stagedPath;
               totalJobBytes += sibDl.sizeBytes;
@@ -1624,10 +1688,8 @@ export class PipelineEngineService {
         );
       };
 
-      const [r2SubRecords] = await Promise.all([
-        extract1080pSubtitlesTask(),
-        downloadSiblingQualitiesTask(),
-      ]);
+      const r2SubRecords = await uploadCaptions();
+      await downloadSiblingQualitiesTask();
 
       const stagedQualityList = Object.keys(stagedQualities) as VideoResolutionQuality[];
       if (processingMode === "vm_remux" && stagedQualityList.length === 1) {
@@ -1691,24 +1753,31 @@ export class PipelineEngineService {
         sizeBytes: totalJobBytes,
       };
     } catch (err: any) {
-      await this.cleanupJobStagedFiles(job).catch(() => {});
-      await db
-        .update(schema.pipelineJob)
-        .set({
-          status: "failed",
-          stagedFilePath: null,
-          stagedQualities: null,
-          lastError: err?.message || String(err),
-          heartbeatAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .where(eq(schema.pipelineJob.id, jobId));
+      await Promise.all([...downloadedPaths].map(file => fs.promises.unlink(file).catch(() => {})));
+      const retryIndex = Number(job.metadata?.discoveryRetries ?? 0);
+      const retryDelay = kind === "release" ? RELEASE_DISCOVERY_DELAYS_MS[retryIndex] : undefined;
+      const discoverAfter = retryDelay ? new Date(Date.now() + retryDelay) : null;
+      await db.update(schema.pipelineJob).set({
+        status: discoverAfter ? "queued" : "failed",
+        discoverAfter,
+        stagedFilePath: null,
+        stagedQualities: null,
+        lastError: err?.message || String(err),
+        ...(discoverAfter ? { metadata: { ...(job.metadata || {}), discoveryRetries: retryIndex + 1 } } : {}),
+        heartbeatAt: new Date(),
+        updatedAt: new Date(),
+      }).where(and(eq(schema.pipelineJob.id, jobId), eq(schema.pipelineJob.status, "downloading")));
 
+      if (discoverAfter) {
+        log.warn("PipelineEngine", `Job #${jobId} will retry after ${discoverAfter.toISOString()}: ${err?.message || err}`);
+        return { status: "retry_scheduled", jobId, error: err?.message || String(err) };
+      }
       log.error("PipelineEngine", `Job #${jobId} staging failed: ${err?.message || err}`);
       return { status: "failed", jobId, error: err?.message || String(err) };
     } finally {
       clearInterval(heartbeatInterval);
       this.activeDiscoveringJobIds.delete(jobId);
+      await fs.promises.rm(tempSubsDir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
@@ -2216,7 +2285,6 @@ export class PipelineEngineService {
 
     const rawSubtitles = (job.subtitlesPayload as R2SubtitleRecord[]) || [];
     const trackPayloads: PipelineEpisodeResult[] = [];
-    const completedAtIso = new Date().toISOString();
 
     for (const trackType of encodedTrackTypes) {
       const trackRecords = jobOutputs.filter((o) => {
@@ -2235,95 +2303,56 @@ export class PipelineEngineService {
       const formattedSubs = SubtitleManager.formatForCallback(rawSubtitles, trackType);
 
       trackPayloads.push({
-        jobId: job.id,
-        anilistId: job.anilistId ?? (job.metadata?.anilistId ? Number(job.metadata.anilistId) : null),
-        animeId: job.animeId ?? (job.metadata?.animeId ? Number(job.metadata.animeId) : null),
-        anidbId: job.anidbId,
-        episodeNumber: job.episodeNumber,
-        type: trackType,
+        ...this.completionIdentity(job, trackType),
         sources,
         subtitles: formattedSubs,
-        metadata: job.metadata || {},
-        completedAt: completedAtIso,
       });
     }
 
-    const primaryResult: PipelineEpisodeResult = {
-      ...trackPayloads[0],
-      allTrackPayloads: trackPayloads,
-    };
-
-    await db
-      .update(schema.pipelineJob)
-      .set({
-        status: "completed",
-        resultPayload: primaryResult,
-        metadata: { ...(job.metadata || {}), callbackDelivered: false },
-        lastError: null,
-        completedAt: new Date(),
-        heartbeatAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(eq(schema.pipelineJob.id, job.id));
-
-    try {
-      const targetCallbackUrl =
-        job.callbackUrl || `${MAIN_BACKEND_URL}/api/internal/pipeline/completed`;
-      let allDelivered = true;
-
-      for (const payload of trackPayloads) {
-        const ok = await this.deliverCallbackPayload(targetCallbackUrl, payload);
-        if (!ok) {
-          allDelivered = false;
-        } else {
-          log.success(
-            "PipelineEngine",
-            `Delivered ${payload.type.toUpperCase()} callback (${payload.sources.length} qualities) to Main Backend for Job #${job.id}`,
-          );
-        }
-
-        const targetAnimeId = payload.animeId || payload.anilistId;
-        if (targetAnimeId) {
-          await notifyMainBackendRevalidate({
-            animeId: targetAnimeId,
-            slug: job.metadata?.slug || null,
-            episodeNumber: job.episodeNumber,
-            airType: payload.type,
-          }).catch(() => {});
-        }
-      }
-
-      const updatedMeta = {
-        ...(job.metadata || {}),
-        callbackDelivered: allDelivered,
-        callbackLastAttemptAt: new Date().toISOString(),
-      };
-      await db
-        .update(schema.pipelineJob)
-        .set({ metadata: updatedMeta, updatedAt: new Date() })
-        .where(eq(schema.pipelineJob.id, job.id));
-
-      if (!allDelivered) {
-        log.warn(
-          "PipelineEngine",
-          `Job #${job.id} completed and saved in DB, but Main Backend callback (${targetCallbackUrl}) is pending retry by Watchdog.`,
-        );
-      }
-
-    } catch (error) {
-      log.warn("PipelineEngine", `Job #${job.id} is complete; delivery remains pending: ${String(error)}`);
-    }
-
-    // Delete all staged quality files (1080p, 720p, 480p) immediately so SSD space is freed
-    await this.cleanupJobStagedFiles(job).catch(error => log.warn("PipelineEngine", `Job #${job.id} cleanup pending: ${String(error)}`));
+    await this.persistAndDeliverPayloads(job, trackPayloads);
   }
 
-  /**
-   * Pipeline 1 Single-Job Executor (2-At-A-Time Streaming Worker — NO Batching!):
-   * Remuxes a single H.264 job (`h264_multi` 1080p/720p/480p or `h264_single_1080p`) on the VM with `-c:v copy`,
-   * uploads to Hugging Face, delivers the Main Backend callback, deletes local staged files,
-   * and immediately pulls the next staged `vm_remux` job into the freed slot.
-   */
+  private static completionIdentity(job: typeof schema.pipelineJob.$inferSelect, type: "sub" | "dub") {
+    return {
+      jobId: job.id,
+      animeId: job.animeId,
+      anilistId: job.anilistId,
+      anidbId: job.anidbId,
+      episodeNumber: job.episodeNumber,
+      type,
+      kind: job.metadata?.kind,
+      sourceJobId: job.metadata?.sourceJobId,
+      sourceUrl: job.metadata?.sourceUrl,
+      completedAt: new Date().toISOString(),
+    };
+  }
+
+  private static async persistAndDeliverPayloads(
+    job: typeof schema.pipelineJob.$inferSelect,
+    payloads: PipelineEpisodeResult[],
+  ): Promise<void> {
+    if (!payloads.length) throw new Error(`No deliverable tracks for job #${job.id}`);
+    const now = new Date();
+    await db.update(schema.pipelineJob).set({
+      status: "completed",
+      resultPayload: { ...payloads[0], allTrackPayloads: payloads },
+      metadata: { ...(job.metadata || {}), callbackDelivered: false },
+      callbackAfter: now,
+      torrentTitle: job.torrentTitle,
+      torrentMagnet: job.torrentMagnet,
+      subtitlesPayload: job.subtitlesPayload,
+      lastError: null,
+      completedAt: now,
+      heartbeatAt: now,
+      updatedAt: now,
+    }).where(eq(schema.pipelineJob.id, job.id));
+
+    await this.retryJobCallback(job.id).catch(error =>
+      log.warn("PipelineEngine", `Job #${job.id} is complete; delivery remains pending: ${String(error)}`));
+    await this.cleanupJobStagedFiles(job).catch(error =>
+      log.warn("PipelineEngine", `Job #${job.id} cleanup pending: ${String(error)}`));
+  }
+
   public static async executeVmRemuxJob(jobId: number): Promise<void> {
 
     const heartbeatTimer = setInterval(() => {
@@ -2482,25 +2511,13 @@ export class PipelineEngineService {
         const queuedRows = await db
           .select()
           .from(schema.pipelineJob)
-          .where(eq(schema.pipelineJob.status, "queued"))
+          .where(queuedDiscoveryCondition())
           .orderBy(asc(schema.pipelineJob.id))
           .limit(KIRA_DISCOVERY_CONCURRENCY);
 
         for (const qJob of queuedRows) {
           await inngest
-            .send({
-              name: "pipeline/job.discover",
-              id: `pipe-job-${qJob.id}-freed-${Date.now()}`,
-              data: {
-                jobId: qJob.id,
-                anilistId: qJob.anilistId,
-                animeId: qJob.animeId,
-                anidbId: qJob.anidbId,
-                episodeNumber: qJob.episodeNumber,
-                types: qJob.types,
-                knownTitles: qJob.knownTitles || [],
-              },
-            })
+            .send(discoveryEvent(qJob, "freed"))
             .catch(() => {
               this.stage1DiscoveryQueue
                 .add(async () => {
@@ -2727,9 +2744,10 @@ export class PipelineEngineService {
           const wantsDub = job.types.includes("dub");
           const langMode = wantsSub && wantsDub ? "all" : wantsDub ? "dub" : "sub";
           tracks = videoManager.determineTracksToEncode(probe, langMode);
-        } catch {
-          tracks = job.types.includes("dub") && !job.types.includes("sub") ? [["dub", 0]] : [["sub", 0]];
+        } catch (error) {
+          throw new Error(`Could not verify audio for job #${job.id}: ${String(error)}`);
         }
+        if (!tracks.length) throw new Error(`No verified audio for job #${job.id}`);
       }
 
       const hfAccount = videoManager.getHfAccountForTarget(job.metadata?.hfUploadTarget);
@@ -3216,39 +3234,24 @@ export class PipelineEngineService {
     return { state: "running", rawStatus: kStatus.rawStatus };
   }
 
-  public static async deliverCallbackPayload(
-    callbackUrl: string,
-    payload: PipelineEpisodeResult,
-    maxAttempts = 4,
-  ): Promise<boolean> {
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        const res = await fetch(callbackUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-internal-secret": INTERNAL_SECRET,
-          },
-          body: JSON.stringify(payload),
-        });
-        if (res.ok) {
-          return true;
-        }
-        const statusText = await res.text().catch(() => "");
-        log.warn(
-          "PipelineEngine",
-          `Callback HTTP ${res.status} for Job #${payload.jobId} (${payload.type}): ${statusText.slice(0, 200)}`,
-        );
-      } catch (callErr: any) {
-        log.warn(
-          "PipelineEngine",
-          `Callback attempt ${attempt}/${maxAttempts} failed for Job #${payload.jobId} (${payload.type}): ${callErr?.message || callErr}`,
-        );
-      }
-      if (attempt < maxAttempts) {
-        const delayMs = Math.min(1500 * Math.pow(2, attempt - 1), 12000);
-        await new Promise((r) => setTimeout(r, delayMs));
-      }
+  public static async deliverCallbackPayload(payload: PipelineEpisodeResult): Promise<boolean> {
+    if (!INTERNAL_SECRET) {
+      log.warn("PipelineEngine", "INTERNAL_SECRET must be configured to deliver callbacks");
+      return false;
+    }
+    try {
+      const res = await fetch(`${MAIN_BACKEND_URL}/api/internal/pipeline/completed`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-internal-secret": INTERNAL_SECRET },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(15_000),
+        redirect: "error",
+      });
+      if (res.ok) return true;
+      const message = (await res.text().catch(() => "")).slice(0, 200);
+      log.warn("PipelineEngine", `Callback HTTP ${res.status} for job #${payload.jobId} (${payload.type}): ${message}`);
+    } catch (error) {
+      log.warn("PipelineEngine", `Callback for job #${payload.jobId} (${payload.type}) failed: ${String(error)}`);
     }
     return false;
   }
@@ -4129,64 +4132,68 @@ export class PipelineEngineService {
     }
   }
 
-  public static async retryPendingCallbacks(): Promise<number> {
-    await this.ensureTables();
+  public static async retryJobCallback(id: number, force = false): Promise<boolean> {
+    const job = await db.query.pipelineJob.findFirst({
+      where: and(eq(schema.pipelineJob.id, id), eq(schema.pipelineJob.status, "completed")),
+    });
+    const result = job?.resultPayload as PipelineEpisodeResult | null;
+    if (!job || !result || (!force && job.metadata?.callbackDelivered !== false)) return false;
 
-    const completedJobs = await db
-      .select()
-      .from(schema.pipelineJob)
-      .where(eq(schema.pipelineJob.status, "completed"));
+    const metadata = job.metadata ?? {};
+    const attempts = Number(metadata.callbackAttempts ?? 0);
+    const now = new Date();
+    if (!force && job.callbackAfter && job.callbackAfter > now) return false;
+    const delay = CALLBACK_DELAYS_MS[Math.min(attempts, CALLBACK_DELAYS_MS.length - 1)];
+    const nextAttempt = new Date(now.getTime() + delay);
+    const [claimed] = await db.update(schema.pipelineJob).set({
+      callbackAfter: nextAttempt,
+      metadata: { ...metadata, callbackDelivered: false, callbackAttempts: attempts + 1, callbackLastAttemptAt: now.toISOString() },
+    }).where(and(
+      eq(schema.pipelineJob.id, id),
+      eq(schema.pipelineJob.status, "completed"),
+      job.callbackAfter ? eq(schema.pipelineJob.callbackAfter, job.callbackAfter) : isNull(schema.pipelineJob.callbackAfter),
+    )).returning({ id: schema.pipelineJob.id });
+    if (!claimed) return false;
 
-    let redeliveredCount = 0;
-
-    for (const job of completedJobs) {
-      const meta = (job.metadata as Record<string, any>) || {};
-      if (meta.callbackDelivered !== false) continue;
-
-      const resultPayload = job.resultPayload as PipelineEpisodeResult | null;
-      if (!resultPayload) continue;
-
-      const targetUrl = job.callbackUrl || `${MAIN_BACKEND_URL}/api/internal/pipeline/completed`;
-      const payloadsToDeliver: PipelineEpisodeResult[] = Array.isArray(resultPayload.allTrackPayloads)
-        ? resultPayload.allTrackPayloads
-        : [resultPayload];
-
-      let allOk = true;
-      for (const p of payloadsToDeliver) {
-        const ok = await this.deliverCallbackPayload(targetUrl, p, 2);
-        if (!ok) {
-          allOk = false;
-          break;
-        }
-        const targetAnimeId = p.animeId || p.anilistId;
-        if (targetAnimeId) {
-          await notifyMainBackendRevalidate({
-            animeId: targetAnimeId,
-            slug: meta.slug || null,
-            episodeNumber: job.episodeNumber,
-            airType: p.type,
-          }).catch(() => {});
-        }
-      }
-
-      if (allOk) {
-        redeliveredCount++;
-        await db
-          .update(schema.pipelineJob)
-          .set({
-            metadata: {
-              ...meta,
-              callbackDelivered: true,
-              callbackDeliveredAt: new Date().toISOString(),
-            },
-            updatedAt: new Date(),
-          })
-          .where(eq(schema.pipelineJob.id, job.id));
-        log.success("PipelineEngine", `Re-delivered pending Main Backend callback for Job #${job.id}`);
-      }
+    const payloads = result.allTrackPayloads ?? [result];
+    const deliveredTypes = new Set<string>(force ? [] : metadata.callbackDeliveredTypes ?? []);
+    for (const { allTrackPayloads: _unused, metadata: legacyMetadata, ...payload } of payloads) {
+      if (!deliveredTypes.has(payload.type) && await this.deliverCallbackPayload({
+        ...payload,
+        animeId: payload.animeId ?? legacyMetadata?.animeId,
+      })) deliveredTypes.add(payload.type);
     }
 
-    return redeliveredCount;
+    const delivered = payloads.every(payload => deliveredTypes.has(payload.type));
+    await db.update(schema.pipelineJob).set({
+      callbackAfter: delivered ? null : nextAttempt,
+      metadata: {
+        ...metadata,
+        callbackAttempts: attempts + 1,
+        callbackLastAttemptAt: now.toISOString(),
+        callbackDeliveredTypes: [...deliveredTypes],
+        callbackDelivered: delivered,
+        ...(delivered ? { callbackDeliveredAt: new Date().toISOString() } : {}),
+      },
+    }).where(and(eq(schema.pipelineJob.id, id), eq(schema.pipelineJob.callbackAfter, nextAttempt)));
+    return delivered;
+  }
+
+  public static async retryPendingCallbacks(): Promise<number> {
+    if (!INTERNAL_SECRET) return 0;
+    await this.ensureTables();
+    const pending = await db.select({ id: schema.pipelineJob.id }).from(schema.pipelineJob).where(and(
+      eq(schema.pipelineJob.status, "completed"),
+      sql`${schema.pipelineJob.metadata}->>'callbackDelivered' = 'false'`,
+      isNotNull(schema.pipelineJob.resultPayload),
+      or(isNull(schema.pipelineJob.callbackAfter), lte(schema.pipelineJob.callbackAfter, new Date())),
+    )).orderBy(sql`${schema.pipelineJob.callbackAfter} asc nulls first`, asc(schema.pipelineJob.id)).limit(8);
+
+    let delivered = 0;
+    for (const { id } of pending) {
+      if (await this.retryJobCallback(id)) delivered++;
+    }
+    return delivered;
   }
 
   public static async getStats(): Promise<PipelineStats> {

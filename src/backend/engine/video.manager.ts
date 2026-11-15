@@ -242,31 +242,16 @@ export class VideoEncodingManager {
     probe: MkvStreamProbe,
     langType: string,
   ): [string, number][] {
-    const isDual = probe.isDualAudio;
-    const jpIdx = probe.japaneseStreamIndex ?? 0;
-    const enIdx = probe.englishStreamIndex ?? 0;
-    const lType = String(langType).toLowerCase();
-
-    if (lType === "all") {
-      if (isDual) {
-        return [
-          ["sub", jpIdx],
-          ["dub", enIdx],
-        ];
-      }
-      if (
-        probe.englishStreamIndex !== null &&
-        probe.englishStreamIndex !== undefined &&
-        probe.japaneseStreamIndex === probe.englishStreamIndex
-      ) {
-        return [["dub", probe.englishStreamIndex]];
-      }
-      return [["sub", jpIdx]];
+    const original = probe.japaneseStreamIndex;
+    const english = probe.englishStreamIndex;
+    const tracks: [string, number][] = [];
+    if (langType !== "dub" && original != null && original !== english && original < probe.audio.length) {
+      tracks.push(["sub", original]);
     }
-    if (lType === "dub") {
-      return [["dub", probe.englishStreamIndex ?? (isDual ? enIdx : jpIdx)]];
+    if (langType !== "sub" && english != null && english < probe.audio.length) {
+      tracks.push(["dub", english]);
     }
-    return [["sub", jpIdx]];
+    return tracks;
   }
 
   private async computeFileSha256(filePath: string): Promise<string> {
@@ -336,11 +321,7 @@ export class VideoEncodingManager {
       throw new Error(`Job #${jobId} has no existing staged quality files on disk for VM direct remux`);
     }
 
-    const normalizedTracks: [string, number][] =
-      tracks.length > 0
-        ? tracks.filter((t) => t[0] === "sub" || t[0] === "dub")
-        : [["sub", 0]];
-
+    const normalizedTracks = tracks.filter(([type]) => type === "sub" || type === "dub");
     if (!normalizedTracks.length) throw new Error(`Job #${jobId} has no valid audio tracks`);
     const records: KiraBatchHfRecord[] = [];
     const addItems: [string, string][] = [];
@@ -366,28 +347,8 @@ export class VideoEncodingManager {
 
       for (const qName of validQualities) {
         const inputPath = stagedQualities[qName]!;
-        let probe: MkvStreamProbe | null = null;
-        try {
-          probe = await inspectMkvStreamsSync(inputPath);
-        } catch {}
-
-        for (const [trackName, fallbackAudioIdx] of normalizedTracks) {
-          let targetAudioIdx = fallbackAudioIdx;
-          if (probe) {
-            if (trackName === "dub" && probe.englishStreamIndex !== null) {
-              targetAudioIdx = probe.englishStreamIndex;
-            } else if (trackName === "sub") {
-              targetAudioIdx = probe.japaneseStreamIndex ?? fallbackAudioIdx;
-            }
-          }
-
-          const audioInfo = probe?.classifiedAudio.find((a) => a.audioIndex === targetAudioIdx);
-          const isAlreadyStereoAac =
-            audioInfo &&
-            audioInfo.codec === "aac" &&
-            audioInfo.channels > 0 &&
-            audioInfo.channels <= 2;
-
+        let probe: MkvStreamProbe | undefined;
+        for (const [trackName] of normalizedTracks) {
           const outMp4Path = path.join(workDir, `${trackName}_${qName}.mp4`);
 
           const cached = cachedRecords.find(r => r.type === trackName && r.quality === qName);
@@ -397,6 +358,14 @@ export class VideoEncodingManager {
             addItems.push([outMp4Path, cached.huggingface.path]);
             continue;
           }
+
+          probe ??= await inspectMkvStreamsSync(inputPath);
+          const targetAudioIdx = this.determineTracksToEncode(probe, trackName)[0]?.[1];
+          if (targetAudioIdx === undefined) {
+            throw new Error(`Missing verified ${trackName} audio for job ${jobId} (${qName})`);
+          }
+          const audioInfo = probe.classifiedAudio.find(track => track.audioIndex === targetAudioIdx);
+          const isAlreadyStereoAac = audioInfo?.codec === "aac" && audioInfo.channels > 0 && audioInfo.channels <= 2;
 
           const runFfmpegRemux = async (copyAudio: boolean, mapAudioSpec: string) => {
             const audioArgs = copyAudio
@@ -1358,7 +1327,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
     job_id = item["jobId"]
     anime_id = item["animeId"]
     ep_num = item["episodeNumber"]
-    raw_tracks = item.get("tracks") or [["sub", 0]]
+    raw_tracks = item.get("tracks") or []
     hf = item["hf"]
 
     # Normalize tracks so we only ever encode valid audio track names ("sub" / "dub")
@@ -1369,7 +1338,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
         if t_label in ("sub", "dub"):
             tracks.append([t_label, t_idx])
     if not tracks:
-        tracks = [["sub", 0]]
+        raise RuntimeError(f"Job {job_id} has no verified audio tracks.")
 
     src_input = resolve_input_file(item)
     work_dir = f"{BASE_WORK_DIR}/job_{job_id}"
@@ -1399,7 +1368,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
     )
     audio_sync_filter = "aresample=async=1000:min_hard_comp=0.100000:first_pts=0,asetpts=PTS-STARTPTS"
 
-    # Extract primary audio track (with fallback to 0:a:0 if specific index fails)
+    # Extract the audio stream verified during staging
     primary_audio = f"{work_dir}/{primary_track_name}_audio.m4a"
     a_cmd = [
         "ffmpeg", "-hide_banner", "-y", "-v", "warning",
@@ -1414,9 +1383,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
         "-movflags", "+faststart",
         primary_audio,
     ]
-    if subprocess.run(a_cmd).returncode != 0:
-        a_cmd[a_cmd.index(f"0:a:{primary_a_idx}")] = "0:a:0"
-        subprocess.run(a_cmd, check=True)
+    subprocess.run(a_cmd, check=True)
 
     # Extract secondary audio tracks (e.g. Dual-Audio dub)
     if len(tracks) > 1:
@@ -1435,9 +1402,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
                 "-movflags", "+faststart",
                 extra_audio,
             ]
-            if subprocess.run(ea_cmd).returncode != 0:
-                ea_cmd[ea_cmd.index(f"0:a:{extra_a_idx}")] = "0:a:0"
-                subprocess.run(ea_cmd, check=True)
+            subprocess.run(ea_cmd, check=True)
 
     def clean_partials(qualities=("1080p", "720p", "480p")):
         for q_k in qualities:

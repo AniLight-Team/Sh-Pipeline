@@ -1,6 +1,6 @@
 import { inngest } from "../client.js";
 import { db, schema } from "../../db/index.js";
-import { eq, inArray, lt, and } from "drizzle-orm";
+import { eq, inArray, lt, and, asc } from "drizzle-orm";
 import { PipelineEngineService } from "../../engine/service.js";
 import {
   MAX_JOB_ATTEMPTS,
@@ -8,6 +8,7 @@ import {
   KIRA_DISCOVERY_CONCURRENCY,
 } from "../../config.js";
 import { log } from "../../utils/logger.js";
+import { discoveryEvent, queuedDiscoveryCondition } from "../../engine/job-scheduling.js";
 
 export const recoveryWatchdogFn = inngest.createFunction(
   {
@@ -44,10 +45,10 @@ export const recoveryWatchdogFn = inngest.createFunction(
         .from(schema.pipelineJob)
         .where(
           and(
-            eq(schema.pipelineJob.status, "queued"),
+            queuedDiscoveryCondition(),
             lt(schema.pipelineJob.updatedAt, twoMinsAgo),
           ),
-        );
+        ).orderBy(asc(schema.pipelineJob.updatedAt)).limit(KIRA_DISCOVERY_CONCURRENCY);
 
       // 2. Recover hung "downloading" jobs (no heartbeat for >10m, e.g. after service restart)
       const hungDownloadingJobs = await db
@@ -76,7 +77,7 @@ export const recoveryWatchdogFn = inngest.createFunction(
               heartbeatAt: new Date(),
               updatedAt: new Date(),
             })
-            .where(eq(schema.pipelineJob.id, hj.id))
+            .where(and(eq(schema.pipelineJob.id, hj.id), eq(schema.pipelineJob.status, "downloading"), lt(schema.pipelineJob.heartbeatAt, tenMinsAgo)))
             .returning();
           if (resetJob) jobsToRediscover.push(resetJob);
         } else {
@@ -87,7 +88,7 @@ export const recoveryWatchdogFn = inngest.createFunction(
               lastError: "Download timed out on watchdog after max attempts",
               updatedAt: new Date(),
             })
-            .where(eq(schema.pipelineJob.id, hj.id));
+            .where(and(eq(schema.pipelineJob.id, hj.id), eq(schema.pipelineJob.status, "downloading"), lt(schema.pipelineJob.heartbeatAt, tenMinsAgo)));
         }
       }
 
@@ -160,15 +161,7 @@ export const recoveryWatchdogFn = inngest.createFunction(
       );
 
       return {
-        rediscoveredJobs: jobsAllowedToDispatch.map((j) => ({
-          id: j.id,
-          anilistId: j.anilistId,
-          animeId: j.animeId,
-          anidbId: j.anidbId,
-          episodeNumber: j.episodeNumber,
-          types: j.types,
-          knownTitles: j.knownTitles || [],
-        })),
+        rediscoveredJobs: jobsAllowedToDispatch.map(job => discoveryEvent(job, "watchdog")),
         reattachedBatchCount: batchesToResume.length,
         expiredBatchCount,
         dispatchedBatchIds: allBatchIdsToDispatch,
@@ -177,20 +170,8 @@ export const recoveryWatchdogFn = inngest.createFunction(
     });
 
     // Dispatch rediscovered jobs
-    for (const j of plan.rediscoveredJobs) {
-      await step.sendEvent(`watchdog-discover-job-${j.id}`, {
-        name: "pipeline/job.discover",
-        id: `pipe-job-${j.id}-watchdog-${Date.now()}`,
-        data: {
-          jobId: j.id,
-          anilistId: j.anilistId,
-          animeId: j.animeId,
-          anidbId: j.anidbId,
-          episodeNumber: j.episodeNumber,
-          types: j.types,
-          knownTitles: j.knownTitles,
-        },
-      });
+    for (const event of plan.rediscoveredJobs) {
+      await step.sendEvent(`watchdog-discover-job-${event.data.jobId}`, event);
     }
 
     // Dispatch created / re-attached / newly sealed batches

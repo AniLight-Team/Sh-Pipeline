@@ -3,64 +3,58 @@ import { db, schema } from "../db/index.js";
 import { eq, desc, sql, and, inArray, asc, notInArray, isNull, or } from "drizzle-orm";
 import { PipelineEngineService } from "../engine/service.js";
 import { AnimeMetadataResolver } from "../engine/metadata-resolver.js";
-import { MAIN_BACKEND_URL } from "../config.js";
+import { timingSafeEqual } from "node:crypto";
+import { z } from "zod";
+import { INTERNAL_SECRET } from "../config.js";
+import { discoveryEvent } from "../engine/job-scheduling.js";
 import { inngest } from "../inngest/client.js";
 import { log } from "../utils/logger.js";
 import type {
-  EnqueueRequest,
-  PipelineEpisodeResult,
   PipelineExecutionPolicy,
 } from "../engine/types.js";
 
-/**
- * Helper that dispatches a job discovery event via Inngest, falling back to direct async execution
- * if the external Inngest server (:8288) is unreachable.
- */
-async function dispatchJobDiscovery(job: {
-  id: number;
-  anilistId?: number | null;
-  animeId?: number | null;
-  anidbId?: number | null;
-  episodeNumber: number;
-  types: string[];
-  knownTitles?: string[] | null;
-}) {
+const positiveId = z.number().int().positive();
+const streamTypes = z.array(z.enum(["sub", "dub"])).min(1).max(2);
+const enqueueSchema = z.object({
+  animeId: positiveId.optional(),
+  anilistId: positiveId.optional(),
+  anidbId: positiveId.optional(),
+  episodeNumbers: z.array(positiveId).min(1).max(1000).optional(),
+  types: streamTypes.optional(),
+  episodes: z.array(z.object({
+    episodeNumber: positiveId,
+    types: streamTypes,
+    sourceJobId: positiveId.nullable().optional(),
+    sourceUrl: z.url({ protocol: /^https?$/ }).max(2048).optional(),
+  })).min(1).max(100).optional(),
+  kind: z.enum(["release", "stream_refresh", "caption_refresh"]).optional(),
+  requestId: z.string().min(1).max(200).optional(),
+  knownTitles: z.array(z.string().min(1).max(500)).max(30).optional(),
+  episodeCount: positiveId.optional(),
+  metadata: z.record(z.string(), z.any()).optional(),
+  executionPolicy: z.enum(["all", "vm_remux_only", "kaggle_gpu_only"]).optional(),
+});
+
+async function dispatchJobDiscovery(...jobs: Parameters<typeof discoveryEvent>[0][]) {
+  if (!jobs.length) return;
   try {
-    await inngest.send({
-      name: "pipeline/job.discover",
-      id: `pipe-job-${job.id}-discover-${Date.now()}`,
-      data: {
-        jobId: job.id,
-        anilistId: job.anilistId,
-        animeId: job.animeId,
-        anidbId: job.anidbId,
-        episodeNumber: job.episodeNumber,
-        types: job.types,
-        knownTitles: job.knownTitles || [],
-      },
-    });
+    await inngest.send(jobs.map(job => discoveryEvent(job, "discover")));
   } catch (err: any) {
-    log.warn("API", `Inngest server unreachable (${err?.message || err}); queuing discovery for Job #${job.id} in high-concurrency background worker.`);
-    PipelineEngineService.stage1DiscoveryQueue
-      .add(async () => {
-        try {
-          const res = await PipelineEngineService.discoverAndStageJob(job.id);
-          if (res.status === "staged") {
-            await PipelineEngineService.drainVmRemuxQueue();
-            const readiness = await PipelineEngineService.evaluateBatchSealReadiness(false);
-            if (readiness.shouldSeal) {
-              const batchIds = await PipelineEngineService.sealAvailableBatches({
-                forceFlush: false,
-                triggerReason: readiness.reason,
-              });
-              for (const bId of batchIds) {
-                await PipelineEngineService.executeBatch(bId).catch(() => {});
-              }
-            }
-          }
-        } catch {}
-      })
-      .catch(() => {});
+    log.warn("API", `Inngest server unavailable (${err?.message || err}); using the background queue for ${jobs.length} job(s).`);
+    for (const job of jobs) {
+      PipelineEngineService.stage1DiscoveryQueue.add(async () => {
+        const result = await PipelineEngineService.discoverAndStageJob(job.id);
+        if (result.status !== "staged") return;
+        await PipelineEngineService.drainVmRemuxQueue();
+        const readiness = await PipelineEngineService.evaluateBatchSealReadiness(false);
+        if (!readiness.shouldSeal) return;
+        const batchIds = await PipelineEngineService.sealAvailableBatches({
+          forceFlush: false,
+          triggerReason: readiness.reason,
+        });
+        for (const id of batchIds) await PipelineEngineService.executeBatch(id).catch(() => {});
+      }).catch(error => log.warn("API", `Background discovery for job #${job.id}: ${String(error)}`));
+    }
   }
 }
 
@@ -186,33 +180,30 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
   });
 
   app.post("/pipeline/enqueue", async (req, reply) => {
-    const body = req.body as EnqueueRequest;
-    const hasId = Boolean(
-      body?.anilistId ||
-      body?.anidbId ||
-      body?.animeId ||
-      body?.metadata?.anilistId ||
-      body?.metadata?.animeId,
-    );
-    if (!hasId || !Array.isArray(body?.episodeNumbers) || body.episodeNumbers.length === 0) {
-      return reply.status(400).send({ error: "anilistId (or anidbId/animeId) and episodeNumbers are required" });
+    const parsed = enqueueSchema.safeParse(req.body);
+    if (!parsed.success) return reply.status(400).send({ error: "Invalid enqueue request" });
+    const body = parsed.data;
+    if (!(body.anilistId || body.animeId || body.anidbId ||
+        positiveId.safeParse(Number(body.metadata?.anilistId)).success ||
+        positiveId.safeParse(Number(body.metadata?.animeId)).success)) {
+      return reply.status(400).send({ error: "An anime identifier is required" });
+    }
+    if (body.kind || body.episodes || body.requestId) {
+      const token = req.headers["x-internal-secret"];
+      if (!INTERNAL_SECRET) return reply.status(503).send({ error: "Pipeline authentication is not configured" });
+      if (typeof token !== "string" || Buffer.byteLength(token) !== Buffer.byteLength(INTERNAL_SECRET) ||
+          !timingSafeEqual(Buffer.from(token), Buffer.from(INTERNAL_SECRET))) {
+        return reply.status(401).send({ error: "Unauthorized" });
+      }
+      if (!body.episodes || !body.kind || !body.requestId) {
+        return reply.status(400).send({ error: "episodes, kind, and requestId are required" });
+      }
+    } else if (!body.episodeNumbers) {
+      return reply.status(400).send({ error: "episodeNumbers are required" });
     }
 
     const res = await PipelineEngineService.enqueue(body);
-
-    // Fan-out discovery for newly queued jobs
-    for (const j of res.queuedJobs) {
-      await dispatchJobDiscovery({
-        id: j.id,
-        anilistId: j.anilistId,
-        animeId: j.animeId,
-        anidbId: j.anidbId,
-        episodeNumber: j.episodeNumber,
-        types: j.types,
-        knownTitles: body.knownTitles || [],
-      });
-    }
-
+    await dispatchJobDiscovery(...res.queuedJobs);
     return res;
   });
 
@@ -269,6 +260,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
         batchId: null,
         lastError: null,
         attempt: 0,
+          discoverAfter: null,
         heartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -381,6 +373,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
             batchId: null,
             lastError: null,
             attempt: 0,
+            discoverAfter: null,
             heartbeatAt: new Date(),
             updatedAt: new Date(),
           })
@@ -465,31 +458,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     if (action === "sync_callbacks") {
       let delivered = 0;
       for (const job of targetJobs) {
-        const resultPayload = job.resultPayload as PipelineEpisodeResult | null;
-        if (!resultPayload) continue;
-        const targetUrl = job.callbackUrl || `${MAIN_BACKEND_URL}/api/internal/pipeline/completed`;
-        const payloads: PipelineEpisodeResult[] = Array.isArray(resultPayload.allTrackPayloads)
-          ? resultPayload.allTrackPayloads
-          : [resultPayload];
-        let allOk = true;
-        for (const p of payloads) {
-          const ok = await PipelineEngineService.deliverCallbackPayload(targetUrl, p, 2);
-          if (!ok) allOk = false;
-        }
-        if (allOk) {
-          delivered++;
-          await db
-            .update(schema.pipelineJob)
-            .set({
-              metadata: {
-                ...(job.metadata || {}),
-                callbackDelivered: true,
-                callbackDeliveredAt: new Date().toISOString(),
-              },
-              updatedAt: new Date(),
-            })
-            .where(eq(schema.pipelineJob.id, job.id));
-        }
+        if (await PipelineEngineService.retryJobCallback(job.id, true)) delivered++;
       }
       return {
         ok: true,
@@ -522,6 +491,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
           batchId: null,
           lastError: null,
           attempt: 0,
+          discoverAfter: null,
           heartbeatAt: new Date(),
           updatedAt: new Date(),
         })

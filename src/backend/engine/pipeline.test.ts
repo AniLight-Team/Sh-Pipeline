@@ -73,6 +73,8 @@ test("VideoEncodingManager.determineTracksToEncode maps sub, dub, and dual-audio
   ]);
   assert.deepEqual(vm.determineTracksToEncode(dualProbe, "dub"), [["dub", 1]]);
   assert.deepEqual(vm.determineTracksToEncode(dualProbe, "sub"), [["sub", 0]]);
+  assert.deepEqual(vm.determineTracksToEncode({ ...dualProbe, englishStreamIndex: null }, "dub"), []);
+  assert.deepEqual(vm.determineTracksToEncode({ ...dualProbe, japaneseStreamIndex: null }, "sub"), []);
 });
 
 test("SubtitleManager.formatForCallback sets default flags for sub (dialogue) vs dub (signs)", () => {
@@ -104,12 +106,21 @@ test("SubtitleManager.formatForCallback sets default flags for sub (dialogue) vs
   ];
 
   const subFormatted = SubtitleManager.formatForCallback(r2Records, "sub");
-  assert.equal(subFormatted[0].isDefault, true);
-  assert.equal(subFormatted[1].isDefault, false);
+  assert.deepEqual(subFormatted.map(track => [track.language, track.isDefault]), [["en", true]]);
 
   const dubFormatted = SubtitleManager.formatForCallback(r2Records, "dub");
-  assert.equal(dubFormatted[0].isDefault, false);
-  assert.equal(dubFormatted[1].isDefault, true);
+  assert.deepEqual(dubFormatted.map(track => [track.language, track.isDefault]), [["en-signs", true]]);
+});
+
+test("ReleaseFilter rejects announced raw and explicitly unsubtitled releases for sub work", () => {
+  const raw = { id: 1, title: "[Group] Example Anime - 02 (1080p) [RAW].mkv", seeders: 50 };
+  const noSub = { id: 2, title: "[Group] Example Anime - 02 (1080p).mkv", seeders: 50, sublangs: [] };
+  const candidate = { ...noSub, id: 3, sublangs: ["en"] };
+  assert.deepEqual(
+    ReleaseFilter.selectTopCandidates([raw, noSub, candidate], 2, "sub", { knownTitles: ["Example Anime"] })
+      .map(([item]) => item.id),
+    [3],
+  );
 });
 
 test("ReleaseFilter parses dual-audio and single episode releases accurately", () => {

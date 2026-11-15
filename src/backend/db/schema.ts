@@ -76,6 +76,8 @@ export const pipelineJob = pgTable(
     callbackUrl: text("callback_url"),
     attempt: integer("attempt").notNull().default(1),
     torrentMagnet: text("torrent_magnet"),
+    discoverAfter: timestamp("discover_after", { withTimezone: true }),
+    callbackAfter: timestamp("callback_after", { withTimezone: true }),
     torrentTitle: text("torrent_title"),
     torrentId: integer("torrent_id"),
     stagedFilePath: text("staged_file_path"),
@@ -112,5 +114,7 @@ export const pipelineJob = pgTable(
     index("sh_pipeline_job_anime_idx").on(table.animeId),
     index("sh_pipeline_job_anidb_idx").on(table.anidbId, table.episodeNumber),
     index("sh_pipeline_job_batch_idx").on(table.batchId),
+    index("sh_pipeline_job_discover_after_idx").on(table.status, table.discoverAfter),
+    index("sh_pipeline_job_callback_after_idx").on(table.status, table.callbackAfter),
   ],
 );

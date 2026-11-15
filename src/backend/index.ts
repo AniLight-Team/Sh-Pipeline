@@ -21,6 +21,7 @@ import { PipelineEngineService } from "./engine/service.js";
 import { db, schema } from "./db/index.js";
 import { eq, lt, and, inArray } from "drizzle-orm";
 import { log } from "./utils/logger.js";
+import { discoveryEvent, queuedDiscoveryCondition } from "./engine/job-scheduling.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -192,7 +193,7 @@ async function runAutonomousReconciliationTick() {
         .from(schema.pipelineJob)
         .where(
           and(
-            eq(schema.pipelineJob.status, "queued"),
+            queuedDiscoveryCondition(),
             lt(schema.pipelineJob.updatedAt, ninetySecsAgo),
           ),
         )
@@ -205,19 +206,7 @@ async function runAutonomousReconciliationTick() {
           .set({ updatedAt: new Date() })
           .where(eq(schema.pipelineJob.id, j.id));
         await inngest
-          .send({
-            name: "pipeline/job.discover",
-            id: `pipe-job-${j.id}-auto-${Date.now()}`,
-            data: {
-              jobId: j.id,
-              anilistId: j.anilistId,
-              animeId: j.animeId,
-              anidbId: j.anidbId,
-              episodeNumber: j.episodeNumber,
-              types: j.types,
-              knownTitles: j.knownTitles || [],
-            },
-          })
+          .send(discoveryEvent(j, "auto"))
           .catch(() => {
             PipelineEngineService.stage1DiscoveryQueue
               .add(async () => {
