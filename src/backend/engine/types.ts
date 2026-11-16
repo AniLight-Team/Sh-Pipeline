@@ -22,6 +22,7 @@ export interface AnimeToshoItem {
   article_url?: string;
   date?: number;
   num_files?: number;
+  anidb_aid?: number | string | null;
   is_seadex?: boolean;
   provider?: "animetosho" | "tsukihime";
   tsukihime_id?: number;

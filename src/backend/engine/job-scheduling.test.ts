@@ -28,6 +28,7 @@ test("Kira discovery persists release backoff and completes caption repairs with
     await fs.rm(scratch, { recursive: true, force: true });
   });
   await PipelineEngineService.ensureTables();
+  t.mock.method(AnimeMetadataResolver, "resolveDiscoveryTitles", async () => ["Example Anime"]);
   const request = {
     animeId, anilistId: animeId, anidbId: animeId,
     requestId: randomUUID(), knownTitles: ["Example Anime"],

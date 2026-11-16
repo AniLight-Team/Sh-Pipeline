@@ -123,6 +123,31 @@ test("ReleaseFilter rejects announced raw and explicitly unsubtitled releases fo
   );
 });
 
+test("Goblin episode 7 excludes Witch releases before choosing a quality bundle", () => {
+  const knownTitles = [
+    "Tensei Goblin Dakedo Shitsumon Aru?",
+    "So What's Wrong with Getting Reborn as a Goblin?",
+    "転生ゴブリンだけど質問ある？",
+  ];
+  const witch = "Doumo, Suki na Hito ni Horegusuri wo Irai sareta Majo desu";
+  const witch1080 = { id: 1, title: `[Erai-raws] ${witch} - 07 [1080p CR WEB-DL AVC AAC][MultiSub][6136ACFF]`, seeders: 90 };
+  const witch720 = { id: 2, title: `[Erai-raws] ${witch} - 07 [720p CR WEB-DL AVC AAC][MultiSub][7B824FBB]`, seeders: 70 };
+  const goblin1080 = { id: 3, title: "[Erai-raws] Tensei Goblin da kedo Shitsumon Aru - 07 [1080p][MultiSub]", seeders: 8 };
+  const goblin720 = { id: 4, title: "[Erai-raws] 転生ゴブリンだけど質問ある - 07 [720p][MultiSub]", seeders: 5 };
+
+  assert.deepEqual(ReleaseFilter.selectTopCandidateBundles([witch1080, witch720], 7, "sub", { knownTitles }), []);
+  const [bundle] = ReleaseFilter.selectTopCandidateBundles([witch1080, witch720, goblin1080, goblin720], 7, "sub", { knownTitles });
+  assert.equal(bundle.primaryEntry.item.id, goblin1080.id);
+  assert.equal(bundle.qualities["720p"]?.item.id, goblin720.id);
+});
+
+test("Series matching accepts an explicit season match and rejects sequel and spinoff titles", () => {
+  assert.equal(ReleaseFilter.matchesSeriesTitle("Example.Anime.S02E07.1080p", ["Example Anime 2nd Season"]), true);
+  assert.equal(ReleaseFilter.matchesSeriesTitle("[Example] Example Anime S03E07", ["Example Anime 2nd Season"]), false);
+  assert.equal(ReleaseFilter.matchesSeriesTitle("[Example] Example Anime 2 - 07 [1080p]", ["Example Anime"]), false);
+  assert.equal(ReleaseFilter.matchesSeriesTitle("[Example] Example Anime Heroes - 07 [1080p]", ["Example Anime"]), false);
+});
+
 test("ReleaseFilter parses dual-audio and single episode releases accurately", () => {
   const parsed = ReleaseFilter.parseTitle(
     "[SubsPlease] Solo Leveling - 08 (1080p) [ABCD1234].mkv",

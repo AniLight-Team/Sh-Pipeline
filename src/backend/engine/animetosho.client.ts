@@ -48,7 +48,8 @@ export class AnimeToshoClient {
   private static async fetchWithPagination(
     baseUrl: string,
     logContext: string,
-    options: FetchTorrentsOptions = {},
+    options: FetchTorrentsOptions,
+    matchesSeries: (item: AnimeToshoItem) => boolean,
   ): Promise<AnimeToshoItem[]> {
     const {
       targetEp,
@@ -82,12 +83,12 @@ export class AnimeToshoClient {
       const pageUniqueItems: AnimeToshoItem[] = [];
       for (const item of pageItems) {
         const itemKey = item.id || item.info_hash || item.title;
-        if (!seenIds.has(itemKey)) {
-          seenIds.add(itemKey);
-          allItems.push(item);
-          pageUniqueItems.push(item);
-          newItemsCount++;
-        }
+        if (seenIds.has(itemKey)) continue;
+        seenIds.add(itemKey);
+        newItemsCount++;
+        if (!matchesSeries(item)) continue;
+        allItems.push(item);
+        pageUniqueItems.push(item);
       }
 
       if (newItemsCount === 0) {
@@ -178,6 +179,13 @@ export class AnimeToshoClient {
       baseUrl,
       `AniDB ID ${anidbId} (query: "${query || "all"}")`,
       options,
+      (item) => {
+        const reportedId = Number(item.anidb_aid);
+        if (reportedId > 0 && reportedId !== anidbId) return false;
+        return !options.knownTitles?.length || ReleaseFilter.matchesSeriesTitle(item.title, options.knownTitles, {
+          allowUnmarkedSeason: reportedId === anidbId,
+        });
+      },
     );
   }
 
@@ -186,16 +194,20 @@ export class AnimeToshoClient {
     query = "1080p",
     options: FetchTorrentsOptions = {},
   ): Promise<AnimeToshoItem[]> {
-    const cleanTitle = title.replace(/[^\w\s-]/g, " ").replace(/\s+/g, " ").trim();
+    const cleanTitle = title.normalize("NFKC")
+      .replace(/[^\p{L}\p{M}\p{N}\s-]+/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!/[\p{L}\p{N}]/u.test(cleanTitle)) return [];
+
+    const knownTitles = options.knownTitles?.length ? options.knownTitles : [title];
     const fullQuery = query ? `${cleanTitle} ${query}` : cleanTitle;
     const baseUrl = `https://feed.animetosho.net/json?qx=1&q=${encodeURIComponent(fullQuery)}`;
     return await this.fetchWithPagination(
       baseUrl,
       `title "${fullQuery}"`,
-      {
-        ...options,
-        knownTitles: options.knownTitles || [title, cleanTitle],
-      },
+      { ...options, knownTitles },
+      (item) => ReleaseFilter.matchesSeriesTitle(item.title, knownTitles),
     );
   }
 }

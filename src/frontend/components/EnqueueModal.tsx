@@ -29,7 +29,6 @@ interface ResolvedPreview {
   titleRomaji?: string;
   totalEpisodes?: number;
   coverImage?: string;
-  synonyms: string[];
   source: string;
 }
 
@@ -93,7 +92,6 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [overrideAnidbId, setOverrideAnidbId] = useState("");
   const [overrideAnimeId, setOverrideAnimeId] = useState("");
-  const [knownTitles, setKnownTitles] = useState("");
 
   useEffect(() => {
     if (!isOpen) {
@@ -150,9 +148,6 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
           }
           if (json.metadata.animeId) {
             setOverrideAnimeId(String(json.metadata.animeId));
-          }
-          if (json.metadata.synonyms?.length > 0) {
-            setKnownTitles(json.metadata.synonyms.join(", "));
           }
         }
       }
@@ -215,10 +210,6 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
         types,
         executionPolicy:
           executionPolicy === "default" ? undefined : executionPolicy,
-        knownTitles: knownTitles
-          .split(",")
-          .map((t) => t.trim())
-          .filter(Boolean),
       };
 
       const res = await fetch("/api/pipeline/enqueue", {
@@ -639,19 +630,6 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                     className="w-full px-3 py-1.5 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] text-[#302e2a] font-mono text-xs focus:outline-none focus:border-indigo-500"
                   />
                 </div>
-              </div>
-
-              <div>
-                <label className="block text-[#716c63] text-[11px] mb-1">
-                  Known Search Titles (Comma-separated)
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. BLEACH: Thousand-Year Blood War - The Calamity"
-                  value={knownTitles}
-                  onChange={(e) => setKnownTitles(e.target.value)}
-                  className="w-full px-3 py-1.5 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] text-[#302e2a] text-xs focus:outline-none focus:border-indigo-500"
-                />
               </div>
 
             </div>

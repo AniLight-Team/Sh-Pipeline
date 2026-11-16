@@ -60,6 +60,70 @@ export class ReleaseFilter {
   public static readonly UNSUPPORTED_CONTAINER_PATTERN =
     /(?:\b|_)(?:bdmv|dvd-iso|bd-iso|\.iso|\.rar|\.zip|\.7z)(?:\b|\d|_)/i;
 
+  private static normalizeSeriesTitle(title: string): string {
+    return title.normalize("NFKC").normalize("NFD")
+      .replace(/(\p{Script=Latin})\p{M}+/gu, "$1")
+      .normalize("NFC")
+      .toLowerCase()
+      .replace(/['’`]/g, "")
+      .replace(/[^\p{L}\p{M}\p{N}]+/gu, " ")
+      .trim();
+  }
+
+  private static seriesTitleEnd(release: string, title: string): number {
+    let end = 0;
+    for (const character of title.replaceAll(" ", "")) {
+      if (release[end] === " ") end++;
+      if (!release.startsWith(character, end)) return -1;
+      end += character.length;
+    }
+    return end === release.length || release[end] === " " ? end : -1;
+  }
+
+  public static matchesSeriesTitle(
+    releaseTitle: string,
+    knownTitles: (string | null | undefined)[],
+    { allowUnmarkedSeason = false } = {},
+  ): boolean {
+    if (typeof releaseTitle !== "string") return false;
+    const releaseName = releaseTitle.normalize("NFKC")
+      .replace(/^(?:\s*\[[^\]]+\])+\s*/, "")
+      .replace(/\.(?:mkv|mp4|avi|webm)$/i, "");
+    const release = this.normalizeSeriesTitle(releaseName);
+    const episodeDivider = Array.from(releaseName.matchAll(/\s+[-–—]\s+(?=\d{1,4}(?:v\d+)?\b)/gi)).at(-1);
+    const beforeEpisode = episodeDivider ? this.normalizeSeriesTitle(releaseName.slice(0, episodeDivider.index)) : "";
+    const seasonStart = /^(?:(\d{1,2})(?:st|nd|rd|th) season|season (\d{1,2})|s(\d{1,2}))(?=e\d| |$)/;
+    const releaseSuffix = /^(?:\d{1,4}(?:v\d+)?|e(?:p(?:isode)?)? ?\d+(?:v\d+)?|第 ?\d+ ?話|\d{3,4}p|4k|batch|complete|collection|web|bd|bluray|hevc|av1|h264|x264|x265)(?: |$)/;
+
+    return knownTitles.some(raw => {
+      const title = this.normalizeSeriesTitle(raw ?? "");
+      if (!title) return false;
+      if (release === title) return true;
+      const seasonEnd = title.match(/ (\d{1,2}(?:st|nd|rd|th) season|season \d{1,2}|s\d{1,2})$/);
+      const baseTitle = seasonEnd ? title.slice(0, seasonEnd.index) : title;
+      const titleEnd = this.seriesTitleEnd(release, baseTitle);
+      if (titleEnd < 0) return false;
+
+      let suffix = release.slice(titleEnd).trimStart();
+      const releaseSeason = suffix.match(seasonStart);
+      if (releaseSeason) {
+        const season = Number(releaseSeason[1] || releaseSeason[2] || releaseSeason[3]);
+        const expectedSeason = seasonEnd ? Number(seasonEnd[1].match(/\d+/)?.[0]) : null;
+        if (expectedSeason !== null ? season !== expectedSeason : season !== 1 && !allowUnmarkedSeason) {
+          return false;
+        }
+        suffix = suffix.slice(releaseSeason[0].length).trimStart();
+      } else if (seasonEnd && !allowUnmarkedSeason) {
+        return false;
+      } else if (/^\d/.test(beforeEpisode.slice(titleEnd).trimStart())) {
+        // A number in the title before the explicit episode separator can denote a different series.
+        return false;
+      }
+
+      return !suffix || releaseSuffix.test(suffix);
+    });
+  }
+
   private static expandKnownTitleVariants(
     knownTitles?: (string | null | undefined)[],
   ): RegExp[] {
@@ -745,6 +809,11 @@ export class ReleaseFilter {
       minSeeders = DEFAULT_MIN_SEEDERS,
     } = options;
 
+    const eligibleTorrents = knownTitles?.length
+      ? torrentList.filter(item => this.matchesSeriesTitle(item.title, knownTitles, {
+          allowUnmarkedSeason: item.provider === "tsukihime" || Number(item.anidb_aid) > 0,
+        }))
+      : torrentList;
     const candidatesToTry: (number | string)[] = [targetEp];
 
     if (String(targetEp).toLowerCase() !== "all") {
@@ -753,7 +822,7 @@ export class ReleaseFilter {
         candidatesToTry.unshift(tNum + episodeOffset);
       }
       const inferredOffsets = this.inferCumulativeOffsets(
-        torrentList,
+        eligibleTorrents,
         tNum,
         knownTitles,
         totalExpectedEps,
@@ -782,7 +851,7 @@ export class ReleaseFilter {
 
     for (const candidateEp of candidatesToTry) {
       const isDirectMatch = candidateEp === targetEp;
-      for (const t of torrentList) {
+      for (const t of eligibleTorrents) {
         let score = this.scoreTorrent(
           t,
           candidateEp,

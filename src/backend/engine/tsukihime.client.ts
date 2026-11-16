@@ -6,6 +6,7 @@ import type {
   VideoResolutionQuality,
 } from "./types.js";
 import type { FetchTorrentsOptions } from "./animetosho.client.js";
+import { canonicalDiscoveryTitles } from "./discovery-titles.js";
 import { ReleaseFilter } from "./release-filter.js";
 import { log } from "../utils/logger.js";
 
@@ -158,60 +159,43 @@ export class TsukihimeClient {
     const { tsukihimeId, anilistId, malId, anidbId } = lookup;
     const now = Date.now();
 
+    const externalIds = [
+      ["anilist", "AniList", anilistId],
+      ["mal", "MAL", malId],
+      ["anidb", "AniDB", anidbId],
+    ] as const;
+    for (const [field, label, id] of externalIds) {
+      if (!id || id <= 0) continue;
+      const cached = animeLookupCache.get(`${field}:${id}`);
+      const cachedAnime = cached && cached.expiresAt > now ? cached.data : undefined;
+      const data = cachedAnime ?? await this.requestJson<TsukihimeAnime>(`/animes/${field}/${id}`);
+      if (!data || !Number.isInteger(data.id) || data.id <= 0) continue;
+
+      const returnedId = Number(data[field]);
+      const returnedAniListId = Number(data.anilist);
+      if (
+        (returnedId > 0 && returnedId !== id) ||
+        (anilistId && anilistId > 0 && returnedAniListId > 0 && returnedAniListId !== anilistId)
+      ) {
+        log.warn("Tsukihime", `Ignoring conflicting mapping for ${label} #${id} (Tsukihime #${data.id}).`);
+        continue;
+      }
+
+      if (cachedAnime) return cachedAnime;
+      this.cacheAnime(data);
+      log.info(
+        "Tsukihime",
+        `Resolved ${label} #${id} -> Tsukihime #${data.id} ("${data.title}", eps=${data.total_episodes ?? "?"})`,
+      );
+      return data;
+    }
+
     if (tsukihimeId && tsukihimeId > 0) {
       const cached = animeLookupCache.get(`id:${tsukihimeId}`);
-      if (cached && cached.expiresAt > now) return cached.data;
-    }
-    if (anilistId && anilistId > 0) {
-      const cached = animeLookupCache.get(`anilist:${anilistId}`);
-      if (cached && cached.expiresAt > now) return cached.data;
-    }
-    if (malId && malId > 0) {
-      const cached = animeLookupCache.get(`mal:${malId}`);
-      if (cached && cached.expiresAt > now) return cached.data;
-    }
-    if (anidbId && anidbId > 0) {
-      const cached = animeLookupCache.get(`anidb:${anidbId}`);
-      if (cached && cached.expiresAt > now) return cached.data;
-    }
-
-    // 1. Try AniList ID first
-    if (anilistId && anilistId > 0) {
-      const data = await this.requestJson<TsukihimeAnime>(`/animes/anilist/${anilistId}`);
-      if (data && typeof data.id === "number" && data.id > 0) {
-        this.cacheAnime(data);
-        log.info(
-          "Tsukihime",
-          `Resolved AniList #${anilistId} -> Tsukihime #${data.id} ("${data.title}", eps=${data.total_episodes ?? "?"})`,
-        );
-        return data;
-      }
-    }
-
-    // 2. Fallback to MAL ID
-    if (malId && malId > 0) {
-      const data = await this.requestJson<TsukihimeAnime>(`/animes/mal/${malId}`);
-      if (data && typeof data.id === "number" && data.id > 0) {
-        this.cacheAnime(data);
-        log.info(
-          "Tsukihime",
-          `Resolved MAL #${malId} -> Tsukihime #${data.id} ("${data.title}", eps=${data.total_episodes ?? "?"})`,
-        );
-        return data;
-      }
-    }
-
-    // 3. Fallback to AniDB ID
-    if (anidbId && anidbId > 0) {
-      const data = await this.requestJson<TsukihimeAnime>(`/animes/anidb/${anidbId}`);
-      if (data && typeof data.id === "number" && data.id > 0) {
-        this.cacheAnime(data);
-        log.info(
-          "Tsukihime",
-          `Resolved AniDB #${anidbId} -> Tsukihime #${data.id} ("${data.title}", eps=${data.total_episodes ?? "?"})`,
-        );
-        return data;
-      }
+      if (
+        cached && cached.expiresAt > now &&
+        (!anilistId || anilistId <= 0 || Number(cached.data.anilist) === anilistId)
+      ) return cached.data;
     }
 
     return null;
@@ -336,6 +320,10 @@ export class TsukihimeClient {
       let added = 0;
       for (const entry of body.results) {
         if (!entry || !entry.btih || !entry.name || entry.is_adult) continue;
+        if (
+          knownTitles.length > 0 &&
+          !ReleaseFilter.matchesSeriesTitle(entry.name, knownTitles, { allowUnmarkedSeason: true })
+        ) continue;
         const hashKey = entry.btih.toLowerCase();
         if (!seenHashes.has(hashKey)) {
           seenHashes.add(hashKey);
@@ -344,7 +332,7 @@ export class TsukihimeClient {
         }
       }
 
-      if (added === 0) break;
+      if (added === 0 && knownTitles.length === 0) break;
 
       if (targetEpNum !== null) {
         const candidates = ReleaseFilter.selectTopCandidates(
@@ -398,20 +386,16 @@ export class TsukihimeClient {
       episodeCount = anime.total_episodes || null,
     } = options;
 
-    const mergedKnownTitles = Array.from(
-      new Set(
-        [
-          ...(knownTitles || []),
-          anime.title,
-          anime.english_title,
-        ].filter(Boolean) as string[],
-      ),
-    );
+    const seriesTitles = knownTitles.length > 0
+      ? knownTitles
+      : canonicalDiscoveryTitles({ titleRomaji: anime.title, titleEnglish: anime.english_title });
+    if (seriesTitles.length === 0) return { anime, torrents: [] };
 
     const allItems: AnimeToshoItem[] = [];
     const seenHashes = new Set<string>();
     const addItems = (items: AnimeToshoItem[]) => {
       for (const item of items) {
+        if (!ReleaseFilter.matchesSeriesTitle(item.title, seriesTitles, { allowUnmarkedSeason: true })) continue;
         const key = (item.info_hash || item.title).toLowerCase();
         if (!seenHashes.has(key)) {
           seenHashes.add(key);
@@ -433,7 +417,7 @@ export class TsukihimeClient {
       const inferredOffsets = ReleaseFilter.inferCumulativeOffsets(
         allItems,
         targetEpNum,
-        mergedKnownTitles,
+        seriesTitles,
         episodeCount,
       );
       for (const off of inferredOffsets) {
@@ -449,26 +433,26 @@ export class TsukihimeClient {
         targetEpNum,
         langType,
         {
-          knownTitles: mergedKnownTitles,
+          knownTitles: seriesTitles,
           totalExpectedEps: episodeCount,
           maxCandidates: 4,
         },
       );
 
       const hasTopQuality = epCandidates.some(([item, effectiveEp]) =>
-        ReleaseFilter.isHighQualityCandidate(item, effectiveEp, langType, mergedKnownTitles),
+        ReleaseFilter.isHighQualityCandidate(item, effectiveEp, langType, seriesTitles),
       );
 
       const langLower = String(langType).toLowerCase();
       const hasRequiredLangMatch =
         langLower === "dub"
           ? epCandidates.some(([item]) => {
-              const parsed = ReleaseFilter.parseTitle(item.title || "", mergedKnownTitles, item);
+              const parsed = ReleaseFilter.parseTitle(item.title || "", seriesTitles, item);
               return Boolean(parsed.isH264 && (parsed.isDualAudio || parsed.isEnglishDub));
             })
           : langLower === "all"
             ? epCandidates.some(([item]) => {
-                const parsed = ReleaseFilter.parseTitle(item.title || "", mergedKnownTitles, item);
+                const parsed = ReleaseFilter.parseTitle(item.title || "", seriesTitles, item);
                 return Boolean(parsed.isH264 && parsed.isDualAudio);
               })
             : true;
@@ -486,7 +470,7 @@ export class TsukihimeClient {
     // 2. Also paginate /animes/{id}?limit=50&offset=... to catch batches or unindexed episode_no entries
     const paginatedItems = await this.fetchAllAnimeTorrents(anime.id, {
       ...options,
-      knownTitles: mergedKnownTitles,
+      knownTitles: seriesTitles,
       episodeCount,
     });
     addItems(paginatedItems);
@@ -498,29 +482,32 @@ export class TsukihimeClient {
    * Enriches selected Tsukihime candidates via GET /v1/torrents/{id} to attach live tracker
    * seeders/leechers and full tracker announce URLs onto magnet_uri.
    */
+  private static async hydrateCandidate(item: AnimeToshoItem): Promise<AnimeToshoItem> {
+    if (item.provider !== "tsukihime" || !item.tsukihime_id || !item.info_hash) return item;
+    const detail = await this.requestJson<TsukihimeTorrentEntry>(`/torrents/${item.tsukihime_id}`);
+    if (!detail) return item;
+    if (
+      detail.id !== item.tsukihime_id ||
+      typeof detail.btih !== "string" ||
+      detail.btih.trim().toLowerCase() !== item.info_hash.trim().toLowerCase()
+    ) {
+      log.warn("Tsukihime", `Ignoring conflicting torrent details for Tsukihime #${item.tsukihime_id}.`);
+      return item;
+    }
+    const enriched = this.toAnimeToshoItem({ ...detail, name: item.title });
+    return {
+      ...item,
+      ...enriched,
+      tsukihime_episode_no: item.tsukihime_episode_no ?? enriched.tsukihime_episode_no,
+    };
+  }
+
   public static async hydrateCandidates(
     candidates: [AnimeToshoItem, number | string][],
   ): Promise<[AnimeToshoItem, number | string][]> {
     const hydrated: [AnimeToshoItem, number | string][] = [];
     for (const [item, effectiveEp] of candidates) {
-      if (item.provider === "tsukihime" && item.tsukihime_id) {
-        const detail = await this.requestJson<TsukihimeTorrentEntry>(
-          `/torrents/${item.tsukihime_id}`,
-        );
-        if (detail) {
-          const enriched = this.toAnimeToshoItem(detail);
-          hydrated.push([
-            {
-              ...item,
-              ...enriched,
-              tsukihime_episode_no: item.tsukihime_episode_no ?? enriched.tsukihime_episode_no,
-            },
-            effectiveEp,
-          ]);
-          continue;
-        }
-      }
-      hydrated.push([item, effectiveEp]);
+      hydrated.push([await this.hydrateCandidate(item), effectiveEp]);
     }
     return hydrated;
   }
@@ -539,30 +526,9 @@ export class TsukihimeClient {
       for (const qKey of ["1080p", "720p", "480p"] as VideoResolutionQuality[]) {
         const entry = bundle.qualities[qKey];
         if (!entry) continue;
-        const item = entry.item;
-        if (item.provider === "tsukihime" && item.tsukihime_id) {
-          const detail = await this.requestJson<TsukihimeTorrentEntry>(
-            `/torrents/${item.tsukihime_id}`,
-          );
-          if (detail) {
-            const enriched = this.toAnimeToshoItem(detail);
-            // If this is a lower quality (720p/480p) and tracker hydration shows 0 seeders, skip it
-            if (qKey !== "1080p" && (enriched.seeders || 0) === 0) {
-              continue;
-            }
-            nextQualities[qKey] = {
-              ...entry,
-              item: {
-                ...item,
-                ...enriched,
-                tsukihime_episode_no:
-                  item.tsukihime_episode_no ?? enriched.tsukihime_episode_no,
-              },
-            };
-            continue;
-          }
-        }
-        nextQualities[qKey] = entry;
+        const item = await this.hydrateCandidate(entry.item);
+        if (qKey !== "1080p" && item !== entry.item && (item.seeders || 0) === 0) continue;
+        nextQualities[qKey] = { ...entry, item };
       }
       const primaryEntry =
         nextQualities["1080p"] ||

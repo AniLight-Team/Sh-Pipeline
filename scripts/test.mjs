@@ -5,7 +5,14 @@ import path from "node:path";
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "kira-pipeline-tests-"));
 try {
-  const result = spawnSync(process.execPath, ["--import", "tsx", "--test", "src/backend/engine/pipeline.test.ts", "src/backend/engine/hf-upload.test.ts"], {
+  const result = spawnSync(process.execPath, [
+    "--import", "tsx", "--test",
+    "src/backend/engine/pipeline.test.ts",
+    "src/backend/engine/hf-upload.test.ts",
+    "src/backend/engine/animetosho.client.test.ts",
+    "src/backend/engine/discovery-titles.test.ts",
+    "src/backend/engine/tsukihime.client.test.ts",
+  ], {
     stdio: "inherit",
     env: { ...process.env, DATABASE_URL: "", DEFAULT_DOWNLOAD_DIR: temp, KIRA_STAGING_DIR: path.join(temp, "staging"),
       DOTENV_CONFIG_QUIET: "true", KIRA_MAX_STAGING_GB: "56", KIRA_BATCH_MAX_GB: "10",

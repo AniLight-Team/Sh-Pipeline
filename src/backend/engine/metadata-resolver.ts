@@ -4,10 +4,12 @@ import { db } from "../db/index.js";
 import { sql } from "drizzle-orm";
 import { log } from "../utils/logger.js";
 import { TsukihimeClient } from "./tsukihime.client.js";
+import { canonicalDiscoveryTitles } from "./discovery-titles.js";
 import type { AnimeResolvedMetadata } from "./types.js";
 
 // Cache resolved anime in memory (1 hour TTL)
 const metadataCache = new Map<number, { data: AnimeResolvedMetadata; expiresAt: number }>();
+const discoveryTitleCache = new Map<number, { titles: Promise<string[]>; expiresAt: number }>();
 
 const requestQueue = new PQueue({
   concurrency: 4,
@@ -15,7 +17,75 @@ const requestQueue = new PQueue({
   intervalCap: 4,
 });
 
+interface AniListMedia {
+  id: number;
+  idMal?: number;
+  title?: { romaji?: string; english?: string; native?: string };
+  countryOfOrigin?: string;
+  episodes?: number;
+  coverImage?: { large?: string; medium?: string };
+  status?: string;
+}
+
 export class AnimeMetadataResolver {
+  public static resolveDiscoveryTitles(anilistId: number): Promise<string[]> {
+    const cached = discoveryTitleCache.get(anilistId);
+    if (cached && cached.expiresAt > Date.now()) return cached.titles;
+
+    const entry = {
+      titles: this.loadDiscoveryTitles(anilistId).catch(() => []),
+      expiresAt: Date.now() + 3600_000,
+    };
+    discoveryTitleCache.set(anilistId, entry);
+    void entry.titles.then(titles => {
+      if (titles.length === 0 && discoveryTitleCache.get(anilistId) === entry) {
+        discoveryTitleCache.delete(anilistId);
+      }
+    });
+    return entry.titles;
+  }
+
+  private static async loadDiscoveryTitles(anilistId: number): Promise<string[]> {
+    const local = await this.readLocalDiscoveryTitles(sql`anilist_id = ${anilistId}`);
+    const localTitles = canonicalDiscoveryTitles(local);
+    const native = local.titleNative?.trim() ?? "";
+    // A title written only in Han characters needs its country to distinguish kanji from Chinese.
+    const needsCountry = /\p{Script=Han}/u.test(native) && !localTitles.includes(native);
+    if (localTitles.length > 0 && !needsCountry) return localTitles;
+
+    const media = await this.fetchAniListMedia(anilistId).catch(() => null);
+    if (!media) return localTitles;
+    return canonicalDiscoveryTitles({
+      titleRomaji: local.titleRomaji || media.title?.romaji,
+      titleEnglish: local.titleEnglish || media.title?.english,
+      titleNative: media.title?.native || local.titleNative,
+      countryOfOrigin: media.countryOfOrigin,
+    });
+  }
+
+  public static async resolveLocalDiscoveryTitles(animeId: number): Promise<string[]> {
+    return canonicalDiscoveryTitles(await this.readLocalDiscoveryTitles(sql`id = ${animeId}`));
+  }
+
+  private static async readLocalDiscoveryTitles(where: ReturnType<typeof sql>) {
+    const rows = await db.execute(sql`
+      SELECT title_romaji, title_english, title_native
+      FROM anime
+      WHERE ${where}
+      LIMIT 1
+    `).catch(() => null);
+    const row = rows?.[0] as {
+      title_romaji?: string | null;
+      title_english?: string | null;
+      title_native?: string | null;
+    } | undefined;
+    return {
+      titleRomaji: row?.title_romaji,
+      titleEnglish: row?.title_english,
+      titleNative: row?.title_native,
+    };
+  }
+
   /**
    * Resolves AniList ID to AniDB ID, MAL ID, Tsukihime internal ID, internal anime ID, title variations, and cover art.
    */
@@ -54,10 +124,10 @@ export class AnimeMetadataResolver {
         anidbId: resolved.anidbId,
       });
       if (tsukihimeAnime && tsukihimeAnime.id) {
-        const tsukiSynonyms = [
-          tsukihimeAnime.title,
-          tsukihimeAnime.english_title,
-        ].filter(Boolean) as string[];
+        const tsukiSynonyms = canonicalDiscoveryTitles({
+          titleRomaji: tsukihimeAnime.title,
+          titleEnglish: tsukihimeAnime.english_title,
+        });
         resolved = {
           ...resolved,
           tsukihimeId: tsukihimeAnime.id,
@@ -126,6 +196,7 @@ export class AnimeMetadataResolver {
     if (!resolved.tsukihimeId && (resolved.malId || resolved.anidbId)) {
       try {
         const tsukiFallback = await TsukihimeClient.resolveAnime({
+          anilistId,
           malId: resolved.malId,
           anidbId: resolved.anidbId,
         });
@@ -164,7 +235,7 @@ export class AnimeMetadataResolver {
 
   private static async resolveFromDatabase(anilistId: number): Promise<Partial<AnimeResolvedMetadata> | null> {
     const animeRows = await db.execute(sql`
-      SELECT id, mal_id, title_romaji, title_english, title_native, synonyms, poster_url, episode_count
+      SELECT id, mal_id, title_romaji, title_english, title_native, poster_url, episode_count
       FROM anime
       WHERE anilist_id = ${anilistId}
       LIMIT 1
@@ -195,13 +266,7 @@ export class AnimeMetadataResolver {
     const titleNative = anime.title_native || undefined;
     const primaryTitle = titleRomaji || titleEnglish || `AniList #${anilistId}`;
 
-    const rawSynonyms = Array.isArray(anime.synonyms) ? anime.synonyms : [];
-    const synonyms = Array.from(new Set([
-      ...(titleRomaji ? [titleRomaji] : []),
-      ...(titleEnglish ? [titleEnglish] : []),
-      ...(titleNative ? [titleNative] : []),
-      ...rawSynonyms,
-    ])).filter(Boolean);
+    const synonyms = canonicalDiscoveryTitles({ titleRomaji, titleEnglish, titleNative });
 
     return {
       animeId: Number(anime.id),
@@ -253,14 +318,10 @@ export class AnimeMetadataResolver {
       }
 
       const primaryTitle = data.title || `AniList #${anilistId}`;
-      const rawSynonyms = Array.isArray(data.synonyms) ? data.synonyms : [];
-      const synonyms = Array.from(new Set([primaryTitle, ...rawSynonyms])).filter(Boolean);
-
       return {
         anidbId,
         malId,
         primaryTitle,
-        synonyms,
         totalEpisodes: typeof data.episodes === "number" ? data.episodes : undefined,
         coverImage: data.picture || data.thumbnail || undefined,
         status: data.status || undefined,
@@ -268,7 +329,7 @@ export class AnimeMetadataResolver {
     });
   }
 
-  private static async resolveFromAnilistGraphql(anilistId: number): Promise<Partial<AnimeResolvedMetadata> | null> {
+  private static async fetchAniListMedia(anilistId: number): Promise<AniListMedia | null> {
     return requestQueue.add(async () => {
       const query = `
         query ($id: Int) {
@@ -280,7 +341,7 @@ export class AnimeMetadataResolver {
               english
               native
             }
-            synonyms
+            countryOfOrigin
             episodes
             coverImage {
               large
@@ -306,22 +367,22 @@ export class AnimeMetadataResolver {
       });
 
       if (res.statusCode !== 200 || !res.body) return null;
-      const media = (res.body as any)?.data?.Media;
-      if (!media) return null;
+      const media = (res.body as { data?: { Media?: AniListMedia } })?.data?.Media;
+      return media?.id === anilistId ? media : null;
+    });
+  }
 
-      const titleRomaji = media.title?.romaji || undefined;
-      const titleEnglish = media.title?.english || undefined;
-      const titleNative = media.title?.native || undefined;
-      const primaryTitle = titleEnglish || titleRomaji || `AniList #${anilistId}`;
+  private static async resolveFromAnilistGraphql(anilistId: number): Promise<Partial<AnimeResolvedMetadata> | null> {
+    const media = await this.fetchAniListMedia(anilistId);
+    if (!media) return null;
 
-      const rawSynonyms = Array.isArray(media.synonyms) ? media.synonyms : [];
-      const synonyms = Array.from(new Set([
-        ...(titleRomaji ? [titleRomaji] : []),
-        ...(titleEnglish ? [titleEnglish] : []),
-        ...(titleNative ? [titleNative] : []),
-        ...rawSynonyms,
-      ])).filter(Boolean);
+    const titleRomaji = media.title?.romaji || undefined;
+    const titleEnglish = media.title?.english || undefined;
+    const titleNative = media.title?.native || undefined;
+    const primaryTitle = titleEnglish || titleRomaji || `AniList #${anilistId}`;
+    const synonyms = canonicalDiscoveryTitles({ titleRomaji, titleEnglish, titleNative, countryOfOrigin: media.countryOfOrigin });
 
+    return requestQueue.add(async () => {
       let anidbId: number | undefined;
 
       // If AniList gave us an idMal, check Animap MAL mapping to get AniDB ID

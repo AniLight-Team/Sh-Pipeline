@@ -11,6 +11,7 @@ import { AnimeToshoClient, type FetchTorrentsOptions } from "./animetosho.client
 import { TsukihimeClient } from "./tsukihime.client.js";
 import { ReleaseFilter } from "./release-filter.js";
 import { AnimeMetadataResolver } from "./metadata-resolver.js";
+import { canonicalDiscoveryTitles } from "./discovery-titles.js";
 import {
   DATABASE_URL,
   DEFAULT_DOWNLOAD_DIR,
@@ -559,7 +560,6 @@ export class PipelineEngineService {
       anidbId,
       episodeNumbers,
       types = ["sub", "dub"],
-      knownTitles = [],
       metadata = {},
     } = req;
 
@@ -572,6 +572,9 @@ export class PipelineEngineService {
       if (!isNaN(parsed) && parsed > 0) animeId = parsed;
     }
 
+    let knownTitles = anilistId
+      ? await AnimeMetadataResolver.resolveDiscoveryTitles(anilistId)
+      : animeId ? await AnimeMetadataResolver.resolveLocalDiscoveryTitles(animeId) : [];
     if (anilistId && (!anidbId || !animeId || knownTitles.length === 0)) {
       try {
         const resolved = await AnimeMetadataResolver.resolve(anilistId);
@@ -582,8 +585,8 @@ export class PipelineEngineService {
           if (!animeId && resolved.animeId) {
             animeId = resolved.animeId;
           }
-          if (resolved.synonyms && resolved.synonyms.length > 0) {
-            knownTitles = Array.from(new Set([...knownTitles, ...resolved.synonyms]));
+          if (knownTitles.length === 0) {
+            knownTitles = canonicalDiscoveryTitles(resolved);
           }
           metadata = {
             ...metadata,
@@ -1086,7 +1089,9 @@ export class PipelineEngineService {
         typeof job.metadata?.totalEpisodes === "number" && job.metadata.totalEpisodes > 0
           ? job.metadata.totalEpisodes
           : null;
-      const effectiveKnownTitles = Array.from(new Set([...(job.knownTitles || [])]));
+      let effectiveKnownTitles = job.anilistId
+        ? await AnimeMetadataResolver.resolveDiscoveryTitles(job.anilistId)
+        : job.animeId ? await AnimeMetadataResolver.resolveLocalDiscoveryTitles(job.animeId) : [];
 
       const torrentByKey = new Map<string | number, AnimeToshoItem>();
       const allTorrents: AnimeToshoItem[] = [];
@@ -1180,7 +1185,7 @@ export class PipelineEngineService {
             torrent_url: isMagnet ? undefined : source.torrentMagnet,
           },
           effectiveEp: source.qualitiesPayload?.[quality]?.effectiveEp ??
-            ReleaseFilter.parseTitle(source.torrentTitle, source.knownTitles ?? []).singleEp ?? job.episodeNumber,
+            ReleaseFilter.parseTitle(source.torrentTitle, effectiveKnownTitles).singleEp ?? job.episodeNumber,
           score: 0,
         };
         topBundles = [{
@@ -1216,23 +1221,23 @@ export class PipelineEngineService {
               maxPages: 4,
             },
           );
-          if (tsukiAnime) {
+          if (tsukiAnime && (effectiveKnownTitles.length > 0 || !job.anilistId || Number(tsukiAnime.anilist) === job.anilistId)) {
             if (!totalExpectedEps && tsukiAnime.total_episodes && tsukiAnime.total_episodes > 0) {
               totalExpectedEps = tsukiAnime.total_episodes;
             }
-            if (tsukiAnime.title && !effectiveKnownTitles.includes(tsukiAnime.title)) {
-              effectiveKnownTitles.push(tsukiAnime.title);
-            }
-            if (tsukiAnime.english_title && !effectiveKnownTitles.includes(tsukiAnime.english_title)) {
-              effectiveKnownTitles.push(tsukiAnime.english_title);
+            if (effectiveKnownTitles.length === 0) {
+              effectiveKnownTitles = canonicalDiscoveryTitles({
+                titleRomaji: tsukiAnime.title,
+                titleEnglish: tsukiAnime.english_title,
+              });
             }
             if (tsukiAnime.anidb && tsukiAnime.anidb > 0) {
               tsukihimeAnidbId = tsukiAnime.anidb;
             }
-          }
-          if (tsukiTorrents.length > 0) {
-            mergeTorrents(tsukiTorrents);
-            topBundles = evaluateBundles();
+            if (tsukiTorrents.length > 0) {
+              mergeTorrents(tsukiTorrents);
+              topBundles = evaluateBundles();
+            }
           }
         } catch (tsukiErr: any) {
           log.warn("PipelineEngine", `[Job #${job.id}] Tsukihime search warning: ${tsukiErr?.message || tsukiErr}`);
@@ -1254,16 +1259,21 @@ export class PipelineEngineService {
             AnimeToshoClient.fetchTorrents(aid, "", opts),
             AnimeToshoClient.fetchTorrents(aid, "1080p", opts),
           ]);
-          mergeTorrents(allResItems);
-          mergeTorrents(hdItems);
+          const mergeScopedTorrents = (items: AnimeToshoItem[]) => {
+            mergeTorrents(effectiveKnownTitles.length > 0
+              ? items
+              : items.filter(item => Number(item.anidb_aid) === aid));
+          };
+          mergeScopedTorrents(allResItems);
+          mergeScopedTorrents(hdItems);
           topBundles = evaluateBundles();
 
           if (wantsDub && !hasViableDubBundle()) {
-            mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "dual-audio", opts));
+            mergeScopedTorrents(await AnimeToshoClient.fetchTorrents(aid, "dual-audio", opts));
             topBundles = evaluateBundles();
           }
           if (wantsDub && !hasViableDubBundle()) {
-            mergeTorrents(await AnimeToshoClient.fetchTorrents(aid, "dub", opts));
+            mergeScopedTorrents(await AnimeToshoClient.fetchTorrents(aid, "dub", opts));
             topBundles = evaluateBundles();
           }
         };
