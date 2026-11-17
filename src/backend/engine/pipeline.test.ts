@@ -5,6 +5,7 @@ import { runUploadProcess } from "./hf-upload.js";
 import { SubtitleManager } from "./subtitles.manager.js";
 import { ReleaseFilter } from "./release-filter.js";
 import { TsukihimeClient } from "./tsukihime.client.js";
+import { torrentInfoHash } from "./torrent-identity.js";
 import {
   KIRA_MAX_STAGING_BYTES,
   KIRA_VM_MAX_CONCURRENT_BATCHES,
@@ -13,6 +14,42 @@ import {
   KIRA_DISCOVERY_PER_ANIME_CONCURRENCY,
 } from "../config.js";
 import type { MkvStreamProbe } from "./types.js";
+
+test("torrent identity requires a consistent normalized info hash", () => {
+  const zeros = "0".repeat(40);
+  const other = "b".repeat(40);
+  const title = "Example Anime - 02 (1080p)";
+  assert.equal(torrentInfoHash({ title, info_hash: zeros, magnet_uri: "magnet:?xt=urn%3Abtih%3A" + "A".repeat(32) }), zeros);
+  assert.equal(torrentInfoHash({ title, info_hash: zeros, magnet_uri: "magnet:?xt=urn:btih:" + other }), undefined);
+  assert.equal(torrentInfoHash({ title, magnet_uri: "magnet:?xt=urn:btih:" + zeros + "&xt=urn:btih:" + other }), undefined);
+});
+
+test("Transmission hash mismatch is rejected before examining or starting the torrent", async () => {
+  const { PipelineEngineService } = await import("./service.js");
+  const engine = PipelineEngineService as unknown as { transferEpisodeFile(params: object): Promise<{ ok: boolean; reason: string }> };
+  const hash = "a".repeat(40);
+  let released = false;
+  const transmission = {
+    addTorrent: async (_url: string, _dir: string, paused: boolean) => {
+      assert.equal(paused, true);
+      return { id: 34, hashString: "b".repeat(40), isDuplicate: true };
+    },
+    waitForMetadata: async () => assert.fail("Mismatched torrent metadata must not be used"),
+    startTorrentNow: async () => assert.fail("Mismatched torrent must not be started"),
+    releaseTorrentClaim: async (id: number, index: unknown, deleteData: boolean, complete: boolean, remove: boolean) => {
+      assert.deepEqual([id, index, deleteData, complete, remove], [34, undefined, false, false, false]);
+      released = true;
+    },
+  };
+  const result = await engine.transferEpisodeFile({
+    jobId: 1, episodeNumber: 2, knownTitles: ["Example Anime"],
+    candidate: { title: "[Group] Example Anime - 02 (1080p)", info_hash: hash },
+    effectiveEp: 2, qualityTag: "1080p", transmission, stagingDir: "unused", enforceHardCapBeforeStart: true,
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /different or missing torrent info hash/);
+  assert.equal(released, true);
+});
 
 test("VideoEncodingManager.generateBatchGpuKernelScript configures all three default qualities with AniLight watermark", () => {
   const vm = new VideoEncodingManager({
@@ -231,7 +268,7 @@ test("ReleaseFilter parses dual-audio and single episode releases accurately", (
   assert.equal(parsed.resolution, "1080p");
 });
 
-test("ReleaseFilter infers cumulative cour offsets (+26 and +40) even when relative episodes exist in the same feed", () => {
+test("ReleaseFilter applies an indexed cumulative cour offset alongside relative releases", () => {
   const mockFeed18220 = [
     {
       id: 1,
@@ -250,12 +287,16 @@ test("ReleaseFilter infers cumulative cour offsets (+26 and +40) even when relat
       title: "BLEACH.Thousand.Year.Blood.War.S01E27.A.1080p.DSNP.WEB-DL.AAC2.0.H.264.DUAL-VARYG.mkv",
       seeders: 67,
       num_files: 1,
+      provider: "tsukihime",
+      tsukihime_episode_no: 1,
     },
     {
       id: 4,
       title: "BLEACH.Thousand.Year.Blood.War.S01E40.MY.LAST.WORDS.1080p.DSNP.WEB-DL.AAC2.0.H.264.DUAL-VARYG.mkv",
       seeders: 32,
       num_files: 1,
+      provider: "tsukihime",
+      tsukihime_episode_no: 14,
     },
     {
       id: 5,
@@ -267,6 +308,7 @@ test("ReleaseFilter infers cumulative cour offsets (+26 and +40) even when relat
 
   // Ep 1 with "all" (sub+dub) should select S01E27 DUAL-VARYG (effectiveEp = 27) over Dub-only S04E01
   const topEp1 = ReleaseFilter.selectTopCandidates(mockFeed18220 as any, 1, "all", {
+    totalExpectedEps: 14,
     maxCandidates: 3,
   });
   assert.equal(topEp1.length > 0, true);
@@ -275,6 +317,7 @@ test("ReleaseFilter infers cumulative cour offsets (+26 and +40) even when relat
 
   // Ep 1 with "sub" should also match S01E27 DUAL-VARYG (and reject Dub-only S04E01)
   const topEp1Sub = ReleaseFilter.selectTopCandidates(mockFeed18220 as any, 1, "sub", {
+    totalExpectedEps: 14,
     maxCandidates: 3,
   });
   assert.equal(topEp1Sub.length > 0, true);
@@ -872,6 +915,7 @@ test("ReleaseFilter parses titles containing 'Special' / Season formats and rank
   // Dub-only target for Ep 4 should select Yameii (h264_multi), ToonsHub, AnoZu, and VARYG (via +12 offset -> effectiveEp 16)
   const dubBundles = ReleaseFilter.selectTopCandidateBundles(items, 4, "dub", {
     knownTitles,
+    totalExpectedEps: 12,
     maxBundles: 10,
   });
   assert.equal(dubBundles.length, 4);
@@ -889,6 +933,7 @@ test("ReleaseFilter parses titles containing 'Special' / Season formats and rank
   // Sub+Dub ("all") target for Ep 4 should rank Dual-Audio H.264 ahead of Sub-only (SubsPlease) and Dub-only (Yameii)
   const allBundles = ReleaseFilter.selectTopCandidateBundles(items, 4, "all", {
     knownTitles,
+    totalExpectedEps: 12,
     maxBundles: 10,
   });
   assert.equal(allBundles[0].isDualAudio, true);

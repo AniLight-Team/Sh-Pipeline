@@ -27,6 +27,22 @@ interface AniListMedia {
   status?: string;
 }
 
+function animapIds(sources: unknown, host: string): Set<number> {
+  const ids = new Set<number>();
+  if (!Array.isArray(sources)) return ids;
+  for (const source of sources) {
+    if (typeof source !== "string") continue;
+    const url = URL.canParse(source) ? new URL(source) : null;
+    const id = Number(url?.pathname.match(/^\/anime\/([1-9]\d*)(?:\/|$)/)?.[1]);
+    if (url?.hostname === host && Number.isSafeInteger(id) && id > 0) ids.add(id);
+  }
+  return ids;
+}
+
+function uniqueId(ids: Set<number>): number | undefined {
+  return ids.size === 1 ? ids.values().next().value : undefined;
+}
+
 export class AnimeMetadataResolver {
   public static resolveDiscoveryTitles(anilistId: number): Promise<string[]> {
     const cached = discoveryTitleCache.get(anilistId);
@@ -65,6 +81,12 @@ export class AnimeMetadataResolver {
 
   public static async resolveLocalDiscoveryTitles(animeId: number): Promise<string[]> {
     return canonicalDiscoveryTitles(await this.readLocalDiscoveryTitles(sql`id = ${animeId}`));
+  }
+
+  public static async hasConflictingLocalIdentity(animeId: number, anilistId: number): Promise<boolean> {
+    const rows = await db.execute(sql`SELECT anilist_id FROM anime WHERE id = ${animeId} LIMIT 1`).catch(() => null);
+    const localAniListId = Number(rows?.[0]?.anilist_id);
+    return Number.isSafeInteger(localAniListId) && localAniListId > 0 && localAniListId !== anilistId;
   }
 
   private static async readLocalDiscoveryTitles(where: ReturnType<typeof sql>) {
@@ -122,7 +144,7 @@ export class AnimeMetadataResolver {
         anilistId,
         malId: resolved.malId,
         anidbId: resolved.anidbId,
-      });
+      }, false, undefined, canonicalDiscoveryTitles(resolved));
       if (tsukihimeAnime && tsukihimeAnime.id) {
         const tsukiSynonyms = canonicalDiscoveryTitles({
           titleRomaji: tsukihimeAnime.title,
@@ -199,7 +221,7 @@ export class AnimeMetadataResolver {
           anilistId,
           malId: resolved.malId,
           anidbId: resolved.anidbId,
-        });
+        }, false, undefined, canonicalDiscoveryTitles(resolved));
         if (tsukiFallback?.id) {
           resolved.tsukihimeId = tsukiFallback.id;
           if (!resolved.anidbId && tsukiFallback.anidb) resolved.anidbId = tsukiFallback.anidb;
@@ -300,22 +322,9 @@ export class AnimeMetadataResolver {
       if (res.statusCode !== 200 || !res.body) return null;
       const data = res.body as any;
 
-      let anidbId: number | undefined;
-      let malId: number | undefined;
-
-      if (Array.isArray(data.sources)) {
-        for (const src of data.sources) {
-          if (typeof src !== "string") continue;
-          const anidbMatch = src.match(/anidb\.net\/anime\/(\d+)/i);
-          if (anidbMatch && !anidbId) {
-            anidbId = parseInt(anidbMatch[1], 10);
-          }
-          const malMatch = src.match(/myanimelist\.net\/anime\/(\d+)/i);
-          if (malMatch && !malId) {
-            malId = parseInt(malMatch[1], 10);
-          }
-        }
-      }
+      if (uniqueId(animapIds(data.sources, "anilist.co")) !== anilistId) return null;
+      const anidbId = uniqueId(animapIds(data.sources, "anidb.net"));
+      const malId = uniqueId(animapIds(data.sources, "myanimelist.net"));
 
       const primaryTitle = data.title || `AniList #${anilistId}`;
       return {
@@ -397,14 +406,10 @@ export class AnimeMetadataResolver {
           });
           if (malRes.statusCode === 200 && malRes.body) {
             const malData = malRes.body as any;
-            if (Array.isArray(malData.sources)) {
-              for (const src of malData.sources) {
-                const match = typeof src === "string" && src.match(/anidb\.net\/anime\/(\d+)/i);
-                if (match) {
-                  anidbId = parseInt(match[1], 10);
-                  break;
-                }
-              }
+            const aniListIds = animapIds(malData.sources, "anilist.co");
+            if (uniqueId(animapIds(malData.sources, "myanimelist.net")) === media.idMal &&
+                (!aniListIds.size || uniqueId(aniListIds) === anilistId)) {
+              anidbId = uniqueId(animapIds(malData.sources, "anidb.net"));
             }
           }
         } catch {}

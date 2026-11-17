@@ -58,6 +58,89 @@ test("trailing aliases require the same franchise and the full canonical cour ti
   assert.equal(ReleaseFilter.matchesSeriesTitle("Example Anime S03E02", ["Example Anime 2nd Season"]), false);
 });
 
+test("a split Erai-raws cour title matches all AVC qualities and prefers remux to HEVC", () => {
+  const avc: AnimeToshoItem[] = ["1080p", "720p", "480p"].map((quality, index) => ({
+    id: 36106 - index,
+    title: `[Erai-raws] Bleach S17E50 (Sennen Kessen Hen - Kashin Tan) [${quality} DSNP WEB-DL AVC AAC][MultiSub][459C54CE]`,
+    provider: "tsukihime",
+    tsukihime_episode_no: 10,
+    seeders: 4,
+  }));
+  const hevc: AnimeToshoItem = {
+    id: 36117,
+    title: "[Erai-raws] Bleach Sennen Kessen Hen - Kashin Tan - 10 [1080p HEVC DSNP WEB-DL AAC][MultiSub]",
+    provider: "tsukihime",
+    tsukihime_episode_no: 10,
+    seeders: 35,
+  };
+  const options = { knownTitles: calamityTitles, totalExpectedEps: 10 };
+  const bundles = ReleaseFilter.selectTopCandidateBundles([hevc, ...avc], 10, "sub", options);
+  assert.equal(bundles[0]?.selectionTier, "h264_multi");
+  assert.deepEqual(Object.entries(bundles[0]?.qualities ?? {}).map(([quality, entry]) =>
+    [quality, entry.item.id, entry.effectiveEp]), [["1080p", 36106, 50], ["720p", 36105, 50], ["480p", 36104, 50]]);
+  assert.equal(bundles[1]?.selectionTier, "hevc_av1_gpu");
+
+  const unscoped: AnimeToshoItem = { ...avc[0], provider: "animetosho", tsukihime_episode_no: undefined };
+  assert.equal(ReleaseFilter.matchesSeriesTitle(unscoped.title, calamityTitles), true);
+  assert.deepEqual(ReleaseFilter.selectTopCandidates([unscoped], 10, "sub", options), []);
+  assert.deepEqual(ReleaseFilter.selectTopCandidates([unscoped], 10, "sub", { ...options, episodeOffset: 40 }),
+    [[unscoped, 50]]);
+  for (const title of [
+    unscoped.title.replace("Kashin Tan", "Soukoku Tan"),
+    unscoped.title.replace("Kashin Tan", ""),
+    unscoped.title.replace("Bleach S17E50", "Different Series S17E50"),
+    unscoped.title.replace("Bleach S17E50", "Bleach S00E50"),
+    unscoped.title.replace("Bleach S17E50", "Bleach S17E00"),
+  ]) assert.equal(ReleaseFilter.matchesSeriesTitle(title, calamityTitles), false, title);
+});
+
+test("provider indexes and title prefixes cannot substitute a different show or episode", () => {
+  const options = { knownTitles: ["Example Anime"], totalExpectedEps: 12 };
+  const releases: AnimeToshoItem[] = [
+    { title: "[SubsPlease] Different Anime - 03 (1080p)", seeders: 20 },
+    { title: "[SubsPlease] Example Anime S02E03 (1080p)", seeders: 20 },
+    { title: "[SubsPlease] Example Anime 2 S01E03 (1080p)", seeders: 20 },
+    { title: "[SubsPlease] Example Anime - 04 (1080p)", seeders: 20 },
+    { title: "[SubsPlease] Example Anime [1080p]", seeders: 20 },
+    { title: "[SubsPlease] Example Anime - 15 (1080p)", seeders: 20 },
+  ].map(item => ({ ...item, provider: "tsukihime", tsukihime_episode_no: 3 }));
+  assert.deepEqual(ReleaseFilter.selectTopCandidates(releases, 3, "sub", options), []);
+  assert.deepEqual(ReleaseFilter.selectTopCandidates([releases[5]], 15, "sub", options), []);
+  assert.ok(ReleaseFilter.scoreTorrent(releases[0], 3, "sub", options.knownTitles) < 0);
+  assert.equal(ReleaseFilter.isHighQualityCandidate(releases[0], 3, "sub", options.knownTitles), false);
+  assert.deepEqual(ReleaseFilter.selectTopCandidates([
+    { title: "[SubsPlease] Example Anime - 03 (1080p)", seeders: 20, provider: "tsukihime", tsukihime_episode_no: 3 },
+    { title: "[SubsPlease] Example Anime Complete (01-12) [1080p]", seeders: 20, provider: "tsukihime", num_files: 12 },
+  ], 3, "sub", { ...options, knownTitles: ["Example Anime 2nd Season"] }), []);
+});
+
+test("sparse later episodes and partial batches do not establish a cour offset", () => {
+  const releases: AnimeToshoItem[] = [
+    { title: "[Group] Example Anime 2nd Season - 49 (1080p)", seeders: 20 },
+    { title: "[Group] Example Anime 2nd Season - 50 (1080p)", seeders: 20 },
+    { title: "[Group] Example Anime 2nd Season (41-50) [1080p]", seeders: 20, num_files: 10 },
+    { title: "[Group] Different Anime - 22 (1080p)", seeders: 20, provider: "tsukihime", tsukihime_episode_no: 10 },
+  ];
+  const knownTitles = ["Example Anime 2nd Season"];
+  assert.deepEqual(ReleaseFilter.inferCumulativeOffsets(releases, 10, knownTitles, 10), []);
+  assert.deepEqual(ReleaseFilter.selectTopCandidates(releases, 10, "sub", { knownTitles, totalExpectedEps: 10 }), []);
+});
+
+test("conflicting absolute numbers do not replace a direct episode or guess when it is unavailable", () => {
+  const absolute = [50, 49].map((episode): AnimeToshoItem => ({
+    title: `[Group] Example Anime 2nd Season - ${episode} (1080p)`, seeders: 20,
+    provider: "tsukihime", tsukihime_episode_no: 10,
+  }));
+  const direct = { title: "[Group] Example Anime 2nd Season - 10 (1080p)", seeders: 2 };
+  const knownTitles = ["Example Anime 2nd Season"];
+  const options = { knownTitles, totalExpectedEps: 10 };
+  assert.deepEqual(ReleaseFilter.inferCumulativeOffsets(absolute, 10, knownTitles, 10), []);
+  assert.deepEqual(ReleaseFilter.selectTopCandidates(absolute, 10, "sub", options), []);
+  assert.deepEqual(ReleaseFilter.selectTopCandidates([...absolute, direct], 10, "sub", options), [[direct, 10]]);
+  assert.deepEqual(ReleaseFilter.selectTopCandidates(absolute, 10, "sub", { ...options, episodeOffset: 40 }),
+    [[absolute[0], 50]]);
+});
+
 test("an explicit watermarked copy rejects the same torrent hash across providers", () => {
   const info_hash = "01ab".repeat(10);
   const marked = { ...bilibili, info_hash: info_hash.toUpperCase() };

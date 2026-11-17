@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import PQueue from "p-queue";
-import type { AnimeToshoItem, ReleaseCandidateBundle, VideoResolutionQuality } from "./types.js";
+import type { AnimeToshoItem, PipelineExecutionType, ReleaseCandidateBundle, VideoResolutionQuality } from "./types.js";
 import type { FetchTorrentsOptions } from "./animetosho.client.js";
 import { canonicalDiscoveryTitles } from "./discovery-titles.js";
 import { ReleaseFilter } from "./release-filter.js";
@@ -67,6 +67,13 @@ export interface TsukihimeFetchOptions extends FetchTorrentsOptions {
   episodeAliases?: number[];
   quality?: VideoResolutionQuality;
   groupName?: string;
+  preferredPipeline?: PipelineExecutionType;
+}
+
+interface TsukihimeDiscoveryResult {
+  anime: TsukihimeAnime | null;
+  torrents: AnimeToshoItem[];
+  releaseSearchFailed?: boolean;
 }
 
 interface TorrentPage {
@@ -76,6 +83,7 @@ interface TorrentPage {
   limit?: number;
   error?: boolean;
   anime?: TsukihimeAnime;
+  episode?: { anime_id?: number; episode_num?: number | null } | null;
 }
 
 type Query = Record<string, string | number>;
@@ -100,6 +108,17 @@ function pathWithQuery(path: string, query: Query) {
 
 function isId(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function catalogId(value: unknown): number | undefined {
+  const id = typeof value === "string" && /^\d+$/.test(value.trim()) ? Number(value) : value;
+  return isId(id) ? id : undefined;
+}
+
+function catalogTitle(value: unknown): string {
+  return typeof value === "string"
+    ? value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{M}\p{N}]+/gu, " ").trim()
+    : "";
 }
 
 function retryAfterMs(value: string | null) {
@@ -165,25 +184,35 @@ export class TsukihimeClient {
     lookup: TsukihimeAnimeLookup,
     reportErrors = false,
     signal = AbortSignal.timeout(30_000),
+    knownTitles: (string | null | undefined)[] = [],
   ): Promise<TsukihimeAnime | null> {
     const { tsukihimeId, anilistId, malId, anidbId } = lookup;
     const external = [["anilist", anilistId], ["mal", malId], ["anidb", anidbId]] as const;
+    const titleKeys = knownTitles.map(catalogTitle).filter(Boolean);
     const failures: unknown[] = [];
     for (const [field, id] of [...external, ["id", tsukihimeId] as const]) {
       if (signal.aborted) break;
       if (!isId(id)) continue;
       const cached = animeCache.get(`${field}:${id}`);
       try {
+        // A stalled preferred ID should leave time for the other identifiers.
+        const lookupSignal = AbortSignal.any([signal, AbortSignal.timeout(6_000)]);
         const anime = cached && cached.expiresAt > Date.now() ? cached.anime : field === "id"
-          ? (await this.requestJson<TorrentPage>(pathWithQuery(`/animes/${id}`, { limit: 1, offset: 0 }), signal))?.anime
-          : await this.requestJson<TsukihimeAnime>(`/animes/${field}/${id}`, signal);
+          ? (await this.requestJson<TorrentPage>(pathWithQuery(`/animes/${id}`, { limit: 1, offset: 0 }), lookupSignal))?.anime
+          : await this.requestJson<TsukihimeAnime>(`/animes/${field}/${id}`, lookupSignal);
         if (!anime || !isId(anime.id) || typeof anime.title !== "string") continue;
 
-        const conflicting = (isId(anime[field]) && anime[field] !== id) ||
-          (isId(anilistId) && isId(anime.anilist) && anime.anilist !== anilistId);
+        const reportedAniList = catalogId(anime.anilist);
+        const matchesAniList = isId(anilistId) && reportedAniList === anilistId;
+        const conflicting = catalogId(anime[field]) !== id || (!matchesAniList && external.some(([key, expected]) => {
+          const reported = catalogId(anime[key]);
+          return isId(expected) && reported !== undefined && reported !== expected;
+        }));
+        const missingAniListProof = isId(anilistId) && !reportedAniList &&
+          ![anime.title, anime.english_title].some(title => titleKeys.includes(catalogTitle(title)));
         const unconfirmedInternalId = field === "id" && external.some(([, expected]) => isId(expected)) &&
-          !external.some(([key, expected]) => isId(expected) && anime[key] === expected);
-        if (conflicting || unconfirmedInternalId) {
+          !external.some(([key, expected]) => isId(expected) && catalogId(anime[key]) === expected);
+        if (conflicting || missingAniListProof || unconfirmedInternalId) {
           log.warn("Tsukihime", `Ignoring conflicting mapping for ${field} #${id} (Tsukihime #${anime.id}).`);
           continue;
         }
@@ -242,6 +271,7 @@ export class TsukihimeClient {
 
   private static async fetchPages(path: string, query: Query, maxPages: number, signal: AbortSignal, animeId?: number) {
     const results: TsukihimeTorrentEntry[] = [];
+    const requestedEpisode = catalogId(path.match(/\/episodes\/(\d+)$/)?.[1]);
     let offset = 0;
     for (let page = 0; page < maxPages; page++) {
       try {
@@ -251,8 +281,25 @@ export class TsukihimeClient {
         if (animeId && response.anime && response.anime.id !== animeId) {
           throw new Error(`Unexpected anime #${response.anime.id} in Tsukihime ${path}`);
         }
-        if (!response.results.length) break;
-        results.push(...response.results);
+        const episodeAnime = catalogId(response.episode?.anime_id);
+        const episodeNumber = catalogId(response.episode?.episode_num);
+        if ((animeId && episodeAnime && animeId !== episodeAnime) ||
+            (requestedEpisode && episodeNumber && requestedEpisode !== episodeNumber)) {
+          throw new Error(`Unexpected episode metadata in Tsukihime ${path}`);
+        }
+        // Filtered full-text search can return empty pages while its total still covers the underlying search results.
+        if (!response.results.length && path !== "/search/torrents") break;
+        for (const entry of response.results) {
+          if (!entry) continue;
+          const assignedAnime = entry.anime ?? response.anime;
+          const reportedEpisode = catalogId(entry.episode_no);
+          const conflictingEpisode = requestedEpisode && reportedEpisode && requestedEpisode !== reportedEpisode;
+          results.push({
+            ...entry,
+            anime: assignedAnime,
+            episode_no: conflictingEpisode ? null : entry.episode_no,
+          });
+        }
         const limit = isId(response.limit) ? response.limit : pageLimit;
         const nextOffset = (response.start ?? offset) + limit;
         if (nextOffset <= offset || (typeof response.total === "number"
@@ -270,37 +317,54 @@ export class TsukihimeClient {
   public static async fetchTorrents(
     lookup: TsukihimeAnimeLookup,
     options: TsukihimeFetchOptions = {},
-  ): Promise<{ anime: TsukihimeAnime | null; torrents: AnimeToshoItem[] }> {
+  ): Promise<TsukihimeDiscoveryResult> {
     const deadline = AbortSignal.timeout(45_000);
     const errors: unknown[] = [];
     const attempt = async <T>(work: Promise<T>): Promise<T | null> => {
       try { return await work; }
       catch (error) { errors.push(error); return null; }
     };
-    const anime = await attempt(this.resolveAnime(lookup, true, AbortSignal.any([deadline, AbortSignal.timeout(20_000)])));
+    const anime = await attempt(this.resolveAnime(
+      lookup, true, AbortSignal.any([deadline, AbortSignal.timeout(20_000)]), options.knownTitles,
+    ));
     const titles = options.knownTitles?.some(title => title?.trim()) ? options.knownTitles
       : canonicalDiscoveryTitles({ titleRomaji: anime?.title, titleEnglish: anime?.english_title });
     const episode = isId(options.targetEp) ? options.targetEp : null;
     const episodeCount = options.episodeCount ?? anime?.total_episodes;
     const maxPages = Math.max(1, Math.min(options.maxPages ?? 4, 8));
+    const preferredPipeline = options.preferredPipeline ?? "vm_remux";
     const filters = languageFilters(options.langType);
     const preferredGroup = options.groupName?.trim().toLowerCase();
+    const expectedIds = [
+      ["anilist", catalogId(anime?.anilist) ?? lookup.anilistId],
+      ["mal", catalogId(anime?.mal) ?? lookup.malId],
+      ["anidb", catalogId(anime?.anidb) ?? lookup.anidbId],
+    ] as const;
     const torrents = new Map<string, AnimeToshoItem>();
     let groupId: number | undefined;
     let searched = false;
     let ranked: ReleaseCandidateBundle[] | undefined;
 
-    const merge = (entries: TsukihimeTorrentEntry[] | null, scopedAnimeId?: number) => {
+    const merge = (entries: TsukihimeTorrentEntry[] | null, verifiedScope?: number) => {
       if (!entries) return;
       searched = true;
       if (entries.length) ranked = undefined;
       for (const entry of entries) {
         if (!entry || !isId(entry.id) || typeof entry.name !== "string" || !entry.name.trim() ||
-            typeof entry.btih !== "string" || Number(entry.is_adult) > 0 ||
-            (scopedAnimeId && isId(entry.anime?.id) && entry.anime.id !== scopedAnimeId) ||
-            (!scopedAnimeId && isId(lookup.anilistId) && isId(entry.anime?.anilist) && entry.anime.anilist !== lookup.anilistId) ||
-            !ReleaseFilter.matchesSeriesTitle(entry.name, titles, { allowUnmarkedSeason: true })) continue;
+            typeof entry.btih !== "string" || Number(entry.is_adult) > 0) continue;
+        const reportedInternalId = catalogId(entry.anime?.id);
+        if ((anime && reportedInternalId && anime.id !== reportedInternalId) || expectedIds.some(([field, expected]) => {
+          const reported = catalogId(entry.anime?.[field]);
+          return isId(expected) && reported !== undefined && reported !== expected;
+        })) continue;
+        const matchingExternalId = isId(lookup.anilistId)
+          ? catalogId(entry.anime?.anilist) === lookup.anilistId
+          : expectedIds.some(([field, expected]) => isId(expected) && catalogId(entry.anime?.[field]) === expected);
+        const verifiedAnime = Boolean(anime && reportedInternalId === anime.id) || matchingExternalId;
+        if (!verifiedAnime && !verifiedScope) continue;
+        if (!ReleaseFilter.matchesSeriesTitle(entry.name, titles, { allowUnmarkedSeason: verifiedAnime })) continue;
         const item = this.toAnimeToshoItem(entry);
+        if (!verifiedAnime) item.tsukihime_episode_no = null;
         const hash = torrentInfoHash(item);
         if (!hash) continue;
         if (preferredGroup && isId(entry.group?.id) && typeof entry.group.name === "string" &&
@@ -322,15 +386,17 @@ export class TsukihimeClient {
     }) : [];
     const hasCoverage = () => {
       if (options.exhaustive || !episode) return false;
-      return bundles().some(bundle => bundle.isSolo && bundle.isH264 &&
-        bundle.qualities["1080p"] && bundle.qualities["720p"] && bundle.qualities["480p"]);
+      return bundles().some(bundle => bundle.isSolo && bundle.pipelineType === preferredPipeline &&
+        bundle.qualities["1080p"] && (preferredPipeline === "kaggle_gpu" ||
+          (bundle.qualities["720p"] && bundle.qualities["480p"])));
     };
     const hasEpisodeQuality = () => bundles().some(bundle =>
-      (!preferredGroup || bundle.groupLower === preferredGroup) && bundle.qualities[options.quality ?? "1080p"]);
+      bundle.pipelineType === preferredPipeline && (!preferredGroup || bundle.groupLower === preferredGroup) &&
+      bundle.qualities[options.quality ?? "1080p"]);
     const preferredFilters = (): Query => groupId ? { ...filters, group_id: groupId } : filters;
     const read = async (path: string, params: Query, pages: number, scope?: number) => {
       const entries = await attempt(this.fetchPages(path, params, pages, deadline, scope));
-      merge(entries, scope);
+      merge(entries, path === "/search/torrents" ? undefined : scope);
       return entries?.length ?? 0;
     };
 
@@ -358,28 +424,31 @@ export class TsukihimeClient {
       }
     }
 
-    if (titles.length && (!anime || !hasEpisodeQuality() || options.exhaustive)) {
+    if ((anime || expectedIds.some(([, expected]) => isId(expected))) &&
+        titles.length && (!anime || !hasEpisodeQuality() || options.exhaustive)) {
       const q = titleQuery(titles, options.quality);
       if (q) {
         const animeId = anime?.id;
         const scope: Query = animeId ? { anime_id: animeId } : {};
         const preferred = preferredFilters();
+        const searchPages = Math.min(2, maxPages);
         const filteredCount = Object.keys(preferred).length
-          ? await read("/search/torrents", { q, ...scope, ...preferred }, 1, animeId) : 0;
+          ? await read("/search/torrents", { q, ...scope, ...preferred }, searchPages, animeId) : 0;
         if (!filteredCount || !hasEpisodeQuality() || options.exhaustive) {
-          const scopedCount = await read("/search/torrents", { q, ...scope }, Math.min(2, maxPages), animeId);
+          const scopedCount = await read("/search/torrents", { q, ...scope }, searchPages, animeId);
           if (animeId && (!scopedCount || !hasEpisodeQuality())) {
-            await read("/search/torrents", { q }, Math.min(2, maxPages));
+            await read("/search/torrents", { q }, searchPages);
           }
         }
       }
     }
 
+    const releaseSearchFailed = errors.length > 0 && !searched;
     if (errors.length) {
-      if (!searched && options.reportErrors) throw new AggregateError(errors, "Tsukihime discovery failed");
+      if (releaseSearchFailed && options.reportErrors && !anime) throw new AggregateError(errors, "Tsukihime discovery failed");
       log.warn("Tsukihime", `Some discovery lookups failed: ${String(errors[0])}`);
     }
-    return { anime, torrents: [...torrents.values()] };
+    return { anime, torrents: [...torrents.values()], ...(releaseSearchFailed ? { releaseSearchFailed } : {}) };
   }
 
   private static async hydrateCandidate(item: AnimeToshoItem): Promise<AnimeToshoItem> {
@@ -408,7 +477,6 @@ export class TsukihimeClient {
       audiolangs: enriched.audiolangs?.length ? enriched.audiolangs : item.audiolangs,
       sublangs: enriched.sublangs?.length ? enriched.sublangs : item.sublangs,
       group_name: item.group_name ?? enriched.group_name,
-      tsukihime_episode_no: item.tsukihime_episode_no ?? enriched.tsukihime_episode_no,
     };
   }
 

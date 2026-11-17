@@ -9,6 +9,7 @@ import type {
   VideoResolutionQuality,
 } from "./types.js";
 import { DEFAULT_MIN_SEEDERS, ALLOW_CAM } from "../config.js";
+import { torrentIdentityKey } from "./torrent-identity.js";
 import { log } from "../utils/logger.js";
 
 export class ReleaseFilter {
@@ -108,6 +109,7 @@ export class ReleaseFilter {
     releaseName: string,
     knownTitles: (string | null | undefined)[],
     allowUnmarkedSeason: boolean,
+    verifiedCourAlias = false,
   ): boolean {
     const release = this.normalizeSeriesTitle(releaseName);
     const episodeDivider = Array.from(releaseName.matchAll(/\s+[-–—]\s+(?=\d{1,4}(?:v\d+)?\b)/gi)).at(-1);
@@ -129,13 +131,14 @@ export class ReleaseFilter {
       if (releaseSeason) {
         const season = Number(releaseSeason[1] || releaseSeason[2] || releaseSeason[3]);
         const expectedSeason = seasonEnd ? Number(seasonEnd[1].match(/\d+/)?.[0]) : null;
-        if (expectedSeason !== null ? season !== expectedSeason : season !== 1 && !allowUnmarkedSeason) {
+        if (expectedSeason !== null ? season !== expectedSeason : season !== 1 && !verifiedCourAlias) {
           return false;
         }
         suffix = suffix.slice(releaseSeason[0].length).trimStart();
       } else if (seasonEnd && !allowUnmarkedSeason) {
         return false;
-      } else if (/^\d/.test(beforeEpisode.slice(titleEnd).trimStart())) {
+      } else if (/^\d/.test(beforeEpisode.slice(titleEnd).trimStart()) ||
+                 /^\d{1,4} (?:(?:s\d{1,2} ?)?e(?:p(?:isode)?)? ?\d+)/.test(suffix)) {
         // A number in the title before the explicit episode separator can denote a different series.
         return false;
       }
@@ -161,19 +164,35 @@ export class ReleaseFilter {
     for (const alias of aliases) {
       const aliasTitle = alias[1] ?? alias[2];
       const normalizedAlias = this.normalizeSeriesTitle(aliasTitle);
+      const leadingTitle = releaseName.slice(0, alias.index);
       for (const { title } of namedCourTitles) {
+        if (this.matchesSplitCourTitle(leadingTitle, normalizedAlias, title)) return {};
         const end = this.seriesTitleEnd(normalizedAlias, this.normalizeSeriesTitle(title));
         if (end < 0) continue;
         const suffix = normalizedAlias.slice(end).trim();
         const episode = suffix.match(/^(?:(?:s(\d{1,2}) ?)?e(?:p(?:isode)?)? ?)?(\d{1,4})(?:v\d+)?$/);
         if (suffix && (!episode || Number(episode[1]) === 0 || Number(episode[2]) === 0)) continue;
-        if (!this.matchesLeadingSeriesTitle(aliasTitle, [title], true)) continue;
-        const leadingTitle = releaseName.slice(0, alias.index);
-        if (this.matchesLeadingSeriesTitle(leadingTitle, franchiseTitles, allowUnmarkedSeason)) {
+        if (!this.matchesLeadingSeriesTitle(aliasTitle, [title], true, true)) continue;
+        if (this.matchesLeadingSeriesTitle(leadingTitle, franchiseTitles, allowUnmarkedSeason, true)) {
           return { relativeEpisode: episode ? Number(episode[2]) : undefined };
         }
       }
     }
+  }
+
+  private static matchesSplitCourTitle(leadingTitle: string, normalizedAlias: string, canonicalTitle: string): boolean {
+    // Some releases put the numbered franchise first and the complete cour subtitle in brackets.
+    const canonical = canonicalTitle.normalize("NFKC").match(/^([^:]+):\s*(.+)$/);
+    if (!canonical || this.seriesTitleEnd(normalizedAlias, this.normalizeSeriesTitle(canonical[2])) !== normalizedAlias.length) {
+      return false;
+    }
+    const prefix = this.normalizeSeriesTitle(leadingTitle);
+    const franchise = this.normalizeSeriesTitle(canonical[1]);
+    const franchiseEnd = this.seriesTitleEnd(prefix, franchise);
+    if (!franchise || franchiseEnd < 0) return false;
+    const numbered = prefix.slice(franchiseEnd).trimStart().match(/^s(\d{1,2}) ?e(\d{1,4})(?:v\d+)?$/);
+    // The alias identifies the cour. Episode matching still uses a file number or a trusted mapping.
+    return Boolean(numbered && Number(numbered[1]) > 0 && Number(numbered[2]) > 0);
   }
 
   private static expandKnownTitleVariants(
@@ -519,6 +538,7 @@ export class ReleaseFilter {
     langType: string,
     knownTitles?: (string | null | undefined)[],
   ): boolean {
+    if (!this.matchesCandidateTitle(item, knownTitles)) return false;
     const parsed = this.parseTitle(item.title || "", knownTitles, item);
     if (parsed.isWeirdOrPromo || parsed.isUnsupportedContainer) return false;
     const seeders = item.seeders || 0;
@@ -567,6 +587,7 @@ export class ReleaseFilter {
     numFiles = 1,
     totalExpectedEps?: number | null,
     item?: AnimeToshoItem,
+    knownTitles?: (string | null | undefined)[],
   ): boolean {
     if (parsed.isWeirdOrPromo || parsed.isUnsupportedContainer) return false;
     if (parsed.isCam && !ALLOW_CAM) return false;
@@ -604,16 +625,14 @@ export class ReleaseFilter {
     const targetEpNum = Number(targetEp);
     if (Number.isNaN(targetEpNum)) return false;
 
-    // An explicit cour-relative number can accompany a cumulative episode number in the release name.
-    if (
-      (item?.tsukihime_episode_no === targetEpNum || parsed.relativeEpisode === targetEpNum) &&
-      !parsed.isBatch &&
-      numFiles === 1
-    ) {
-      return true;
+    if (!parsed.isBatch) {
+      if (parsed.singleEp === null) return false;
+      const indexed = this.providerEpisode(item);
+      const relative = this.mappedRelativeEpisode(parsed, item, totalExpectedEps, knownTitles);
+      if ((parsed.relativeEpisode !== undefined && relative === undefined) ||
+          (indexed !== undefined && indexed !== parsed.singleEp && indexed !== relative)) return false;
+      return parsed.singleEp === targetEpNum || relative === targetEpNum;
     }
-
-    if (parsed.singleEp === targetEpNum && !parsed.isBatch) return true;
 
     // For batch torrents when targeting a single episode:
     // Reject if the batch only has 1 file (monolithic combined file/archive cannot extract 1 episode!)
@@ -650,12 +669,13 @@ export class ReleaseFilter {
     knownTitles?: (string | null | undefined)[],
     totalExpectedEps?: number | null,
   ): number {
+    if (!this.matchesCandidateTitle(item, knownTitles)) return -10_000;
     const parsed = this.parseTitle(item.title || "", knownTitles, item);
     const numFiles = item.num_files || 1;
     const seeders = item.seeders || 0;
     const isSeadex = Boolean(item.is_seadex);
 
-    if (!this.matchesTarget(parsed, targetEp, langType, numFiles, totalExpectedEps, item)) {
+    if (!this.matchesTarget(parsed, targetEp, langType, numFiles, totalExpectedEps, item, knownTitles)) {
       return -10000;
     }
 
@@ -733,8 +753,41 @@ export class ReleaseFilter {
   ]);
 
   private static torrentKey(item: AnimeToshoItem): string {
-    const hash = item.info_hash?.trim().toLowerCase();
-    return hash ? `btih:${hash}` : `${item.provider ?? "animetosho"}:${item.id ?? item.title}`;
+    return torrentIdentityKey(item);
+  }
+
+  private static matchesCandidateTitle(item: AnimeToshoItem, knownTitles?: (string | null | undefined)[]) {
+    return typeof item.title === "string" && Boolean(item.title.trim()) &&
+      (!knownTitles?.length || this.matchesSeriesTitle(item.title, knownTitles, {
+        allowUnmarkedSeason: item.provider === "tsukihime" || Number(item.anidb_aid) > 0,
+      }));
+  }
+
+  private static providerEpisode(item?: AnimeToshoItem): number | undefined {
+    const episode = item?.tsukihime_episode_no;
+    return typeof episode === "number" && Number.isSafeInteger(episode) && episode > 0 &&
+      (item?.provider === "tsukihime" || item?.tsukihime_id) ? episode : undefined;
+  }
+
+  private static mappedRelativeEpisode(
+    parsed: ParsedReleaseTitle,
+    item?: AnimeToshoItem,
+    expectedCount?: number | null,
+    knownTitles?: (string | null | undefined)[],
+  ): number | undefined {
+    const absolute = parsed.singleEp;
+    if (parsed.isBatch || absolute === null) return;
+    const indexed = this.providerEpisode(item);
+    const alias = parsed.relativeEpisode;
+    if (alias !== undefined) {
+      if (alias <= absolute && (!expectedCount || alias <= expectedCount) &&
+          (indexed === undefined || indexed === alias || indexed === absolute)) return alias;
+      return;
+    }
+    const continuation = !knownTitles?.length || knownTitles.some(title =>
+      title && (/\s[-–—]\s/.test(title) || /\b(?:season\s*\d+|\d+(?:st|nd|rd|th)\s+season|part\s*\d+|cour\s*\d+|s\d+)$/i.test(title.trim())));
+    if (indexed !== undefined && continuation && expectedCount && indexed <= expectedCount && absolute > expectedCount &&
+        this.VALID_COUR_OFFSETS.has(absolute - indexed)) return indexed;
   }
 
   public static inferCumulativeOffsets(
@@ -745,95 +798,26 @@ export class ReleaseFilter {
   ): number[] {
     if (Number.isNaN(targetEpNum) || targetEpNum <= 0) return [];
 
-    const offsets = new Set<number>();
-    const singleEps = new Set<number>();
-
+    const mappings = new Map<number, Set<number>>();
     for (const t of torrentList) {
-      if ((t.seeders || 0) <= 0) continue;
+      if ((t.seeders || 0) <= 0 || !this.matchesCandidateTitle(t, knownTitles)) continue;
       const parsed = this.parseTitle(t.title || "", knownTitles, t);
       if (parsed.isBonusOrExtra || parsed.seasonNum === 0 || parsed.isWeirdOrPromo || parsed.isUnsupportedContainer) {
         continue;
       }
 
-      const relativeEpisode = t.tsukihime_episode_no ?? parsed.relativeEpisode;
-      if (
-        typeof relativeEpisode === "number" &&
-        relativeEpisode > 0 &&
-        parsed.singleEp !== null &&
-        parsed.singleEp > relativeEpisode
-      ) {
-        const diff = parsed.singleEp - relativeEpisode;
-        if (this.VALID_COUR_OFFSETS.has(diff)) {
-          offsets.add(diff);
-        }
-      }
-
-      if (parsed.singleEp !== null && parsed.singleEp > 0) {
-        singleEps.add(parsed.singleEp);
-      }
-
-      if (parsed.epRange) {
-        const [rStart, rEnd] = parsed.epRange;
-        const span = rEnd - rStart + 1;
-        if (rStart > 1 && span >= 3 && span <= 60) {
-          const offset = rStart - 1;
-          if (rStart + targetEpNum - 1 <= rEnd) {
-            offsets.add(offset);
-          }
-        }
+      const relative = this.mappedRelativeEpisode(parsed, t, totalExpectedEps, knownTitles);
+      if (relative !== undefined && parsed.singleEp !== null && parsed.singleEp > relative) {
+        const offset = parsed.singleEp - relative;
+        const episodes = mappings.get(offset) ?? new Set<number>();
+        episodes.add(relative);
+        mappings.set(offset, episodes);
       }
     }
 
-    if (singleEps.size > 0) {
-      const sorted = Array.from(singleEps).sort((a, b) => a - b);
-      const clusters: number[][] = [];
-      for (const ep of sorted) {
-        if (clusters.length === 0) {
-          clusters.push([ep]);
-        } else {
-          const cur = clusters[clusters.length - 1];
-          if (ep - cur[cur.length - 1] <= 3) {
-            cur.push(ep);
-          } else {
-            clusters.push([ep]);
-          }
-        }
-      }
-
-      const relClusters = clusters.filter((c) => c[0] >= 1 && c[c.length - 1] <= 26);
-      const cumClusters = clusters.filter((c) => c[0] > 11);
-      if (relClusters.length > 0 && cumClusters.length > 0) {
-        const relMax = relClusters[0][relClusters[0].length - 1];
-        for (const cum of cumClusters) {
-          const cumMax = cum[cum.length - 1];
-          const diff = cumMax - relMax;
-          if (this.VALID_COUR_OFFSETS.has(diff)) {
-            offsets.add(diff);
-          }
-        }
-      }
-
-      for (const cluster of cumClusters) {
-        const cMin = cluster[0];
-        const cMax = cluster[cluster.length - 1];
-        if (totalExpectedEps && totalExpectedEps >= 4 && totalExpectedEps <= 30) {
-          const expectedOffset = cMax - totalExpectedEps;
-          if (this.VALID_COUR_OFFSETS.has(expectedOffset)) {
-            offsets.add(expectedOffset);
-          }
-        }
-        const candidateOffset = cMin - 1;
-        if (
-          cluster.length >= 3 &&
-          this.VALID_COUR_OFFSETS.has(candidateOffset) &&
-          singleEps.has(candidateOffset + targetEpNum)
-        ) {
-          offsets.add(candidateOffset);
-        }
-      }
-    }
-
-    return Array.from(offsets);
+    // Multiple mappings cannot safely translate a release that has no mapping of its own.
+    if (mappings.size !== 1) return [];
+    return [...mappings].filter(([, episodes]) => episodes.has(targetEpNum) || episodes.size >= 2).map(([offset]) => offset);
   }
 
   /**
@@ -875,31 +859,41 @@ export class ReleaseFilter {
       maxBundles = 5,
       minSeeders = DEFAULT_MIN_SEEDERS,
     } = options;
+    const isSingleEpTarget = String(targetEp).toLowerCase() !== "all";
+    const target = Number(targetEp);
+    if (isSingleEpTarget && (!Number.isSafeInteger(target) || target < 0 ||
+        (typeof targetEp === "string" && !/^\d+$/.test(targetEp)) ||
+        (totalExpectedEps && totalExpectedEps > 0 && target > totalExpectedEps))) return [];
 
     const blocked = new Set(torrentList.filter(item => this.hasWatermarkedSource(item.title)).map(item => this.torrentKey(item)));
-    const eligibleTorrents = torrentList.filter(item => !blocked.has(this.torrentKey(item)) &&
-      (!knownTitles?.length || this.matchesSeriesTitle(item.title, knownTitles, {
-        allowUnmarkedSeason: item.provider === "tsukihime" || Number(item.anidb_aid) > 0,
-      })));
+    const eligibleTorrents = torrentList.filter(item =>
+      !blocked.has(this.torrentKey(item)) && this.matchesCandidateTitle(item, knownTitles));
     const candidatesToTry: (number | string)[] = [targetEp];
+    const absoluteMatches = new Set<number>();
 
-    if (String(targetEp).toLowerCase() !== "all") {
-      const tNum = Number(targetEp);
-      if (episodeOffset && episodeOffset > 0) {
-        candidatesToTry.unshift(tNum + episodeOffset);
+    if (isSingleEpTarget) {
+      for (const item of eligibleTorrents) {
+        if ((item.seeders ?? 0) <= 0) continue;
+        const parsed = this.parseTitle(item.title, knownTitles, item);
+        if (parsed.isWeirdOrPromo || parsed.isBonusOrExtra || parsed.isUnsupportedContainer) continue;
+        if (parsed.singleEp !== null && parsed.singleEp > target &&
+            this.mappedRelativeEpisode(parsed, item, totalExpectedEps, knownTitles) === target) absoluteMatches.add(parsed.singleEp);
       }
-      const inferredOffsets = this.inferCumulativeOffsets(
+      if (episodeOffset && episodeOffset > 0) {
+        candidatesToTry.unshift(target + episodeOffset);
+      }
+      const inferredOffsets = episodeOffset > 0 ? [] : this.inferCumulativeOffsets(
         eligibleTorrents,
-        tNum,
+        target,
         knownTitles,
         totalExpectedEps,
       );
       for (const off of inferredOffsets) {
-        const mappedEp = tNum + off;
+        const mappedEp = target + off;
         if (!candidatesToTry.includes(mappedEp)) {
           log.info(
             "ReleaseFilter",
-            `Cumulative numbering offset +${off} detected (Ep ${tNum} -> Ep ${mappedEp})`,
+            `Cumulative numbering offset +${off} detected (Ep ${target} -> Ep ${mappedEp})`,
           );
           candidatesToTry.push(mappedEp);
         }
@@ -931,19 +925,15 @@ export class ReleaseFilter {
             score += 15;
           }
           const parsed = this.parseTitle(t.title || "", knownTitles, t);
-          if (String(targetEp).toLowerCase() !== "all" &&
-              parsed.relativeEpisode !== undefined && parsed.relativeEpisode !== Number(targetEp)) {
-            continue;
+          const relative = this.mappedRelativeEpisode(parsed, t, totalExpectedEps, knownTitles);
+          if (isSingleEpTarget) {
+            if (relative !== undefined && relative !== target) continue;
+            if (relative === target && parsed.singleEp !== target &&
+                (episodeOffset > 0 ? parsed.singleEp !== target + episodeOffset : absoluteMatches.size > 1)) continue;
           }
-          let effectiveEpForFile: number | string = candidateEp;
-          if (
-            String(candidateEp).toLowerCase() !== "all" &&
-            (t.tsukihime_episode_no === Number(candidateEp) || parsed.relativeEpisode === Number(candidateEp))
-          ) {
-            if (parsed.singleEp !== null && parsed.singleEp !== Number(candidateEp)) {
-              effectiveEpForFile = parsed.singleEp;
-            }
-          }
+          // A scoped provider may omit the expected season marker only for a verified cumulative number.
+          if (relative === undefined && knownTitles?.length && !this.matchesSeriesTitle(t.title, knownTitles)) continue;
+          const effectiveEpForFile = relative === target && parsed.singleEp !== null ? parsed.singleEp : candidateEp;
           const key = this.torrentKey(t);
           const existing = bestByItemKey.get(key);
           if (!existing || score > existing.score) {
@@ -1025,7 +1015,6 @@ export class ReleaseFilter {
     }
 
     const bundles: ReleaseCandidateBundle[] = [];
-    const isSingleEpTarget = String(targetEp).toLowerCase() !== "all";
     const isAllLang = String(langType).toLowerCase() === "all";
 
     for (const b of bundleMap.values()) {
@@ -1134,13 +1123,7 @@ export class ReleaseFilter {
     return [null, targetEp];
   }
 
-  /**
-   * Maps torrent file entries to episode numbers.
-   * CRITICAL SAFETY RULE:
-   * - When `targetEp` is a single episode (not "all") and the torrent is a multi-file batch pack,
-   *   ONLY map files with an explicit episode number match. Never guess alphabetically, and never
-   *   allow a single monolithic combined batch file to masquerade as a single episode!
-   */
+  /** Maps files with verifiable series and episode labels. Conflicting matches stay unmapped. */
   public static matchFilesToEpisodes(
     files: { name?: string; length?: number }[],
     options: {
@@ -1149,129 +1132,85 @@ export class ReleaseFilter {
       effectiveEp?: number | string | null;
       totalExpectedEps?: number | null;
       allowWatermarkedSource?: boolean;
+      torrentTitle?: string;
     } = {},
   ): Map<number, [number, string]> {
-    const { knownTitles, targetEp, effectiveEp, allowWatermarkedSource = false } = options;
-    const videoExts = [".mkv", ".mp4", ".avi", ".webm"];
     const epMap = new Map<number, [number, string]>();
-    const isSingleEpTarget =
-      targetEp !== null &&
-      targetEp !== undefined &&
-      String(targetEp).toLowerCase() !== "all";
+    const { knownTitles = [], targetEp, effectiveEp, torrentTitle, totalExpectedEps, allowWatermarkedSource = false } = options;
+    if (!Array.isArray(files) || !knownTitles.some(title => title?.trim())) return epMap;
 
-    const videoFiles: { idx: number; relPath: string; length: number }[] = [];
-    for (let i = 0; i < files.length; i++) {
-      const relPath = files[i].name || "";
-      const lower = relPath.toLowerCase();
-      if (videoExts.some((ext) => lower.endsWith(ext))) {
-        videoFiles.push({ idx: i, relPath, length: files[i].length || 0 });
+    const singleEpisode = targetEp != null && String(targetEp).toLowerCase() !== "all";
+    const target = singleEpisode ? Number(targetEp) : null;
+    const expected = singleEpisode ? Number(effectiveEp ?? targetEp) : null;
+    if (target !== null && (!Number.isSafeInteger(target) || target < 1)) return epMap;
+    if (expected !== null && (!Number.isSafeInteger(expected) || expected < 1)) return epMap;
+
+    const titleMatch = { allowUnmarkedSeason: expected !== null && expected !== target };
+    const trustedTorrentTitle = torrentTitle && this.matchesSeriesTitle(torrentTitle, knownTitles, titleMatch);
+    const torrent = trustedTorrentTitle ? this.parseTitle(torrentTitle, knownTitles) : undefined;
+    const videoName = (name: unknown): name is string => typeof name === "string" && /\.(?:mkv|mp4|avi|webm)$/i.test(name);
+    const standalone = target === 1 && expected === 1 && totalExpectedEps === 1 && torrent && !torrent.isBatch &&
+      (torrent.singleEp === null || torrent.singleEp === 1) && files.filter(file => videoName(file?.name)).length === 1;
+    const canonicalSeasons = new Set(knownTitles.flatMap(title => {
+      const suffix = title?.match(/(?:\b(\d{1,2})(?:st|nd|rd|th)\s+season|\bseason\s+(\d{1,2})|\bs(\d{1,2}))\s*$/i);
+      return suffix ? [Number(suffix[1] || suffix[2] || suffix[3])] : [];
+    }));
+    const defaultSeason = canonicalSeasons.size === 1 ? [...canonicalSeasons][0] : 1;
+    const expectedSeason = torrent?.seasonNum ?? defaultSeason;
+    const seenEpisodes = new Set<number>();
+    const verifiedEpisodes = new Set<number>();
+
+    for (let idx = 0; idx < files.length; idx++) {
+      const relPath = files[idx]?.name;
+      if (!videoName(relPath) || /^[a-z]:|[\u0000-\u001f\u007f]/i.test(relPath)) continue;
+      const segments = relPath.split(/[\\/]/);
+      if (segments.some(segment => !segment || segment === "." || segment === "..")) continue;
+
+      const file = segments.at(-1)!;
+      const folders = segments.slice(0, -1);
+      if (folders.some(segment => /^(?:extras?|bonus|samples?|specials?|ncop|nced)$/i.test(segment) ||
+          /^(?:s|season\s*)0+$/i.test(segment))) continue;
+      const parsed = this.parseTitle(file, knownTitles);
+      if (parsed.isBatch || parsed.isBonusOrExtra || parsed.isUnsupportedContainer ||
+          this.WEIRD_OR_PROMO_PATTERN.test(file) || (parsed.isCam && !ALLOW_CAM)) continue;
+      if (parsed.seasonNum !== null && torrent?.seasonNum != null && parsed.seasonNum !== expectedSeason) continue;
+
+      const namedFile = this.matchesSeriesTitle(file, knownTitles, titleMatch);
+      let episode = parsed.singleEp ?? (namedFile && standalone ? 1 : null);
+      if (!namedFile) {
+        if (!torrent || canonicalSeasons.size > 1) continue;
+        const folder = folders.at(-1);
+        if (folder && !this.matchesSeriesTitle(folder, knownTitles, titleMatch)) {
+          const number = folder.match(/^(?:s|season\s*)0*(\d{1,2})$/i);
+          const series = folders.at(-2);
+          if (!number || Number(number[1]) !== expectedSeason || !series ||
+              !this.matchesSeriesTitle(series, knownTitles, titleMatch)) continue;
+        }
+        let bareName = file.replace(/\.(?:mkv|mp4|avi|webm)$/i, "").trim();
+        const group = bareName.match(/^\[([^\]]+)\]\s*/);
+        if (group && group[1].trim().toLowerCase() === torrent.groupLower) bareName = bareName.slice(group[0].length);
+        bareName = bareName.replace(/(?:\s*(?:\[(?:1080p|720p|480p|[0-9a-f]{8})\]|\((?:1080p|720p|480p|[0-9a-f]{8})\)))*$/i, "");
+        const label = bareName.match(/^(?:(?:s(\d{1,2})[\s._-]*)?e(?:p(?:isode)?)?[\s._-]*)?(\d{1,4})(?:v\d+)?$/i);
+        if (!label || (label[1] !== undefined && Number(label[1]) !== expectedSeason)) continue;
+        episode = Number(label[2]);
       }
-    }
+      if (episode === null || !Number.isSafeInteger(episode) || episode < 1) continue;
 
-    if (videoFiles.length === 0) return epMap;
+      verifiedEpisodes.add(episode);
+      if (!allowWatermarkedSource && this.hasWatermarkedSource(relPath)) continue;
+      if (expected !== null && (episode !== expected ||
+          (parsed.relativeEpisode !== undefined && parsed.relativeEpisode !== target))) continue;
 
-    if (videoFiles.length === 1) {
-      const { idx, relPath } = videoFiles[0];
-      if (!allowWatermarkedSource && this.hasWatermarkedSource(relPath)) return epMap;
-      const parsed = this.parseTitle(relPath, knownTitles);
-      // If targeting a single episode, reject a 1-file torrent whose filename is a multi-episode range/batch!
-      if (isSingleEpTarget && (parsed.epRange !== null || parsed.isSeasonBatch)) {
-        return epMap;
-      }
-      let assignedEp = 1;
-      if (isSingleEpTarget) {
-        assignedEp = Number(targetEp);
+      const key = target ?? episode;
+      if (seenEpisodes.has(key)) {
+        epMap.delete(key);
       } else {
-        assignedEp = parsed.singleEp || 1;
-      }
-      epMap.set(assignedEp, [idx, relPath]);
-      return epMap;
-    }
-
-    const nonBonusFiles: { idx: number; relPath: string; length: number; parsed: ParsedReleaseTitle }[] = [];
-    let hasWatermarkedVideo = false;
-    for (const vf of videoFiles) {
-      if (!allowWatermarkedSource && this.hasWatermarkedSource(vf.relPath)) {
-        hasWatermarkedVideo = true;
-        continue;
-      }
-      const parsed = this.parseTitle(vf.relPath, knownTitles);
-      if ((parsed.isBonusOrExtra || parsed.seasonNum === 0) && targetEp !== 0) {
-        continue;
-      }
-      nonBonusFiles.push({ ...vf, parsed });
-
-      let epN = parsed.singleEp;
-      if (epN !== null) {
-        if (
-          isSingleEpTarget &&
-          effectiveEp !== null &&
-          effectiveEp !== undefined &&
-          String(effectiveEp).toLowerCase() !== "all"
-        ) {
-          const targetNum = Number(targetEp);
-          const effectiveNum = Number(effectiveEp);
-          if (epN === effectiveNum) {
-            epN = targetNum;
-          } else if (effectiveNum > targetNum && epN > effectiveNum - targetNum) {
-            epN = epN - (effectiveNum - targetNum);
-          }
-        }
-
-        const existing = epMap.get(epN);
-        const curLen = vf.length;
-        const existLen = existing ? files[existing[0]]?.length || 0 : 0;
-        if (!existing || curLen > existLen) {
-          epMap.set(epN, [vf.idx, vf.relPath]);
-        }
+        seenEpisodes.add(key);
+        epMap.set(key, [idx, relPath]);
       }
     }
 
-    if (
-      isSingleEpTarget &&
-      !hasWatermarkedVideo &&
-      !epMap.has(Number(targetEp)) &&
-      epMap.size > 1
-    ) {
-      const tNum = Number(targetEp);
-      const positiveKeys = Array.from(epMap.keys())
-        .filter((k) => k > 0)
-        .sort((a, b) => a - b);
-      if (positiveKeys.length > 0 && positiveKeys[0] > 1) {
-        const inferredKey = positiveKeys[0] - 1 + tNum;
-        if (epMap.has(inferredKey)) {
-          epMap.set(tNum, epMap.get(inferredKey)!);
-        }
-      }
-    }
-
-    if (epMap.size === 0 && nonBonusFiles.length === 1 && (!isSingleEpTarget || !hasWatermarkedVideo)) {
-      const { idx, relPath, parsed } = nonBonusFiles[0];
-      if (isSingleEpTarget && (parsed.epRange !== null || parsed.isSeasonBatch)) {
-        return epMap;
-      }
-      let assignedEp = 1;
-      if (isSingleEpTarget) {
-        assignedEp = Number(targetEp);
-      } else {
-        assignedEp = parsed.singleEp || 1;
-      }
-      epMap.set(assignedEp, [idx, relPath]);
-      return epMap;
-    }
-
-    // Only allow sequential 1..N fallback when targetEp === "all" (never guess blindly for single-episode extraction!)
-    if (!isSingleEpTarget && epMap.size === 0 && nonBonusFiles.length > 0) {
-      const sorted = [...nonBonusFiles].sort((a, b) => a.relPath.localeCompare(b.relPath));
-      for (let i = 0; i < sorted.length; i++) {
-        epMap.set(i + 1, [sorted[i].idx, sorted[i].relPath]);
-      }
-      log.warn(
-        "ReleaseFilter",
-        `Sequentially mapped ${epMap.size} video files 1..${epMap.size}.`,
-      );
-    }
-
+    if (torrent?.isBatch && verifiedEpisodes.size < 2) epMap.clear();
     return epMap;
   }
 }

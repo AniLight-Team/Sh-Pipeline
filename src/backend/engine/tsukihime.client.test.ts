@@ -35,6 +35,24 @@ test("Tsukihime skips returned mappings with a conflicting AniList ID", async (t
   assert.equal(await TsukihimeClient.resolveAnime({ anilistId: 104, malId: 203, anidbId: 304 }), expected);
 });
 
+test("Tsukihime alternate ID lookup needs independent identity when AniList is missing", async t => {
+  const expected = { id: 25, mal: 224, title: "Example Show, Season 2" };
+  const wrong = { id: 26, mal: 225, title: "Example Show" };
+  const missing = { id: 27, title: "Example Show, Season 2" };
+  t.mock.method(client, "requestJson", async (path: string) => {
+    if (path === "/animes/mal/224") return expected;
+    if (path === "/animes/mal/225") return wrong;
+    if (path === "/animes/anilist/214") return missing;
+    return null;
+  });
+  const knownTitles = ["Example Show: Season 2"];
+  const signal = AbortSignal.timeout(3_000);
+  assert.equal(await TsukihimeClient.resolveAnime({ anilistId: 214 }), null);
+  assert.equal(await TsukihimeClient.resolveAnime({ anilistId: 214, malId: 224 }), null);
+  assert.equal(await TsukihimeClient.resolveAnime({ anilistId: 214, malId: 225 }, false, signal, knownTitles), null);
+  assert.equal(await TsukihimeClient.resolveAnime({ anilistId: 214, malId: 224 }, false, signal, knownTitles), expected);
+});
+
 test("Tsukihime rejects a conflicting release title even within an ID-scoped feed", async (t) => {
   const expected = { id: 5, anilist: 105, title: "Incorrect Provider Title" };
   const wrongTorrent = {
@@ -132,7 +150,7 @@ test("Tsukihime tries language and group filters and then includes releases with
 });
 
 test("Tsukihime falls back to title search when mappings fail and rejects different titles and IDs", async t => {
-  const healthy = makeEntry(121, "[SubsPlease] Example Show - 07 (1080p)", { episode_no: 7 });
+  const healthy = makeEntry(121, "[SubsPlease] Example Show - 07 (1080p)", { anime: { id: 949, anilist: 119 }, episode_no: 7 });
   const conflicting = makeEntry(122, healthy.name, { anime: { id: 950, anilist: 999 }, episode_no: 7 });
   const wrongTitle = makeEntry(123, "[SubsPlease] Another Show - 07 (1080p)");
   const request = t.mock.method(client, "requestJson", async (path: string) => {
@@ -146,8 +164,56 @@ test("Tsukihime falls back to title search when mappings fail and rejects differ
     targetEp: 7, langType: "dub", knownTitles: ["Example Show", "Example Romaji"], reportErrors: true,
   });
   assert.equal(result.anime, null);
-  assert.deepEqual(result.torrents.map(item => item.id), [121]);
+  assert.deepEqual(result.torrents.map(item => [item.id, item.tsukihime_episode_no]), [[121, 7]]);
   assert.ok(request.mock.calls.some(call => call.arguments[0].includes("audiolang=en")));
+});
+
+test("Tsukihime unscoped title fallback cannot borrow an episode mapping from a stale alternate ID", async t => {
+  const base = "[SubsPlease] Example Saga";
+  const unmarked = makeEntry(161, base + " - 02 [1080p]", { anime: { id: 165, mal: 728 }, episode_no: 2 });
+  const conflicting = makeEntry(162, base + " Season 2 - 02 [1080p]", {
+    anime: { id: 166, anilist: 900, anidb: 599 }, episode_no: 2,
+  });
+  const verified = makeEntry(163, base + " - 02 [1080p]", { anime: { id: 167, anilist: 900 }, episode_no: 2 });
+  const strict = makeEntry(164, base + " Season 2 - 04 [1080p]", { episode_no: 2 });
+  t.mock.method(client, "requestJson", async (path: string) => {
+    if (path.startsWith("/search/torrents?")) return { results: [unmarked, conflicting, verified, strict] };
+    return null;
+  });
+  const { torrents } = await TsukihimeClient.fetchTorrents({ anilistId: 900, malId: 728, anidbId: 500 }, {
+    targetEp: 2, knownTitles: ["Example Saga Season 2"],
+  });
+  assert.deepEqual(torrents.map(item => [item.id, item.tsukihime_episode_no]), [[163, 2]]);
+});
+
+test("Tsukihime rejects conflicting row metadata within a verified show page", async t => {
+  const anime = { id: 170, anilist: 910, mal: 259, anidb: 607, title: "Example Saga Season 2" };
+  const title = "[SubsPlease] Example Saga - 02 [1080p]";
+  const verifiedByPage = makeEntry(171, title, { episode_no: 2 });
+  const wrongRow = makeEntry(172, title, { anime: { id: 170, anilist: 911 }, episode_no: 2 });
+  const wronglyScoped = makeEntry(173, title, { anime: { id: 175, anilist: 910 }, episode_no: 2 });
+  const strict = makeEntry(176, "[SubsPlease] Example Saga Season 2 - 02 [1080p]", { episode_no: 5 });
+  const conflictingEpisode = makeEntry(177, title, { episode_no: 3 });
+  const wrongEpisodePage = makeEntry(178, title, { episode_no: 4 });
+  t.mock.method(client, "requestJson", async (path: string) => {
+    if (path === "/animes/anilist/910") return anime;
+    if (path.startsWith("/animes/170/episodes/2?")) {
+      return { anime, episode: { anime_id: 170, episode_num: 2 }, results: [verifiedByPage, wrongRow, wronglyScoped, conflictingEpisode] };
+    }
+    if (path.startsWith("/animes/170/episodes/3?")) {
+      return { anime, episode: { anime_id: 170, episode_num: 4 }, results: [wrongEpisodePage] };
+    }
+    // A request parameter alone cannot verify a row without associated show metadata.
+    if (path.startsWith("/torrents?")) return { results: [makeEntry(174, title, { episode_no: 2 }), strict] };
+    if (path === "/torrents/176") return { ...strict, anime };
+    return null;
+  });
+  const { torrents } = await TsukihimeClient.fetchTorrents({ anilistId: 910 }, {
+    targetEp: 2, episodeAliases: [3], knownTitles: [anime.title],
+  });
+  assert.deepEqual(torrents.map(item => [item.id, item.tsukihime_episode_no]), [[171, 2], [177, null], [176, null]]);
+  const [[hydrated]] = await TsukihimeClient.hydrateCandidates([[torrents[2], 2]]);
+  assert.equal(hydrated.tsukihime_episode_no, null);
 });
 
 test("Tsukihime resolves and validates an uncached stored internal ID", async t => {
@@ -159,6 +225,44 @@ test("Tsukihime resolves and validates an uncached stored internal ID", async t 
   assert.equal(await TsukihimeClient.resolveAnime({ anilistId: 129, tsukihimeId: 130 }), expected);
   assert.equal(await TsukihimeClient.resolveAnime({ anilistId: 128, tsukihimeId: 130 }), null);
   assert.ok(request.mock.calls.some(call => call.arguments[0] === "/animes/130?limit=1&offset=0"));
+});
+
+test("a HEVC result does not suppress the remux search, including a sparse filtered search page", async t => {
+  const anime = { id: 301, anilist: 300, title: "Test Hero" };
+  const hevc = makeEntry(302, "[Erai-raws] Test Hero - 03 [1080p HEVC] [MultiSub]", { episode_no: 3 });
+  const avc = makeEntry(303, "[SubsPlease] Test Hero - 03 [1080p AVC]", { anime, episode_no: 3 });
+  const request = t.mock.method(client, "requestJson", async (path: string) => {
+    const { pathname, searchParams } = new URL(path, "https://test.invalid");
+    if (pathname === "/animes/anilist/300") return anime;
+    if (pathname === "/animes/301/episodes/3" || pathname === "/torrents") return { results: [hevc] };
+    if (pathname === "/search/torrents") {
+      const offset = Number(searchParams.get("offset"));
+      return { total: 100, start: offset, limit: 50, results: offset === 50 ? [avc] : [] };
+    }
+    return null;
+  });
+  const target = { anilistId: 300 };
+  const episode = { targetEp: 3, langType: "sub", knownTitles: ["Test Hero"] };
+  const result = await TsukihimeClient.fetchTorrents(target, episode);
+  assert.deepEqual(result.torrents.map(item => item.id), [302, 303]);
+  assert.ok(request.mock.calls.some(call => call.arguments[0].startsWith("/search/torrents?") &&
+    call.arguments[0].includes("sublang=en") && call.arguments[0].includes("offset=50")));
+  const priorCalls = request.mock.callCount();
+  const gpu = await TsukihimeClient.fetchTorrents(target, { ...episode, preferredPipeline: "kaggle_gpu" });
+  assert.deepEqual(gpu.torrents.map(item => item.id), [302]);
+  assert.ok(request.mock.calls.slice(priorCalls).every(call => !call.arguments[0].startsWith("/search/torrents?")));
+});
+
+test("Tsukihime retains a verified show ID when every release endpoint fails", async t => {
+  const anime = { id: 311, anilist: 310, title: "Test Hero" };
+  t.mock.method(client, "requestJson", async (path: string) => {
+    if (path === "/animes/anilist/310") return anime;
+    throw new Error("HTTP 503");
+  });
+  const result = await TsukihimeClient.fetchTorrents({ anilistId: 310 }, {
+    knownTitles: ["Test Hero"], targetEp: 3, reportErrors: true,
+  });
+  assert.deepEqual(result, { anime, torrents: [], releaseSearchFailed: true });
 });
 
 test("Tsukihime uses the info hash fallback when a torrent detail ID is unavailable", async t => {

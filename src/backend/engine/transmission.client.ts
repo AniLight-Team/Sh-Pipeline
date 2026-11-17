@@ -180,7 +180,7 @@ export class TransmissionClient {
     downloadDir = DEFAULT_DOWNLOAD_DIR,
     paused = false,
     fallbackMagnet?: string,
-  ): Promise<{ id: number; name: string; isDuplicate?: boolean }> {
+  ): Promise<{ id: number; name: string; hashString?: string; isDuplicate?: boolean }> {
     await this.ensureOptimalSessionSettings();
 
     const target = magnetOrUrl.startsWith("magnet:?")
@@ -212,17 +212,17 @@ export class TransmissionClient {
       const info = res["torrent-added"];
       const tId = Number(info.id);
       activeTorrentRefCount.set(tId, (activeTorrentRefCount.get(tId) || 0) + 1);
-      await this.startTorrentNow(tId).catch(() => {});
+      if (!paused) await this.startTorrentNow(tId).catch(() => {});
       log.success("Transmission", `Torrent added: ${info.name} (ID: ${tId})`);
-      return { id: tId, name: info.name, isDuplicate: false };
+      return { id: tId, name: info.name, hashString: info.hashString, isDuplicate: false };
     }
     if (res["torrent-duplicate"]) {
       const info = res["torrent-duplicate"];
       const tId = Number(info.id);
       activeTorrentRefCount.set(tId, (activeTorrentRefCount.get(tId) || 0) + 1);
-      await this.startTorrentNow(tId).catch(() => {});
+      if (!paused) await this.startTorrentNow(tId).catch(() => {});
       log.info("Transmission", `Torrent already present: ${info.name} (ID: ${tId}, activeRefs=${activeTorrentRefCount.get(tId)})`);
-      return { id: tId, name: info.name, isDuplicate: true };
+      return { id: tId, name: info.name, hashString: info.hashString, isDuplicate: true };
     }
     throw new Error(`Unexpected response adding torrent: ${JSON.stringify(res)}`);
   }
@@ -286,6 +286,7 @@ export class TransmissionClient {
     wantedFileIndex?: number,
     deleteLocalData = true,
     fileCompleted = false,
+    removeWhenUnused = true,
   ): Promise<void> {
     const activeSet = activeTorrentWantedFiles.get(torrentId);
     if (activeSet && wantedFileIndex !== undefined) {
@@ -322,7 +323,7 @@ export class TransmissionClient {
     activeTorrentRefCount.delete(torrentId);
     activeTorrentWantedFiles.delete(torrentId);
     activeTorrentCompletedFiles.delete(torrentId);
-    await this.removeTorrent(torrentId, deleteLocalData);
+    if (removeWhenUnused) await this.removeTorrent(torrentId, deleteLocalData);
   }
 
   public async markFileWanted(
@@ -378,7 +379,7 @@ export class TransmissionClient {
     const res = await this.callRpc("torrent-get", {
       ids: [torrentId],
       fields: [
-        "id", "name", "percentDone", "metadataPercentComplete", "status", "files", "fileStats",
+        "id", "name", "hashString", "percentDone", "metadataPercentComplete", "status", "files", "fileStats",
         "downloadDir", "isFinished", "errorString", "rateDownload",
         "eta", "peersConnected", "peersSendingToUs", "leftUntilDone", "totalSize",
         "sizeWhenDone",

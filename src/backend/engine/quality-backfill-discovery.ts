@@ -2,7 +2,7 @@ import { AnimeToshoClient, type FetchTorrentsOptions } from "./animetosho.client
 import { canonicalDiscoveryTitles } from "./discovery-titles.js";
 import { AnimeMetadataResolver } from "./metadata-resolver.js";
 import { ReleaseFilter } from "./release-filter.js";
-import { torrentIdentityKey } from "./torrent-identity.js";
+import { torrentIdentityKey, torrentInfoHash } from "./torrent-identity.js";
 import { TsukihimeClient } from "./tsukihime.client.js";
 import type { AnimeToshoItem, ReleaseQualityEntry, StreamType, VideoResolutionQuality } from "./types.js";
 
@@ -82,7 +82,11 @@ export async function findBackfillTorrents(job: BackfillSearch): Promise<Release
   const addCandidates = (items: AnimeToshoItem[] | null) => {
     if (!items) return;
     searched = true;
+    if (!knownTitles.length) return;
     for (const item of items) {
+      if (!torrentInfoHash(item)) continue;
+      const declaredAnidb = Number(item.anidb_aid);
+      if (options.expectedAnidbId && declaredAnidb > 0 && declaredAnidb !== options.expectedAnidbId) continue;
       const key = torrentIdentityKey(item);
       if (ReleaseFilter.hasWatermarkedSource(item.title)) {
         blockedKeys.add(key);
@@ -119,6 +123,7 @@ export async function findBackfillTorrents(job: BackfillSearch): Promise<Release
     job.anidbId ? search(AnimeToshoClient.fetchTorrents(job.anidbId, quality, options)) : null,
   ]);
 
+  options.expectedAnidbId = tsukihime?.anime?.anidb || job.anidbId;
   if (tsukihime?.anime) {
     if (!knownTitles.length) {
       knownTitles = canonicalDiscoveryTitles({
@@ -128,13 +133,15 @@ export async function findBackfillTorrents(job: BackfillSearch): Promise<Release
       options.knownTitles = knownTitles;
     }
   }
-  addCandidates(tsukihime?.torrents ?? null);
-  addCandidates(aniDbItems);
+  if (tsukihime?.releaseSearchFailed) errors.push(new Error("Tsukihime release search unavailable"));
+  else addCandidates(tsukihime?.torrents ?? null);
+  if (options.expectedAnidbId === job.anidbId) addCandidates(aniDbItems);
 
   if (!candidates.size) {
     const canonicalId = tsukihime?.anime?.anidb || (job.anilistId
       ? await search(AnimeMetadataResolver.resolveAnimapAnidbId(job.anilistId))
       : null);
+    if (canonicalId) options.expectedAnidbId = canonicalId;
     if (canonicalId && canonicalId !== job.anidbId) {
       addCandidates(await search(AnimeToshoClient.fetchTorrents(canonicalId, quality, options)));
     }

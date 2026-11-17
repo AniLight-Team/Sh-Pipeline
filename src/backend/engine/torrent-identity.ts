@@ -2,8 +2,8 @@ import type { AnimeToshoItem } from "./types.js";
 
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-function normalizeBtih(raw: string | undefined): string | undefined {
-  const value = raw?.trim().toUpperCase();
+export function normalizeBtih(raw: unknown): string | undefined {
+  const value = typeof raw === "string" ? raw.trim().toUpperCase() : undefined;
   if (!value) return;
   if (/^[0-9A-F]{40}$/.test(value)) return value.toLowerCase();
   if (!/^[A-Z2-7]{32}$/.test(value)) return;
@@ -23,8 +23,17 @@ function normalizeBtih(raw: string | undefined): string | undefined {
 }
 
 export function torrentInfoHash(item: AnimeToshoItem): string | undefined {
-  const magnetHash = item.magnet_uri?.match(/[?&]xt=urn:btih:([a-z\d]+)(?=&|$)/i)?.[1];
-  return normalizeBtih(item.info_hash) ?? normalizeBtih(magnetHash);
+  const hashes = new Set<string>();
+  const declared = normalizeBtih(item.info_hash);
+  if (declared) hashes.add(declared);
+  if (typeof item.magnet_uri === "string" && item.magnet_uri.startsWith("magnet:?")) {
+    for (const topic of new URLSearchParams(item.magnet_uri.slice(8)).getAll("xt")) {
+      if (!/^urn:btih:/i.test(topic)) continue;
+      const hash = normalizeBtih(topic.slice(9));
+      if (hash) hashes.add(hash);
+    }
+  }
+  return hashes.size === 1 ? hashes.values().next().value : undefined;
 }
 
 export function torrentIdentityKey(item: AnimeToshoItem): string {

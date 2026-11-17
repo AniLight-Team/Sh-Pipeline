@@ -48,7 +48,7 @@ test("Kira discovery persists release backoff and completes caption repairs with
   t.mock.method(PipelineEngineService, "checkStorageCapacityForDownload", async () => ({
     allowed: true, usedBytes: 0, freeBytes: 64 * 1024 ** 3,
   }));
-  const discovery = t.mock.method(TsukihimeClient, "fetchTorrents", async () => ({ anime: null, torrents: [] }));
+  const discovery = t.mock.method(TsukihimeClient, "fetchTorrents", async (): ReturnType<typeof TsukihimeClient.fetchTorrents> => ({ anime: null, torrents: [] }));
   const scopedSearch = t.mock.method(AnimeToshoClient, "fetchTorrents", async (): Promise<AnimeToshoItem[]> => []);
   t.mock.method(AnimeToshoClient, "fetchTorrentsByTitle", async () => []);
   t.mock.method(AnimeMetadataResolver, "resolveAnimapAnidbId", async () => null);
@@ -140,4 +140,31 @@ test("Kira discovery persists release backoff and completes caption repairs with
   assert.equal((await PipelineEngineService.discoverAndStageJob(previous.id)).status, "staged");
   assert.equal((await job(previous.id))?.torrentTitle, clean);
   await assert.rejects(fs.access(rejectedFile), { code: "ENOENT" });
+
+  assert.equal((await job(previous.id))?.metadata?.tsukihimeId, undefined);
+  await db.update(schema.pipelineJob).set({ status: "queued" }).where(eq(schema.pipelineJob.id, previous.id));
+  discovery.mock.mockImplementation(async () => ({
+    anime: { id: 9403, anilist: animeId, anidb: animeId, mal: 60636, title: knownTitles[0], total_episodes: 10 },
+    torrents: [],
+  }));
+  assert.equal((await PipelineEngineService.discoverAndStageJob(previous.id)).status, "staged");
+  const mapped = await job(previous.id);
+  assert.equal(mapped?.torrentTitle, clean);
+  assert.equal(mapped?.metadata?.tsukihimeId, 9403);
+  assert.equal(mapped?.metadata?.malId, 60636);
+  assert.equal(mapped?.metadata?.kind, "release");
+
+  const [unverified] = await db.insert(schema.pipelineJob).values({
+    animeId, anilistId: animeId, anidbId: animeId, episodeNumber: 11, types: ["sub"],
+    knownTitles: ["Another Anime"], metadata: { kind: "release" },
+  }).returning();
+  resolveTitles.mock.mockImplementation(async () => []);
+  discovery.mock.mockImplementation(async () => ({ anime: null, torrents: [] }));
+  const requestsBefore = scopedSearch.mock.callCount();
+  const transfersBefore = transfer.mock.callCount();
+  const unavailable = await PipelineEngineService.discoverAndStageJob(unverified.id);
+  assert.equal(unavailable.status, "retry_scheduled");
+  assert.match(unavailable.error ?? "", /verify a canonical title/);
+  assert.equal(scopedSearch.mock.callCount(), requestsBefore);
+  assert.equal(transfer.mock.callCount(), transfersBefore);
 });

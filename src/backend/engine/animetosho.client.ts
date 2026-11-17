@@ -7,10 +7,16 @@ export interface FetchTorrentsOptions {
   targetEp?: number;
   langType?: string;
   knownTitles?: (string | null | undefined)[];
+  expectedAnidbId?: number | null;
   episodeCount?: number | null;
   maxPages?: number;
   exhaustive?: boolean;
   reportErrors?: boolean;
+}
+
+function catalogId(value: unknown): number | undefined {
+  const id = typeof value === "string" && /^\d+$/.test(value.trim()) ? Number(value) : value;
+  return typeof id === "number" && Number.isSafeInteger(id) && id > 0 ? id : undefined;
 }
 
 export class AnimeToshoClient {
@@ -92,6 +98,7 @@ export class AnimeToshoClient {
       let newItemsCount = 0;
       const pageUniqueItems: AnimeToshoItem[] = [];
       for (const item of pageItems) {
+        if (!item || typeof item.title !== "string" || !item.title.trim()) continue;
         const itemKey = item.id || item.info_hash || item.title;
         if (seenIds.has(itemKey)) continue;
         seenIds.add(itemKey);
@@ -185,6 +192,7 @@ export class AnimeToshoClient {
     query = "1080p",
     options: FetchTorrentsOptions = {},
   ): Promise<AnimeToshoItem[]> {
+    if (catalogId(anidbId) !== anidbId) return [];
     const qParam = query ? `&q=${encodeURIComponent(query)}` : "";
     const baseUrl = `https://feed.animetosho.net/json?qx=1${qParam}&aids=${anidbId}`;
     return await this.fetchWithPagination(
@@ -192,9 +200,10 @@ export class AnimeToshoClient {
       `AniDB ID ${anidbId} (query: "${query || "all"}")`,
       options,
       (item) => {
-        const reportedId = Number(item.anidb_aid);
-        if (reportedId > 0 && reportedId !== anidbId) return false;
-        return !options.knownTitles?.length || ReleaseFilter.matchesSeriesTitle(item.title, options.knownTitles, {
+        const reportedId = catalogId(item.anidb_aid);
+        if (reportedId && reportedId !== anidbId) return false;
+        if (!options.knownTitles?.length) return reportedId === anidbId;
+        return ReleaseFilter.matchesSeriesTitle(item.title, options.knownTitles, {
           allowUnmarkedSeason: reportedId === anidbId,
         });
       },
@@ -206,6 +215,8 @@ export class AnimeToshoClient {
     query = "1080p",
     options: FetchTorrentsOptions = {},
   ): Promise<AnimeToshoItem[]> {
+    const expectedAnidbId = catalogId(options.expectedAnidbId);
+    if (!expectedAnidbId) return [];
     const cleanTitle = title.normalize("NFKC")
       .replace(/[^\p{L}\p{M}\p{N}\s-]+/gu, " ")
       .replace(/\s+/g, " ")
@@ -219,7 +230,11 @@ export class AnimeToshoClient {
       baseUrl,
       `title "${fullQuery}"`,
       { ...options, knownTitles },
-      (item) => ReleaseFilter.matchesSeriesTitle(item.title, knownTitles),
+      (item) => {
+        const reportedId = catalogId(item.anidb_aid);
+        if (reportedId !== expectedAnidbId) return false;
+        return ReleaseFilter.matchesSeriesTitle(item.title, knownTitles);
+      },
     );
   }
 }

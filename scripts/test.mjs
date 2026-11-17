@@ -12,6 +12,7 @@ try {
     "src/backend/engine/animetosho.client.test.ts",
     "src/backend/engine/discovery-titles.test.ts",
     "src/backend/engine/release-filter.test.ts",
+    "src/backend/engine/torrent-file-selection.test.ts",
     "src/backend/engine/quality-backfill-discovery.test.ts",
     "src/backend/engine/quality-backfill.test.ts",
     "src/backend/engine/tsukihime.client.test.ts",

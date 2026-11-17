@@ -10,7 +10,7 @@ import { VideoEncodingManager } from "./video.manager.js";
 import { AnimeToshoClient, type FetchTorrentsOptions } from "./animetosho.client.js";
 import { TsukihimeClient } from "./tsukihime.client.js";
 import { ReleaseFilter } from "./release-filter.js";
-import { torrentIdentityKey, torrentInfoHash } from "./torrent-identity.js";
+import { normalizeBtih, torrentIdentityKey, torrentInfoHash } from "./torrent-identity.js";
 import { AnimeMetadataResolver } from "./metadata-resolver.js";
 import { canonicalDiscoveryTitles } from "./discovery-titles.js";
 import {
@@ -522,10 +522,14 @@ export class PipelineEngineService {
     metadata?: Record<string, any> | null;
     torrentTitle?: string | null;
     qualitiesPayload?: Record<string, any> | null;
+    knownTitles?: string[] | null;
   }): boolean {
     const stagedTitles = [job.torrentTitle, job.metadata?.sourceTorrentTitle,
       ...Object.values(job.qualitiesPayload ?? {}).map(source => source?.title)];
     if (stagedTitles.some(title => typeof title === "string" && ReleaseFilter.hasWatermarkedSource(title))) return false;
+    const knownTitles = job.knownTitles;
+    if (knownTitles?.length && stagedTitles.some(title => typeof title === "string" &&
+        !ReleaseFilter.matchesSeriesTitle(title, knownTitles, { allowUnmarkedSeason: true }))) return false;
     const sq = job.stagedQualities || job.metadata?.stagedQualities;
     const paths = new Set<string>(job.stagedFilePath ? [job.stagedFilePath] : []);
     if (sq && typeof sq === "object") {
@@ -745,11 +749,11 @@ export class PipelineEngineService {
     knownTitles: string[];
     candidate: AnimeToshoItem;
     effectiveEp: number | string;
+    totalExpectedEps?: number | null;
     qualityTag: VideoResolutionQuality;
     transmission: TransmissionClient;
     stagingDir: string;
     enforceHardCapBeforeStart: boolean;
-    requireEpisodeMatch?: boolean;
     allowWatermarkedSource?: boolean;
   }): Promise<
     | {
@@ -777,11 +781,9 @@ export class PipelineEngineService {
     if (!params.allowWatermarkedSource && ReleaseFilter.hasWatermarkedSource(candidate.title)) {
       return { ok: false, reason: "Torrent is marked as a watermarked source" };
     }
-
-    const magnetUri =
-      candidate.magnet_uri ||
-      (candidate.info_hash ? `magnet:?xt=urn:btih:${candidate.info_hash}` : "") ||
-      candidate.torrent_url;
+    const expectedHash = torrentInfoHash(candidate);
+    if (!expectedHash) return { ok: false, reason: "Torrent has no consistent info hash" };
+    const magnetUri = candidate.magnet_uri || `magnet:?xt=urn:btih:${expectedHash}`;
     const primarySourceUrl = candidate.torrent_url || magnetUri;
     if (!primarySourceUrl) {
       return { ok: false, reason: "Missing magnet_uri and torrent_url" };
@@ -795,12 +797,20 @@ export class PipelineEngineService {
       const tInfo = await transmission.addTorrent(
         primarySourceUrl,
         DEFAULT_DOWNLOAD_DIR,
-        false,
+        true,
         magnetUri || undefined,
       );
       tId = tInfo.id;
+      if (normalizeBtih(tInfo.hashString) !== expectedHash) {
+        await transmission.releaseTorrentClaim(tId, undefined, false, false, !tInfo.isDuplicate).catch(() => {});
+        tId = null;
+        throw new Error("Transmission returned a different or missing torrent info hash");
+      }
 
       const metaStatus = await transmission.waitForMetadata(tId);
+      if (normalizeBtih(metaStatus.hashString) !== expectedHash) {
+        throw new Error("Transmission metadata does not match the selected torrent");
+      }
       const tFiles = metaStatus.files || [];
       const dlDir = metaStatus.downloadDir || DEFAULT_DOWNLOAD_DIR;
       const isMultiFile = tFiles.length > 1;
@@ -821,6 +831,8 @@ export class PipelineEngineService {
         knownTitles,
         targetEp: episodeNumber,
         effectiveEp,
+        torrentTitle: candidate.title,
+        totalExpectedEps: params.totalExpectedEps,
         allowWatermarkedSource: params.allowWatermarkedSource,
       });
 
@@ -833,11 +845,8 @@ export class PipelineEngineService {
       }
 
       const [wantedIdx, relPath] = epMap.get(episodeNumber)!;
-      if (params.requireEpisodeMatch) {
-        const fileEpisode = ReleaseFilter.parseTitle(path.basename(relPath), knownTitles).singleEp;
-        if ((isMarkedBatch || fileEpisode !== null) && fileEpisode !== Number(effectiveEp)) {
-          throw new TorrentEntryNotFoundException(`Could not verify episode ${effectiveEp} in '${relPath}'`);
-        }
+      if (path.win32.isAbsolute(relPath) || path.posix.isAbsolute(relPath) || relPath.split(/[\\/]/).includes("..")) {
+        throw new Error("Torrent file path is outside its download directory");
       }
       claimedWantedIdx = wantedIdx;
       const wantedFileBytes = Number(tFiles[wantedIdx]?.length || candidate.size || 0);
@@ -880,8 +889,16 @@ export class PipelineEngineService {
         expectedDiskPath: fullPath,
       });
 
-      if (!fs.existsSync(fullPath) || fs.statSync(fullPath).size <= 1024) {
-        throw new Error(`Downloaded video file missing or empty on disk: ${fullPath}`);
+      const realDownloadDir = await fs.promises.realpath(dlDir);
+      const realFile = await fs.promises.realpath(fullPath);
+      const relative = path.relative(realDownloadDir, realFile);
+      if (!relative || path.isAbsolute(relative) || relative.split(path.sep)[0] === "..") {
+        throw new Error("Torrent file resolves outside its download directory");
+      }
+      const stat = await fs.promises.lstat(fullPath);
+      if (!stat.isFile() || stat.size <= 1024 || (Number(tFiles[wantedIdx]?.length) > 0 &&
+          stat.size !== Number(tFiles[wantedIdx].length))) {
+        throw new Error(`Downloaded file did not match the expected video size: ${fullPath}`);
       }
 
       const ext = path.extname(fullPath) || ".mkv";
@@ -1105,6 +1122,9 @@ export class PipelineEngineService {
     }, 30_000);
 
     try {
+      if (job.animeId && job.anilistId && await AnimeMetadataResolver.hasConflictingLocalIdentity(job.animeId, job.anilistId)) {
+        throw new TorrentEntryNotFoundException("The job's anime ID and AniList ID refer to different shows");
+      }
       if (kind === "quality_backfill") {
         return await this.discoverAndStageQualityBackfill(job, transmission, videoManager, stagingDir, downloadedPaths);
       }
@@ -1125,7 +1145,7 @@ export class PipelineEngineService {
       const resolvedTitles = job.anilistId
         ? await AnimeMetadataResolver.resolveDiscoveryTitles(job.anilistId)
         : job.animeId ? await AnimeMetadataResolver.resolveLocalDiscoveryTitles(job.animeId) : [];
-      let effectiveKnownTitles = resolvedTitles.length ? resolvedTitles : job.knownTitles ?? [];
+      let effectiveKnownTitles = resolvedTitles;
 
       const torrentByKey = new Map<string, AnimeToshoItem>();
       const allTorrents: AnimeToshoItem[] = [];
@@ -1133,13 +1153,15 @@ export class PipelineEngineService {
       const checkedTrackerDetails = new Set<string>();
       const mergeTorrents = (items: AnimeToshoItem[]) => {
         for (const item of items) {
+          const infoHash = torrentInfoHash(item);
+          if (!infoHash) continue;
           const key = torrentIdentityKey(item);
           if (item.provider !== "tsukihime") {
             animeToshoSeeds.set(key, Math.max(animeToshoSeeds.get(key) ?? 0, item.seeders ?? 0));
           }
           const existing = torrentByKey.get(key);
           if (!existing) {
-            const copy = { ...item, info_hash: torrentInfoHash(item) ?? item.info_hash };
+            const copy = { ...item, info_hash: infoHash };
             torrentByKey.set(key, copy);
             allTorrents.push(copy);
           } else {
@@ -1241,6 +1263,12 @@ export class PipelineEngineService {
         if (!source?.torrentMagnet || !source.torrentTitle || !source.types.some(type => job.types.includes(type))) {
           throw new Error("The torrent for the published stream could not be recovered. Rebuild the stream to record its source.");
         }
+        if (!effectiveKnownTitles.length && source.knownTitles?.length) {
+          effectiveKnownTitles = source.knownTitles;
+        }
+        if (!effectiveKnownTitles.length) {
+          throw new TorrentEntryNotFoundException("Discovery could not verify a canonical title for this anime");
+        }
         const quality = (Object.keys(source.qualitiesPayload ?? {})[0] ?? "1080p") as VideoResolutionQuality;
         const isMagnet = source.torrentMagnet.startsWith("magnet:?");
         const primaryEntry = {
@@ -1270,6 +1298,7 @@ export class PipelineEngineService {
       } else {
         // Search both indexes for the target episode and requested language.
         let tsukihimeAnidbId: number | null = null;
+        const gpuSearch = effectivePolicy === "kaggle_gpu_only" || (effectivePolicy === "all" && forcedMode === "kaggle_gpu");
         try {
           const tsukiLookup = {
             tsukihimeId: job.metadata?.tsukihimeId ? Number(job.metadata.tsukihimeId) : null,
@@ -1286,6 +1315,7 @@ export class PipelineEngineService {
               langType: langTypeForSearch,
               knownTitles: effectiveKnownTitles,
               episodeCount: totalExpectedEps,
+              preferredPipeline: gpuSearch ? "kaggle_gpu" : "vm_remux",
               maxPages: 4,
               reportErrors: true,
             },
@@ -1303,13 +1333,30 @@ export class PipelineEngineService {
             if (tsukiAnime.anidb && tsukiAnime.anidb > 0) {
               tsukihimeAnidbId = tsukiAnime.anidb;
             }
+            const mapping = {
+              tsukihimeId: tsukiAnime.id,
+              ...(tsukiAnime.mal && tsukiAnime.mal > 0 ? { malId: tsukiAnime.mal } : {}),
+              ...(totalExpectedEps ? { totalEpisodes: totalExpectedEps } : {}),
+            };
+            if (Object.entries(mapping).some(([key, value]) => job.metadata?.[key] !== value)) {
+              job.metadata = { ...job.metadata, ...mapping };
+              await db.update(schema.pipelineJob).set({
+                metadata: sql`coalesce(${schema.pipelineJob.metadata}, '{}'::jsonb) || ${JSON.stringify(mapping)}::jsonb`,
+                updatedAt: new Date(),
+              }).where(and(eq(schema.pipelineJob.id, jobId), eq(schema.pipelineJob.status, "downloading")))
+                .catch(error => log.warn("PipelineEngine", `[Job #${jobId}] Could not save Tsukihime mapping: ${String(error)}`));
+            }
           }
-          if (tsukiTorrents.length > 0) {
+          if (effectiveKnownTitles.length && tsukiTorrents.length > 0) {
             mergeTorrents(tsukiTorrents);
             topBundles = evaluateBundles();
           }
         } catch (tsukiErr: any) {
           log.warn("PipelineEngine", `[Job #${job.id}] Tsukihime search warning: ${tsukiErr?.message || tsukiErr}`);
+        }
+
+        if (effectiveKnownTitles.length === 0) {
+          throw new TorrentEntryNotFoundException("Discovery could not verify a canonical title for this anime");
         }
 
         const opts: FetchTorrentsOptions = {
@@ -1320,7 +1367,6 @@ export class PipelineEngineService {
           maxPages: 6,
         };
 
-        const gpuSearch = effectivePolicy === "kaggle_gpu_only" || (effectivePolicy === "all" && forcedMode === "kaggle_gpu");
         const matchesAudio = (bundle: ReleaseCandidateBundle) => !wantsDub || bundle.isDualAudio || bundle.isEnglishDub;
         const preferredBundle = (bundle: ReleaseCandidateBundle) => {
           if (!bundle.isSolo || !bundle.qualities["1080p"] || !matchesAudio(bundle)) return false;
@@ -1384,12 +1430,12 @@ export class PipelineEngineService {
             : hasLiveCoverage();
 
           if (await covered()) return;
-          await searchId(job.anidbId);
-          if (await covered()) return;
           if (canonicalAnidb === undefined) {
             canonicalAnidb = job.anilistId ? await AnimeMetadataResolver.resolveAnimapAnidbId(job.anilistId) : null;
           }
-          await searchId(canonicalAnidb);
+          const anidbId = canonicalAnidb ?? job.anidbId;
+          opts.expectedAnidbId = anidbId;
+          await searchId(anidbId);
           if (await covered()) return;
 
           for (const title of effectiveKnownTitles) {
@@ -1500,6 +1546,7 @@ export class PipelineEngineService {
           knownTitles: effectiveKnownTitles,
           candidate: primaryEntry.item,
           effectiveEp: primaryEntry.effectiveEp,
+          totalExpectedEps,
           qualityTag: primaryEntry.quality,
           transmission,
           stagingDir,
@@ -1737,6 +1784,7 @@ export class PipelineEngineService {
               knownTitles: effectiveKnownTitles,
               candidate: siblingEntry.item,
               effectiveEp: siblingEntry.effectiveEp,
+              totalExpectedEps,
               qualityTag: siblingQ,
               transmission,
               stagingDir,
@@ -1814,6 +1862,7 @@ export class PipelineEngineService {
           qualityCount: stagedQualityList.length,
           stagedQualities,
           qualitiesPayload,
+          knownTitles: effectiveKnownTitles,
           stagedFilePath: primaryStagedPath,
           sizeBytes: totalJobBytes,
           tracksConfig,
@@ -1958,11 +2007,16 @@ export class PipelineEngineService {
     if (searchAttempts < searchDelays.length) {
       let reason = `No compatible ${quality} torrent`;
       let candidates = [] as Awaited<ReturnType<typeof findBackfillTorrents>>;
+      const knownTitles = job.knownTitles?.length
+        ? job.knownTitles
+        : anilistId
+          ? await AnimeMetadataResolver.resolveDiscoveryTitles(anilistId)
+          : animeId ? await AnimeMetadataResolver.resolveLocalDiscoveryTitles(animeId) : [];
       if (this.getExecutionPolicy() !== "kaggle_gpu_only") {
         try {
           candidates = await findBackfillTorrents({
             animeId, anilistId, anidbId, episodeNumber, type, quality,
-            knownTitles: job.knownTitles, metadata, releaseGroup: job.releaseGroup,
+            knownTitles, metadata, releaseGroup: job.releaseGroup,
             torrentTitle: metadata.sourceTorrentTitle, sourceEffectiveEp: metadata.sourceEffectiveEp,
           });
         } catch (error) {
@@ -1974,9 +2028,10 @@ export class PipelineEngineService {
       }
       for (const candidate of candidates) {
         const downloaded = await this.downloadCandidateEpisodeToStaging({
-          jobId, episodeNumber, knownTitles: job.knownTitles ?? [], candidate: candidate.item,
+          jobId, episodeNumber, knownTitles, candidate: candidate.item,
           effectiveEp: candidate.effectiveEp, qualityTag: quality, transmission, stagingDir,
-          enforceHardCapBeforeStart: true, requireEpisodeMatch: true,
+          totalExpectedEps: Number(metadata.totalEpisodes) || null,
+          enforceHardCapBeforeStart: true,
         });
         if (!downloaded.ok) {
           if (downloaded.pausedForCapacity) return retryLater(searchDelays[0], downloaded.reason);
