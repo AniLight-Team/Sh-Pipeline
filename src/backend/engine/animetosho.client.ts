@@ -9,13 +9,16 @@ export interface FetchTorrentsOptions {
   knownTitles?: (string | null | undefined)[];
   episodeCount?: number | null;
   maxPages?: number;
+  exhaustive?: boolean;
+  reportErrors?: boolean;
 }
 
 export class AnimeToshoClient {
   private static async fetchPage(
     url: string,
-    retries = 3,
+    reportErrors = false,
   ): Promise<AnimeToshoItem[]> {
+    const retries = 3;
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
         const res = await gotScraping({
@@ -33,10 +36,12 @@ export class AnimeToshoClient {
         if (res.statusCode === 200 && Array.isArray(res.body)) {
           return res.body as AnimeToshoItem[];
         }
+        if (reportErrors) throw new Error(`Unexpected AnimeTosho response (HTTP ${res.statusCode})`);
         return [];
       } catch (err: any) {
         if (attempt === retries) {
           log.error("AnimeTosho", `Error fetching ${url}: ${err?.message || err}`);
+          if (reportErrors) throw err;
           return [];
         }
         await new Promise((resolve) => setTimeout(resolve, 1500 * attempt));
@@ -57,6 +62,8 @@ export class AnimeToshoClient {
       knownTitles = [],
       episodeCount = null,
       maxPages = 6,
+      exhaustive = false,
+      reportErrors = false,
     } = options;
 
     const allItems: AnimeToshoItem[] = [];
@@ -74,7 +81,10 @@ export class AnimeToshoClient {
       const pageUrl = `${baseUrl}${pageParam}`;
       log.info("AnimeTosho", `Querying feed (page ${page}/${effectiveMaxPages}) for ${logContext}`);
 
-      const pageItems = await this.fetchPage(pageUrl);
+      const pageItems = await this.fetchPage(pageUrl, reportErrors).catch(error => {
+        if (allItems.length) return [];
+        throw error;
+      });
       if (!pageItems || pageItems.length === 0) {
         break;
       }
@@ -99,61 +109,63 @@ export class AnimeToshoClient {
         break;
       }
 
-      const matchingCandidates = ReleaseFilter.selectTopCandidates(
-        allItems,
-        targetEpNum,
-        langType,
-        {
-          knownTitles,
-          totalExpectedEps: episodeCount,
-          maxCandidates: 3,
-        },
-      );
-
-      const hasTopQuality = matchingCandidates.some(([item, effectiveEp]) =>
-        ReleaseFilter.isHighQualityCandidate(item, effectiveEp, langType, knownTitles),
-      );
-
-      const isDubSearch = String(langType).toLowerCase() === "dub";
-      const candidateStopThreshold = isDubSearch ? 4 : 3;
-      if (hasTopQuality || (page >= candidateStopThreshold && matchingCandidates.length >= 2)) {
-        log.success(
-          "AnimeTosho",
-          `Found ${matchingCandidates.length} candidate(s) (hasTopQuality=${hasTopQuality}) for Ep ${targetEpNum} on page ${page}.`,
+      if (!exhaustive) {
+        const matchingCandidates = ReleaseFilter.selectTopCandidates(
+          allItems,
+          targetEpNum,
+          langType,
+          {
+            knownTitles,
+            totalExpectedEps: episodeCount,
+            maxCandidates: 3,
+          },
         );
-        break;
-      }
 
-      let maxPageEp: number | null = null;
-      let hasCoveringBatch = false;
+        const hasTopQuality = matchingCandidates.some(([item, effectiveEp]) =>
+          ReleaseFilter.isHighQualityCandidate(item, effectiveEp, langType, knownTitles),
+        );
 
-      for (const item of pageUniqueItems) {
-        const parsed = ReleaseFilter.parseTitle(item.title || "", knownTitles);
-        if (parsed.isBonusOrExtra || parsed.seasonNum === 0 || parsed.isWeirdOrPromo || parsed.isUnsupportedContainer) continue;
-
-        if (parsed.singleEp !== null && parsed.singleEp > 0) {
-          if (maxPageEp === null || parsed.singleEp > maxPageEp) maxPageEp = parsed.singleEp;
+        const isDubSearch = String(langType).toLowerCase() === "dub";
+        const candidateStopThreshold = isDubSearch ? 4 : 3;
+        if (hasTopQuality || (page >= candidateStopThreshold && matchingCandidates.length >= 2)) {
+          log.success(
+            "AnimeTosho",
+            `Found ${matchingCandidates.length} candidate(s) (hasTopQuality=${hasTopQuality}) for Ep ${targetEpNum} on page ${page}.`,
+          );
+          break;
         }
 
-        if (parsed.epRange) {
-          const [rStart, rEnd] = parsed.epRange;
-          if (maxPageEp === null || rEnd > maxPageEp) maxPageEp = rEnd;
-          if (rStart <= targetEpNum && targetEpNum <= rEnd) hasCoveringBatch = true;
-        } else if (parsed.isBatch && parsed.singleEp === null) {
-          const nFiles = item.num_files || 0;
-          if (nFiles >= targetEpNum || (episodeCount && targetEpNum <= episodeCount)) {
-            hasCoveringBatch = true;
+        let maxPageEp: number | null = null;
+        let hasCoveringBatch = false;
+
+        for (const item of pageUniqueItems) {
+          const parsed = ReleaseFilter.parseTitle(item.title || "", knownTitles);
+          if (parsed.isBonusOrExtra || parsed.seasonNum === 0 || parsed.isWeirdOrPromo || parsed.isUnsupportedContainer) continue;
+
+          if (parsed.singleEp !== null && parsed.singleEp > 0) {
+            if (maxPageEp === null || parsed.singleEp > maxPageEp) maxPageEp = parsed.singleEp;
+          }
+
+          if (parsed.epRange) {
+            const [rStart, rEnd] = parsed.epRange;
+            if (maxPageEp === null || rEnd > maxPageEp) maxPageEp = rEnd;
+            if (rStart <= targetEpNum && targetEpNum <= rEnd) hasCoveringBatch = true;
+          } else if (parsed.isBatch && parsed.singleEp === null) {
+            const nFiles = item.num_files || 0;
+            if (nFiles >= targetEpNum || (episodeCount && targetEpNum <= episodeCount)) {
+              hasCoveringBatch = true;
+            }
           }
         }
-      }
 
-      const minPagesBeforeEpCutoff = isDubSearch ? 6 : 3;
-      if (!hasCoveringBatch && maxPageEp !== null && maxPageEp < targetEpNum && page >= minPagesBeforeEpCutoff) {
-        log.info(
-          "AnimeTosho",
-          `Max ep on page ${page} (${maxPageEp}) < target Ep ${targetEpNum}. Target episode passed; stopping.`,
-        );
-        break;
+        const minPagesBeforeEpCutoff = isDubSearch ? 6 : 3;
+        if (!hasCoveringBatch && maxPageEp !== null && maxPageEp < targetEpNum && page >= minPagesBeforeEpCutoff) {
+          log.info(
+            "AnimeTosho",
+            `Max ep on page ${page} (${maxPageEp}) < target Ep ${targetEpNum}. Target episode passed; stopping.`,
+          );
+          break;
+        }
       }
 
       if (pageItems.length < 20) {

@@ -963,7 +963,8 @@ export class VideoEncodingManager {
 
   /**
    * Generates a strictly GPU-ONLY (2x NvidiaTeslaT4 NVENC) Multi-Episode Batch Kernel script:
-   * - ALWAYS encodes all 3 qualities (1080p, 720p, 480p) via hardware h264_nvenc with the "AniLight" RGBA watermark burned in for the first 30s.
+   * - Encodes all 3 qualities by default, or only the requested lower qualities for a stored 1080p stream.
+   * - Uses hardware h264_nvenc with the "AniLight" RGBA watermark burned in for the first 30s.
    * - Zero-desync A/V pipeline: setpts=PTS-STARTPTS + aresample=async=1000:min_hard_comp=0.100000:first_pts=0 + -fps_mode cfr + -avoid_negative_ts make_zero.
    * - Parallel execution across both Tesla T4 GPUs (intra-episode GPU split for 1-job batch, or parallel worker queue for multi-episode batches).
    * - Resilient /kaggle/input dataset file discovery (exact match, case-insensitive match, or jobId prefix match).
@@ -985,7 +986,7 @@ ffmpeg_ver = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=Tr
 print(f"[FFmpeg:System] {ffmpeg_ver}", flush=True)
 
 manifest = json.loads(base64.b64decode("${manifestB64}").decode("utf-8"))
-print(f"Batch Manifest loaded: {len(manifest)} episode job(s) to encode across all 3 qualities (1080p, 720p, 480p).", flush=True)
+print(f"Batch Manifest loaded: {len(manifest)} episode job(s) to encode.", flush=True)
 
 # 1. STRICT GPU HARDWARE ASSERTION (CPU FALLBACK IS DISABLED)
 smi = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True)
@@ -1060,6 +1061,7 @@ except ImportError:
 start_search = time.time()
 input_file_map = {}
 all_video_files = []
+selective_input_files = {item["filename"].lower() for item in manifest if item.get("outputQualities") is not None}
 search_roots = ["/kaggle/input"]
 if os.path.exists("/root/.cache/kagglehub"):
     search_roots.append("/root/.cache/kagglehub")
@@ -1077,7 +1079,7 @@ while time.time() - start_search < 240:
                 input_file_map[f.lower()] = full_p
                 if f.lower().endswith((".mkv", ".mp4", ".avi", ".webm")):
                     all_video_files.append(full_p)
-    if all_video_files:
+    if all_video_files and selective_input_files.issubset(input_file_map):
         if all((item["filename"] in input_file_map or item["filename"].lower() in input_file_map) for item in manifest) or len(all_video_files) >= len(manifest):
             break
     time.sleep(3)
@@ -1098,12 +1100,13 @@ def resolve_input_file(item):
         return input_file_map[fname]
     if fname.lower() in input_file_map and os.path.exists(input_file_map[fname.lower()]):
         return input_file_map[fname.lower()]
-    prefix = f"input_{job_id}".lower()
-    for vf in all_video_files:
-        if os.path.basename(vf).lower().startswith(prefix):
-            return vf
-    if len(manifest) == 1 and len(all_video_files) == 1:
-        return all_video_files[0]
+    if item.get("outputQualities") is None:
+        prefix = f"input_{job_id}".lower()
+        for vf in all_video_files:
+            if os.path.basename(vf).lower().startswith(prefix):
+                return vf
+        if len(manifest) == 1 and len(all_video_files) == 1:
+            return all_video_files[0]
     raise RuntimeError(f"Input file '{fname}' for job {job_id} not found in /kaggle/input (available: {[os.path.basename(x) for x in all_video_files]})")
 
 BASE_WORK_DIR = "/tmp/anilight_batch_work"
@@ -1322,13 +1325,20 @@ def hf_uploader_loop():
 uploader_thread = threading.Thread(target=hf_uploader_loop, daemon=True)
 uploader_thread.start()
 
-# 6. Core GPU Episode Transcoder (ALWAYS encodes 1080p, 720p, and 480p with AniLight Watermark)
+# 6. Core GPU episode transcoder
 def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
     job_id = item["jobId"]
     anime_id = item["animeId"]
     ep_num = item["episodeNumber"]
     raw_tracks = item.get("tracks") or []
     hf = item["hf"]
+    requested_qualities = item.get("outputQualities")
+    if requested_qualities is None:
+        qualities = ("1080p", "720p", "480p")
+    else:
+        qualities = tuple(q for q in ("720p", "480p") if q in requested_qualities)
+        if not qualities or len(qualities) != len(requested_qualities):
+            raise RuntimeError(f"Job {job_id} has invalid lower-quality targets: {requested_qualities}")
 
     # Normalize tracks so we only ever encode valid audio track names ("sub" / "dub")
     tracks = []
@@ -1349,7 +1359,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
     can_nvdec = supports_t4_nvdec(v_codec, pix_fmt)
 
     print(
-        f"\\n[Job {job_id}] Starting 3-Quality Watermarked GPU encode for Anime {anime_id} Ep {ep_num} on GPU {assigned_gpu_id} "
+        f"\\n[Job {job_id}] Starting {', '.join(qualities)} GPU encode for Anime {anime_id} Ep {ep_num} on GPU {assigned_gpu_id} "
         f"(codec={v_codec}, pix_fmt={pix_fmt}, fps={in_fps}, nvdec={can_nvdec}, tracks={tracks})...",
         flush=True,
     )
@@ -1404,7 +1414,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
             ]
             subprocess.run(ea_cmd, check=True)
 
-    def clean_partials(qualities=("1080p", "720p", "480p")):
+    def clean_partials():
         for q_k in qualities:
             pf = primary_files[q_k]
             if os.path.exists(pf):
@@ -1512,22 +1522,47 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
     gpu_env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(assigned_gpu_id))
     dec_prefix = hw_dec_args if can_nvdec else sw_dec_args
 
+    def single_quality_command(quality, decode_args):
+        wm_args, filter_graph, nvenc_args = {
+            "1080p": (wm_input_1080, fc_1080_only, nvenc_1080),
+            "720p": (wm_input_720, fc_720_only, nvenc_720),
+            "480p": (wm_input_480, fc_480_only, nvenc_480),
+        }[quality]
+        return (
+            ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + decode_args +
+            ["-i", src_input] + wm_args + ["-i", primary_audio,
+             "-filter_complex", filter_graph, "-map", f"[out{quality[:-1]}]", "-map", "2:a:0"] + nvenc_args
+        )
+
+    def lower_quality_command(decode_args):
+        return (
+            ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + decode_args +
+            ["-i", src_input] + wm_inputs_lower + ["-i", primary_audio,
+             "-filter_complex", fc_lower_2,
+             "-map", "[out720]", "-map", "3:a:0"] + nvenc_720 +
+            ["-map", "[out480]", "-map", "3:a:0"] + nvenc_480
+        )
+
+    if requested_qualities is not None:
+        if len(qualities) == 2:
+            encode_ok = subprocess.run(lower_quality_command(dec_prefix), env=gpu_env).returncode == 0
+            if not encode_ok and can_nvdec:
+                clean_partials()
+                encode_ok = subprocess.run(lower_quality_command(sw_dec_args), env=gpu_env).returncode == 0
+        elif can_nvdec:
+            encode_ok = subprocess.run(single_quality_command(qualities[0], dec_prefix), env=gpu_env).returncode == 0
+        if not encode_ok:
+            clean_partials()
+            encode_ok = all(
+                subprocess.run(single_quality_command(q, sw_dec_args), env=gpu_env).returncode == 0
+                for q in qualities
+            )
+
     # Mode A: Single-episode batch across 2x Tesla T4 GPUs -> GPU 0 encodes 1080p, GPU 1 encodes 720p + 480p simultaneously
-    if allow_intra_split and gpu_count > 1:
+    elif allow_intra_split and gpu_count > 1:
         def run_split_across_2_gpus(d_args):
-            c_1080 = (
-                ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + d_args +
-                ["-i", src_input] + wm_input_1080 + ["-i", primary_audio,
-                 "-filter_complex", fc_1080_only,
-                 "-map", "[out1080]", "-map", "2:a:0"] + nvenc_1080
-            )
-            c_lower = (
-                ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + d_args +
-                ["-i", src_input] + wm_inputs_lower + ["-i", primary_audio,
-                 "-filter_complex", fc_lower_2,
-                 "-map", "[out720]", "-map", "3:a:0"] + nvenc_720 +
-                ["-map", "[out480]", "-map", "3:a:0"] + nvenc_480
-            )
+            c_1080 = single_quality_command("1080p", d_args)
+            c_lower = lower_quality_command(d_args)
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as sub_ex:
                 f0 = sub_ex.submit(lambda: subprocess.run(c_1080, env=dict(os.environ, CUDA_VISIBLE_DEVICES="0")).returncode == 0)
                 f1 = sub_ex.submit(lambda: subprocess.run(c_lower, env=dict(os.environ, CUDA_VISIBLE_DEVICES="1")).returncode == 0)
@@ -1539,7 +1574,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
             encode_ok = run_split_across_2_gpus(sw_dec_args)
 
     # Mode B: Multi-episode batch -> Worker encodes 1080p + 720p + 480p on its dedicated T4 GPU
-    if not encode_ok:
+    if requested_qualities is None and not encode_ok:
         clean_partials()
         cmd_all = (
             ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + dec_prefix +
@@ -1568,36 +1603,20 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
         if not encode_ok:
             clean_partials()
             print(f"[Job {job_id}] Retrying sequential 1080p -> 720p -> 480p h264_nvenc on GPU {assigned_gpu_id}...", flush=True)
-            c1080 = (
-                ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + sw_dec_args +
-                ["-i", src_input] + wm_input_1080 + ["-i", primary_audio,
-                 "-filter_complex", fc_1080_only, "-map", "[out1080]", "-map", "2:a:0"] + nvenc_1080
-            )
-            c720 = (
-                ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + sw_dec_args +
-                ["-i", src_input] + wm_input_720 + ["-i", primary_audio,
-                 "-filter_complex", fc_720_only, "-map", "[out720]", "-map", "2:a:0"] + nvenc_720
-            )
-            c480 = (
-                ["ffmpeg", "-hide_banner", "-y", "-v", "warning"] + sw_dec_args +
-                ["-i", src_input] + wm_input_480 + ["-i", primary_audio,
-                 "-filter_complex", fc_480_only, "-map", "[out480]", "-map", "2:a:0"] + nvenc_480
-            )
-            encode_ok = (
-                subprocess.run(c1080, env=gpu_env).returncode == 0 and
-                subprocess.run(c720, env=gpu_env).returncode == 0 and
-                subprocess.run(c480, env=gpu_env).returncode == 0
+            encode_ok = all(
+                subprocess.run(single_quality_command(q, sw_dec_args), env=gpu_env).returncode == 0
+                for q in qualities
             )
 
     if not encode_ok:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise RuntimeError(f"GPU h264_nvenc transcode failed across all tiers for Job {job_id}.")
 
-    # Remux additional audio tracks (e.g. Dual-Audio dub) into the watermarked 1080p, 720p, 480p video streams
+    # Remux additional audio tracks (e.g. Dual-Audio dub) into the encoded video streams
     if len(tracks) > 1:
         for extra_track_name, _ in tracks[1:]:
             extra_audio = f"{work_dir}/{extra_track_name}_audio.m4a"
-            for q_name in ("1080p", "720p", "480p"):
+            for q_name in qualities:
                 out_mp4 = f"{work_dir}/{extra_track_name}_{q_name}.mp4"
                 subprocess.run([
                     "ffmpeg", "-hide_banner", "-y", "-v", "warning",
@@ -1611,13 +1630,13 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
                     out_mp4
                 ], check=True)
 
-    # Verify all 3 qualities exist and build SHA-256 + HF upload manifest
+    # Verify each requested quality and build the SHA-256 + HF upload manifest
     job_records = []
     job_add_items = []
     for t_name, _ in tracks:
         f1 = uuid.uuid4().hex
         f2 = uuid.uuid4().hex
-        for q_name in ("1080p", "720p", "480p"):
+        for q_name in qualities:
             mp4_path = f"{work_dir}/{t_name}_{q_name}.mp4"
             if not os.path.exists(mp4_path) or os.path.getsize(mp4_path) < 10240:
                 raise RuntimeError(f"Encoded output missing or empty for Job {job_id} ({t_name} {q_name})")
@@ -1651,7 +1670,7 @@ def transcode_episode_on_gpu(item, assigned_gpu_id, allow_intra_split=False):
             job_records.append(rec)
             job_add_items.append((mp4_path, remote_path))
 
-    print(f"[Job {job_id}] Encoded all 3 watermarked qualities (1080p, 720p, 480p) in {time.time() - t_ep_start:.1f}s! Queuing HF upload.", flush=True)
+    print(f"[Job {job_id}] Encoded {', '.join(qualities)} in {time.time() - t_ep_start:.1f}s! Queuing HF upload.", flush=True)
 
     upload_queue.put({
         "job_id": job_id,

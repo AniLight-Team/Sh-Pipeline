@@ -27,6 +27,7 @@ export interface AnimeToshoItem {
   provider?: "animetosho" | "tsukihime";
   tsukihime_id?: number;
   tsukihime_episode_no?: number | null;
+  tsukihime_seeders_known?: boolean;
   audiolangs?: string[];
   sublangs?: string[];
   group_name?: string;
@@ -49,6 +50,7 @@ export interface ParsedReleaseTitle {
   group: string;
   groupLower: string;
   singleEp: number | null;
+  relativeEpisode?: number;
   epRange: [number, number] | null;
   seasonNum: number | null;
   isBatch: boolean;
@@ -167,6 +169,7 @@ export interface KiraBatchManifestItem {
   hf: HuggingFaceAccount;
   mode?: "remux" | "transcode";
   qualityFiles?: Partial<Record<VideoResolutionQuality, string>>;
+  outputQualities?: Exclude<VideoResolutionQuality, "1080p">[];
 }
 
 export interface KiraBatchHfRecord extends HfStoreRecord {
@@ -203,7 +206,7 @@ export interface PipelineEpisodeResult {
   anidbId?: number | null;
   episodeNumber: number;
   type: "sub" | "dub";
-  kind?: JobKind;
+  kind?: JobKind | "quality_backfill";
   sourceJobId?: number | null;
   sourceUrl?: string;
   sources: PipelineEncodedSource[];

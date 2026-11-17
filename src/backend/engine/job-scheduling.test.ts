@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 import { and, eq } from "drizzle-orm";
 import type { ExtractedSubtitleTrack } from "./subtitles.manager.js";
+import type { AnimeToshoItem } from "./types.js";
 
 const testDb = process.env.KIRA_TEST_DATABASE_URL;
 test("Kira discovery persists release backoff and completes caption repairs without staging an encode", { skip: !testDb }, async t => {
@@ -28,7 +29,7 @@ test("Kira discovery persists release backoff and completes caption repairs with
     await fs.rm(scratch, { recursive: true, force: true });
   });
   await PipelineEngineService.ensureTables();
-  t.mock.method(AnimeMetadataResolver, "resolveDiscoveryTitles", async () => ["Example Anime"]);
+  const resolveTitles = t.mock.method(AnimeMetadataResolver, "resolveDiscoveryTitles", async () => ["Example Anime"]);
   const request = {
     animeId, anilistId: animeId, anidbId: animeId,
     requestId: randomUUID(), knownTitles: ["Example Anime"],
@@ -48,7 +49,7 @@ test("Kira discovery persists release backoff and completes caption repairs with
     allowed: true, usedBytes: 0, freeBytes: 64 * 1024 ** 3,
   }));
   const discovery = t.mock.method(TsukihimeClient, "fetchTorrents", async () => ({ anime: null, torrents: [] }));
-  t.mock.method(AnimeToshoClient, "fetchTorrents", async () => []);
+  const scopedSearch = t.mock.method(AnimeToshoClient, "fetchTorrents", async (): Promise<AnimeToshoItem[]> => []);
   t.mock.method(AnimeToshoClient, "fetchTorrentsByTitle", async () => []);
   t.mock.method(AnimeMetadataResolver, "resolveAnimapAnidbId", async () => null);
 
@@ -75,7 +76,7 @@ test("Kira discovery persists release backoff and completes caption repairs with
   await fs.writeFile(srt, "1\n00:00:00,100 --> 00:00:01,900\nExample full English caption\n");
   execFileSync("ffmpeg", ["-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=s=128x72:d=2",
     "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-i", srt, "-map", "0:v", "-map", "1:a",
-    "-map", "2:s", "-metadata:s:a:0", "language=jpn", "-metadata:s:s:0", "language=eng", "-c:s", "srt", fixture]);
+    "-map", "2:s", "-metadata:s:a:0", "language=jpn", "-metadata:s:s:0", "language=eng", "-c:v", "libx264", "-c:s", "srt", fixture]);
 
   await db.update(schema.pipelineJob).set({
     status: "completed", torrentTitle: "[Group] Example Anime - 02 (1080p).mkv",
@@ -85,7 +86,9 @@ test("Kira discovery persists release backoff and completes caption repairs with
     ...request, requestId: randomUUID(), kind: "caption_refresh",
     episodes: [{ episodeNumber: 2, types: ["sub"], sourceJobId: id }],
   })).queuedJobs;
-  const transfer = t.mock.method(PipelineEngineService as any, "downloadCandidateEpisodeToStaging", async () => {
+  const transfer = t.mock.method(PipelineEngineService as any, "downloadCandidateEpisodeToStaging", async (_request: {
+    jobId: number; effectiveEp: number; candidate: AnimeToshoItem;
+  }) => {
     const stagedPath = path.join(scratch, `job_${repair.id}_fixture.mkv`);
     await fs.copyFile(fixture, stagedPath);
     return { ok: true, stagedPath, sizeBytes: 1000, magnetUri: "test", isBatchExtracted: false, fileIndex: 0 };
@@ -107,4 +110,34 @@ test("Kira discovery persists release backoff and completes caption repairs with
   assert.equal(transfer.mock.callCount(), 1);
   assert.equal(upload.mock.callCount(), 1);
   assert.equal(callback.mock.callCount(), 1);
+
+  const knownTitles = ["Bleach: Sennen Kessen-hen - Kashin-tan", "Bleach: Thousand-Year Blood War - The Calamity"];
+  const marked = "[Doomdos] - Bleach Sennen Kessen-hen - Kashin-tan - S01E50 [1080p BILIBILI INTERNATIONAL WEB-DL] [Bleach: Thousand-Year Blood War - The Calamity]";
+  const clean = "[VARYG] BLEACH Thousand-Year Blood War S01E50 1080p DSNP WEB-DL AAC2.0 H.264 MULTi (Bleach: Sennen Kessen-hen - Kashin-tan S04E10)";
+  const rejectedFile = path.join(scratch, "old-source.mkv");
+  await fs.copyFile(fixture, rejectedFile);
+  const [previous] = await db.insert(schema.pipelineJob).values({
+    animeId, anilistId: animeId, anidbId: animeId, episodeNumber: 10, types: ["sub"], status: "staged",
+    torrentTitle: marked, stagedFilePath: rejectedFile,
+    stagedQualities: { "1080p": rejectedFile }, qualitiesPayload: { "1080p": { title: marked, effectiveEp: 50 } },
+    metadata: { kind: "release", totalEpisodes: 10, executionPolicy: "all" },
+  }).returning();
+  resolveTitles.mock.mockImplementation(async () => knownTitles);
+  discovery.mock.mockImplementation(async () => { throw new Error("Tsukihime unavailable"); });
+  scopedSearch.mock.mockImplementation(async () => [
+    { title: marked, seeders: 300, info_hash: "b".repeat(40) },
+    { title: clean, seeders: 4, info_hash: "c".repeat(40) },
+  ]);
+  t.mock.method(PipelineEngineService, "drainVmRemuxQueue", async () => []);
+  transfer.mock.mockImplementation(async (request: { jobId: number; effectiveEp: number; candidate: AnimeToshoItem }) => {
+    assert.equal(request.jobId, previous.id);
+    assert.equal(request.candidate.title, clean);
+    assert.equal(request.effectiveEp, 50);
+    const stagedPath = path.join(scratch, `job_${previous.id}_fixture.mkv`);
+    await fs.copyFile(fixture, stagedPath);
+    return { ok: true, stagedPath, sizeBytes: (await fs.stat(stagedPath)).size, magnetUri: "clean-magnet", isBatchExtracted: false, fileIndex: 0 };
+  });
+  assert.equal((await PipelineEngineService.discoverAndStageJob(previous.id)).status, "staged");
+  assert.equal((await job(previous.id))?.torrentTitle, clean);
+  await assert.rejects(fs.access(rejectedFile), { code: "ENOENT" });
 });

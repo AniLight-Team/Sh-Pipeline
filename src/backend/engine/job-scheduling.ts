@@ -9,6 +9,7 @@ export function queuedDiscoveryCondition() {
 }
 
 export const RELEASE_DISCOVERY_DELAYS_MS = [5, 15, 30, 60, 120, 240].map(minutes => minutes * 60_000);
+export const QUALITY_BACKFILL_SEARCH_DELAYS_MS = RELEASE_DISCOVERY_DELAYS_MS;
 export const CALLBACK_DELAYS_MS = [1, 5, 15, 60, 240, 720].map(minutes => minutes * 60_000);
 
 type AnimeIdentifiers = { animeId?: number | null; anilistId?: number | null; anidbId?: number | null };

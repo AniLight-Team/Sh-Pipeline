@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { VideoEncodingManager } from "./video.manager.js";
+import { runUploadProcess } from "./hf-upload.js";
 import { SubtitleManager } from "./subtitles.manager.js";
 import { ReleaseFilter } from "./release-filter.js";
 import { TsukihimeClient } from "./tsukihime.client.js";
@@ -13,7 +14,7 @@ import {
 } from "../config.js";
 import type { MkvStreamProbe } from "./types.js";
 
-test("VideoEncodingManager.generateBatchGpuKernelScript always encodes 1080p, 720p, and 480p with AniLight watermark", () => {
+test("VideoEncodingManager.generateBatchGpuKernelScript configures all three default qualities with AniLight watermark", () => {
   const vm = new VideoEncodingManager({
     kaggleAccounts: [{ username: "test_user", key: "KGAT_123456" }],
     hfAccounts: [{ owner: "anilight", bucket: "streams", token: "hf_123" }],
@@ -52,6 +53,77 @@ test("VideoEncodingManager.generateBatchGpuKernelScript always encodes 1080p, 72
   assert.equal(script.includes('primary_files["1080p"]'), true);
   assert.equal(script.includes('primary_files["720p"]'), true);
   assert.equal(script.includes('primary_files["480p"]'), true);
+});
+
+test("GPU kernel encodes and queues only requested lower qualities from the staged MP4", { skip: !process.env.KIRA_TEST_PYTHON }, async () => {
+  const script = new VideoEncodingManager().generateBatchGpuKernelScript([
+    { jobId: 42, filename: "input_42.mp4", animeId: 101, episodeNumber: 5,
+      tracks: [["dub", 0]], hf: { owner: "anilight", bucket: "streams", token: "hf_test" },
+      outputQualities: ["480p"] },
+  ]);
+  // Execute the generated transcode function with a stand-in for ffmpeg and the upload queue.
+  const harness = String.raw`
+import ast, base64, concurrent.futures, hashlib, json, os, shutil, sys, tempfile, time, uuid
+from pathlib import Path
+from types import SimpleNamespace
+
+script = sys.stdin.buffer.read().decode("utf-8")
+tree = ast.parse(script)
+nodes = [node for node in tree.body if
+    (isinstance(node, ast.FunctionDef) and node.name in ("resolve_input_file", "transcode_episode_on_gpu")) or
+    (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "manifest" for t in node.targets))]
+exec(compile(ast.Module(body=nodes, type_ignores=[]), "kernel.py", "exec"))
+
+uploaded = []
+upload_queue = SimpleNamespace(put=uploaded.append)
+probe_input_video = lambda _: (1920, 1080, 24, "h264", "yuv420p")
+supports_t4_nvdec = lambda *_: True
+wm_1080_png, wm_720_png, wm_480_png = "1080.png", "720.png", "480.png"
+has_fdk_aac = has_libdav1d = has_tune_hq = has_b_ref = has_nonref_p = has_fps_mode = True
+selected_preset, gpu_count = "p4", 2
+
+def run_case(base, item, expected, fail_combined=False):
+    global BASE_WORK_DIR, subprocess, input_file_map, all_video_files
+    BASE_WORK_DIR = base
+    source = str(Path(base) / item["filename"])
+    Path(source).touch()
+    input_file_map, all_video_files = {item["filename"]: source}, [source]
+    commands = []
+    def fake_run(command, **_):
+        outputs = [arg for i, arg in enumerate(command) if command[i-1] != "-i" and arg.startswith(base)]
+        if "h264_nvenc" in command:
+            assert source in command
+            encoded = [Path(arg).stem.split("_")[-1] for arg in outputs]
+            assert all(q in expected for q in encoded), encoded
+            commands.append(encoded)
+            if fail_combined and (len(encoded) > 1 or "-hwaccel" in command):
+                return SimpleNamespace(returncode=1)
+        for output in outputs:
+            Path(output).write_bytes(b"x" * 10240)
+        return SimpleNamespace(returncode=0)
+    subprocess = SimpleNamespace(run=fake_run)
+    transcode_episode_on_gpu(item, 0, allow_intra_split=True)
+    result = uploaded.pop()
+    assert result["job_id"] == item["jobId"]
+    assert [(r["type"], r["quality"]) for r in result["records"]] == [(t, q) for t, _ in item["tracks"] for q in expected]
+    assert [Path(dst).stem for _, dst in result["add_items"]] == expected * len(item["tracks"])
+    assert len(commands) > 0
+
+with tempfile.TemporaryDirectory() as base:
+    item = manifest[0]
+    run_case(base, item, ["480p"])
+    run_case(base, dict(item, jobId=43, outputQualities=["720p"]), ["720p"], fail_combined=True)
+    run_case(base, dict(item, jobId=44, outputQualities=["720p", "480p"]), ["720p", "480p"])
+    run_case(base, dict(item, jobId=44, outputQualities=["720p", "480p"]), ["720p", "480p"], fail_combined=True)
+    run_case(base, dict(item, jobId=45, tracks=[["sub", 0], ["dub", 1]], outputQualities=None), ["1080p", "720p", "480p"])
+    try:
+        resolve_input_file(dict(item, filename="missing.mp4"))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Selective transcoding accepted a different staged MP4")
+`;
+  await runUploadProcess(process.env.KIRA_TEST_PYTHON!, ["-c", harness], { input: script });
 });
 
 test("VideoEncodingManager.determineTracksToEncode maps sub, dub, and dual-audio tracks accurately", () => {

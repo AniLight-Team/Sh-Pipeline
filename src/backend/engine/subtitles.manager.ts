@@ -53,6 +53,7 @@ export interface MkvStreamProbe {
   pixelFormat: string;
   width: number;
   height: number;
+  durationSeconds?: number;
   isBrowserCompatibleH264: boolean;
 }
 
@@ -157,6 +158,7 @@ export function inspectMkvStreamsSync(filepath: string): Promise<MkvStreamProbe>
             pixelFormat,
             width,
             height,
+            durationSeconds: Number(data.format?.duration) || undefined,
             isBrowserCompatibleH264,
           });
         } catch (parseErr) {

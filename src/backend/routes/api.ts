@@ -407,6 +407,9 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     }
 
     if (action === "force_remux" || action === "force_gpu") {
+      if (targetJobs.some(job => job.metadata?.kind === "quality_backfill")) {
+        return reply.status(409).send({ error: "Quality backfills choose the worker from their source. Use Retry to run a backfill again." });
+      }
       const targetMode = action === "force_remux" ? "vm_remux" : "kaggle_gpu";
       let updatedCount = 0;
 
