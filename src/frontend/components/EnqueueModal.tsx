@@ -1,5 +1,5 @@
 import { useDialog } from "../hooks/useDialog.js";
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   X,
   Plus,
@@ -10,12 +10,15 @@ import {
   ExternalLink,
   Film,
   Grid,
+  Link2,
+  Search,
+  Sparkles,
 } from "lucide-react";
 
 interface EnqueueModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSuccess: () => void;
+  onSuccess: (message?: string) => void;
 }
 
 interface ResolvedPreview {
@@ -30,6 +33,57 @@ interface ResolvedPreview {
   totalEpisodes?: number;
   coverImage?: string;
   source: string;
+}
+
+interface ManualTorrentPreview {
+  id: number;
+  name: string;
+  btih: string;
+  state?: string;
+  totalsize?: number | null;
+  filecount: number;
+  episode_no?: number | null;
+  audiolangs: string[];
+  sublangs: string[];
+  group?: { id: number; name: string } | null;
+  anime?: {
+    id?: number;
+    title?: string;
+    english_title?: string | null;
+    anilist?: number | null;
+    anidb?: number | null;
+    mal?: number | null;
+    total_episodes?: number | null;
+    thumbnail?: string | null;
+  } | null;
+  seeders: number;
+  leechers: number;
+  resolution: string;
+  videoCodec: string;
+  expectedPipeline: "vm_remux" | "kaggle_gpu";
+  isDualAudio: boolean;
+  isEnglishDub: boolean;
+}
+
+function extractTsukihimeTorrentId(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const urlMatch = trimmed.match(/\/torrents\/(\d+)(?:[/?#]|$)/i);
+  if (urlMatch) {
+    const num = Number.parseInt(urlMatch[1], 10);
+    return Number.isSafeInteger(num) && num > 0 ? num : null;
+  }
+  if (/^\d+$/.test(trimmed)) {
+    const num = Number.parseInt(trimmed, 10);
+    return Number.isSafeInteger(num) && num > 0 ? num : null;
+  }
+  return null;
+}
+
+function formatBytesMb(bytes?: number | null): string {
+  if (!bytes || bytes <= 0) return "—";
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function parseEpisodeString(input: string): number[] {
@@ -74,8 +128,10 @@ function formatEpisodeArray(nums: number[]): string {
 }
 
 export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) {
+  const [discoveryMode, setDiscoveryMode] = useState<"auto" | "manual">("auto");
   const [anilistInput, setAnilistInput] = useState("");
   const [episodes, setEpisodes] = useState("1");
+  const [episodesTouched, setEpisodesTouched] = useState(false);
   const [showEpisodeGrid, setShowEpisodeGrid] = useState(true);
   const [isSub, setIsSub] = useState(true);
   const [isDub, setIsDub] = useState(true);
@@ -84,6 +140,13 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
   const [preview, setPreview] = useState<ResolvedPreview | null>(null);
   const [imgError, setImgError] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Manual Tsukihime torrent fields
+  const [manualTorrentInput, setManualTorrentInput] = useState("");
+  const [lookingUpTorrent, setLookingUpTorrent] = useState(false);
+  const [manualTorrentPreview, setManualTorrentPreview] = useState<ManualTorrentPreview | null>(null);
+  const [manualTorrentError, setManualTorrentError] = useState<string | null>(null);
+  const torrentLookupSeq = useRef(0);
 
   // Advanced fields
   const [executionPolicy, setExecutionPolicy] = useState<
@@ -99,6 +162,10 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
       setPreview(null);
       setResolving(false);
       setImgError(false);
+      setManualTorrentPreview(null);
+      setManualTorrentError(null);
+      setLookingUpTorrent(false);
+      setEpisodesTouched(false);
     }
   }, [isOpen]);
 
@@ -116,6 +183,7 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
   if (!isOpen) return null;
 
   const toggleEpisodeNumber = (ep: number) => {
+    setEpisodesTouched(true);
     const next = new Set(selectedEpisodeSet);
     if (next.has(ep)) {
       next.delete(ep);
@@ -123,6 +191,57 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
       next.add(ep);
     }
     setEpisodes(formatEpisodeArray(Array.from(next)));
+  };
+
+  const handleLookupManualTorrent = async (rawValue = manualTorrentInput) => {
+    const parsedId = extractTsukihimeTorrentId(rawValue);
+    if (!parsedId) {
+      setManualTorrentPreview(null);
+      setManualTorrentError(rawValue.trim() ? "Enter a numeric Tsukihime torrent ID (e.g. 41031) or URL." : null);
+      return;
+    }
+    const seq = ++torrentLookupSeq.current;
+    setLookingUpTorrent(true);
+    setManualTorrentError(null);
+    try {
+      const res = await fetch(`/api/tsukihime/torrents/${parsedId}`);
+      const json = await res.json().catch(() => null);
+      if (seq !== torrentLookupSeq.current) return;
+      if (!res.ok || !json?.torrent) {
+        setManualTorrentPreview(null);
+        setManualTorrentError(json?.error || `Tsukihime torrent #${parsedId} was not found.`);
+        return;
+      }
+      const torrent: ManualTorrentPreview = json.torrent;
+      setManualTorrentPreview(torrent);
+      if (!anilistInput.trim() && torrent.anime?.anilist) {
+        const autoAnilist = String(torrent.anime.anilist);
+        setAnilistInput(autoAnilist);
+        void handleResolve(torrent.anime.anilist);
+      }
+      if (!episodesTouched && torrent.episode_no && torrent.episode_no > 0) {
+        setEpisodes(String(torrent.episode_no));
+      }
+    } catch {
+      if (seq !== torrentLookupSeq.current) return;
+      setManualTorrentPreview(null);
+      setManualTorrentError("Could not reach Tsukihime torrent lookup endpoint.");
+    } finally {
+      if (seq === torrentLookupSeq.current) setLookingUpTorrent(false);
+    }
+  };
+
+  const handleManualTorrentInputChange = (val: string) => {
+    setManualTorrentInput(val);
+    setManualTorrentError(null);
+    const parsedId = extractTsukihimeTorrentId(val);
+    if (parsedId) {
+      void handleLookupManualTorrent(val);
+    } else {
+      torrentLookupSeq.current++;
+      setLookingUpTorrent(false);
+      setManualTorrentPreview(null);
+    }
   };
 
   const extractAnilistId = (raw: string): number | null => {
@@ -172,15 +291,26 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
     e.preventDefault();
     setError(null);
 
-    const parsedAnilist = extractAnilistId(anilistInput);
+    const parsedManualTorrentId =
+      discoveryMode === "manual"
+        ? extractTsukihimeTorrentId(manualTorrentInput)
+        : null;
+    if (discoveryMode === "manual" && !parsedManualTorrentId) {
+      setError("Please enter a valid numeric Tsukihime torrent ID (e.g. 41031)");
+      return;
+    }
+
+    const parsedAnilist =
+      extractAnilistId(anilistInput) ||
+      (discoveryMode === "manual" ? manualTorrentPreview?.anime?.anilist || null : null);
     const parsedAnidb = overrideAnidbId
       ? parseInt(overrideAnidbId.trim(), 10)
-      : preview?.anidbId;
+      : preview?.anidbId || (discoveryMode === "manual" ? manualTorrentPreview?.anime?.anidb || undefined : undefined);
     const parsedAnime = overrideAnimeId
       ? parseInt(overrideAnimeId.trim(), 10)
       : preview?.animeId;
 
-    if (!parsedAnilist && !parsedAnidb) {
+    if (!parsedAnilist && !parsedAnidb && !parsedManualTorrentId) {
       setError("Please provide a valid AniList ID (or AniDB ID)");
       return;
     }
@@ -210,6 +340,7 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
         types,
         executionPolicy:
           executionPolicy === "default" ? undefined : executionPolicy,
+        manualTsukihimeTorrentId: parsedManualTorrentId || undefined,
       };
 
       const res = await fetch("/api/pipeline/enqueue", {
@@ -218,12 +349,20 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
         body: JSON.stringify(payload),
       });
 
+      const data = await res.json().catch(() => null);
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || "Failed to enqueue jobs");
+        throw new Error(data?.error || "Failed to enqueue jobs");
       }
 
-      onSuccess();
+      if (parsedManualTorrentId) {
+        const queuedCount = Array.isArray(data?.queuedJobs) ? data.queuedJobs.length : 0;
+        if (queuedCount === 0 && Number(data?.skippedExisting ?? 0) > 0) {
+          throw new Error("A matching job is already actively downloading or encoding. Wait for it to finish or retry it from Job Details.");
+        }
+        onSuccess(`Queued ${queuedCount} episode job(s) using Tsukihime torrent #${parsedManualTorrentId}.`);
+      } else {
+        onSuccess();
+      }
       onClose();
     } catch (err: any) {
       setError(err?.message || "Failed to enqueue jobs");
@@ -266,6 +405,142 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4 text-xs">
+          {/* Discovery Mode Switcher */}
+          <div>
+            <span className="block text-[#302e2a] font-medium mb-1.5">
+              Discovery Mode
+            </span>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setDiscoveryMode("auto")}
+                className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer flex items-start gap-2 ${
+                  discoveryMode === "auto"
+                    ? "bg-indigo-500/15 border-indigo-500/40 text-[#302e2a]"
+                    : "bg-[#f5f3ed] border-[#e6e3db] text-[#716c63] hover:text-[#302e2a]"
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5 mt-0.5 text-[#9a563b] shrink-0" />
+                <div>
+                  <div className="font-semibold text-xs">Auto Discovery</div>
+                  <div className="text-[11px] text-[#817a70]">
+                    Search Tsukihime & AnimeTosho
+                  </div>
+                </div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setDiscoveryMode("manual")}
+                className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer flex items-start gap-2 ${
+                  discoveryMode === "manual"
+                    ? "bg-indigo-500/15 border-indigo-500/40 text-[#302e2a]"
+                    : "bg-[#f5f3ed] border-[#e6e3db] text-[#716c63] hover:text-[#302e2a]"
+                }`}
+              >
+                <Link2 className="w-3.5 h-3.5 mt-0.5 text-[#9a563b] shrink-0" />
+                <div>
+                  <div className="font-semibold text-xs">Manual Tsukihime ID</div>
+                  <div className="text-[11px] text-[#817a70]">
+                    Use a direct torrent ID (e.g. 41031)
+                  </div>
+                </div>
+              </button>
+            </div>
+          </div>
+
+          {/* Manual Tsukihime Torrent ID Input & Preview */}
+          {discoveryMode === "manual" && (
+            <div className="p-3.5 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] space-y-2.5">
+              <div className="flex items-center justify-between">
+                <label htmlFor="manual-torrent-id-input" className="text-[#302e2a] font-medium">
+                  Tsukihime Torrent ID or URL
+                </label>
+                {manualTorrentPreview && (
+                  <a
+                    href={`https://api.tsukihime.org/v1/torrents/${manualTorrentPreview.id}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[11px] font-mono text-[#9a563b] hover:underline inline-flex items-center gap-1"
+                  >
+                    <span>API #{manualTorrentPreview.id}</span>
+                    <ExternalLink className="w-2.5 h-2.5" />
+                  </a>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  id="manual-torrent-id-input"
+                  type="text"
+                  placeholder="e.g. 41031 or https://api.tsukihime.org/v1/torrents/41031"
+                  value={manualTorrentInput}
+                  onChange={(e) => handleManualTorrentInputChange(e.target.value)}
+                  className="flex-1 px-3 py-2 rounded-lg bg-white border border-[#e6e3db] text-[#302e2a] placeholder-[#817a70] focus:outline-none focus:border-indigo-500 font-mono text-xs"
+                  required={discoveryMode === "manual"}
+                />
+                <button
+                  type="button"
+                  disabled={lookingUpTorrent}
+                  onClick={() => void handleLookupManualTorrent()}
+                  className="btn-secondary px-3 py-2 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  {lookingUpTorrent ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Search className="w-3.5 h-3.5" />
+                  )}
+                  <span>Lookup</span>
+                </button>
+              </div>
+              {manualTorrentError && (
+                <div className="text-[11px] text-[#ad4a3e] flex items-center gap-1.5">
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                  <span>{manualTorrentError}</span>
+                </div>
+              )}
+              {manualTorrentPreview && (
+                <div className="p-2.5 rounded-md bg-white border border-[#e6e3db] space-y-1.5">
+                  <div className="font-mono text-[11px] text-[#302e2a] font-semibold break-all">
+                    {manualTorrentPreview.name}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] font-mono text-[#716c63]">
+                    {manualTorrentPreview.group?.name && (
+                      <span className="text-[#9a563b] font-semibold">
+                        [{manualTorrentPreview.group.name}]
+                      </span>
+                    )}
+                    <span>{manualTorrentPreview.resolution}</span>
+                    <span>· {manualTorrentPreview.videoCodec.toUpperCase()}</span>
+                    <span className={manualTorrentPreview.expectedPipeline === "vm_remux" ? "text-[#52734c]" : "text-[#9a563b]"}>
+                      → {manualTorrentPreview.expectedPipeline === "vm_remux" ? "VM Remux" : "GPU Encode"}
+                    </span>
+                    <span>· {formatBytesMb(manualTorrentPreview.totalsize)}</span>
+                    <span>· {manualTorrentPreview.filecount} file{manualTorrentPreview.filecount === 1 ? "" : "s"}</span>
+                    <span>· {manualTorrentPreview.seeders} seed{manualTorrentPreview.seeders === 1 ? "" : "s"}</span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] font-mono text-[#817a70]">
+                    <span>
+                      Audio: {manualTorrentPreview.audiolangs.length ? manualTorrentPreview.audiolangs.join(", ") : "untagged"}
+                    </span>
+                    <span>
+                      · Subs: {manualTorrentPreview.sublangs.length
+                        ? `${manualTorrentPreview.sublangs.includes("en") ? "en" : manualTorrentPreview.sublangs[0]}${manualTorrentPreview.sublangs.length > 1 ? ` (+${manualTorrentPreview.sublangs.length - 1})` : ""}`
+                        : "none"}
+                    </span>
+                    {manualTorrentPreview.episode_no ? <span>· Ep {manualTorrentPreview.episode_no}</span> : null}
+                    {manualTorrentPreview.anime?.anilist ? <span>· AniList #{manualTorrentPreview.anime.anilist}</span> : null}
+                  </div>
+                  {manualTorrentPreview.anime?.anilist &&
+                    extractAnilistId(anilistInput) &&
+                    extractAnilistId(anilistInput) !== manualTorrentPreview.anime.anilist && (
+                      <div className="text-[11px] text-amber-700 bg-amber-500/10 border border-amber-500/25 rounded px-2 py-1">
+                        Note: Torrent links to AniList #{manualTorrentPreview.anime.anilist}, while you selected #{extractAnilistId(anilistInput)}. Your selected anime will be used.
+                      </div>
+                    )}
+                </div>
+              )}
+            </div>
+          )}
+
           {/* AniList ID Input */}
           <div>
             <div className="flex items-center justify-between mb-1.5">
@@ -301,7 +576,7 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
                 value={anilistInput}
                 onChange={(e) => handleAnilistChange(e.target.value)}
                 className="w-full px-3.5 py-2 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] text-[#302e2a] placeholder-[#817a70] focus:outline-none focus:border-indigo-500 font-mono text-xs transition-colors"
-                required
+                required={discoveryMode === "auto"}
               />
               {resolving && (
                 <div className="absolute right-3 top-2.5 text-[#716c63] flex items-center gap-1.5 text-[11px] font-mono">
@@ -364,25 +639,26 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
               <div className="flex items-center gap-1.5 text-[11px] font-mono">
                 <button
                   type="button"
-                  onClick={() => setEpisodes("1")}
+                  onClick={() => { setEpisodesTouched(true); setEpisodes("1"); }}
                   className="px-2 py-0.5 rounded bg-[#f0eee8] text-[#716c63] hover:text-[#302e2a] border border-[#ded8cd] cursor-pointer"
                 >
                   Ep 1
                 </button>
                 <button
                   type="button"
-                  onClick={() => setEpisodes("1-10")}
+                  onClick={() => { setEpisodesTouched(true); setEpisodes("1-10"); }}
                   className="px-2 py-0.5 rounded bg-[#f0eee8] text-[#716c63] hover:text-[#302e2a] border border-[#ded8cd] cursor-pointer"
                 >
                   1-10
                 </button>
                 <button
                   type="button"
-                  onClick={() =>
+                  onClick={() => {
+                    setEpisodesTouched(true);
                     setEpisodes(
                       `1-${preview?.totalEpisodes || gridCount}`,
-                    )
-                  }
+                    );
+                  }}
                   className="px-2 py-0.5 rounded bg-indigo-500/15 text-[#9a563b] border border-indigo-500/30 hover:bg-indigo-500/25 cursor-pointer"
                 >
                   All ({preview?.totalEpisodes || gridCount})
@@ -403,7 +679,7 @@ export function EnqueueModal({ isOpen, onClose, onSuccess }: EnqueueModalProps) 
               type="text"
               placeholder="e.g. 1 or 1-10 or 1, 2, 5"
               value={episodes}
-              onChange={(e) => setEpisodes(e.target.value)}
+              onChange={(e) => { setEpisodesTouched(true); setEpisodes(e.target.value); }}
               className="w-full px-3.5 py-2 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] text-[#302e2a] placeholder-[#817a70] focus:outline-none focus:border-indigo-500 font-mono text-xs transition-colors"
               required
             />

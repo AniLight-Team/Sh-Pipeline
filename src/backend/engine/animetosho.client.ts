@@ -205,6 +205,7 @@ export class AnimeToshoClient {
         if (!options.knownTitles?.length) return reportedId === anidbId;
         return ReleaseFilter.matchesSeriesTitle(item.title, options.knownTitles, {
           allowUnmarkedSeason: reportedId === anidbId,
+          allowVerifiedSeason: reportedId === anidbId,
         });
       },
     );
@@ -221,7 +222,8 @@ export class AnimeToshoClient {
       .replace(/[^\p{L}\p{M}\p{N}\s-]+/gu, " ")
       .replace(/\s+/g, " ")
       .trim();
-    if (!/[\p{L}\p{N}]/u.test(cleanTitle)) return [];
+    const significantChars = cleanTitle.match(/[\p{L}\p{N}]/gu)?.length ?? 0;
+    if (significantChars < 2 || /^(?:2160p|1080p|720p|480p)$/i.test(cleanTitle)) return [];
 
     const knownTitles = options.knownTitles?.length ? options.knownTitles : [title];
     const fullQuery = query ? `${cleanTitle} ${query}` : cleanTitle;
@@ -233,7 +235,9 @@ export class AnimeToshoClient {
       (item) => {
         const reportedId = catalogId(item.anidb_aid);
         if (reportedId !== expectedAnidbId) return false;
-        return ReleaseFilter.matchesSeriesTitle(item.title, knownTitles);
+        return ReleaseFilter.matchesSeriesTitle(item.title, knownTitles, {
+          allowVerifiedSeason: true,
+        });
       },
     );
   }

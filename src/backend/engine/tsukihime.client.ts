@@ -24,6 +24,15 @@ export interface TsukihimeAnime {
   air_status?: number;
 }
 
+export interface TsukihimeTorrentFileEntry {
+  id?: number;
+  state?: string;
+  filename?: string;
+  size?: number;
+  audiolangs?: string[];
+  sublangs?: string[];
+}
+
 export interface TsukihimeTorrentEntry {
   id: number;
   name: string;
@@ -43,8 +52,9 @@ export interface TsukihimeTorrentEntry {
   episode_no?: number | null;
   source_date?: number;
   added_date?: number;
-  anime?: Pick<TsukihimeAnime, "id" | "anilist" | "mal" | "anidb"> | null;
+  anime?: (Pick<TsukihimeAnime, "id" | "anilist" | "mal" | "anidb"> & Partial<TsukihimeAnime>) | null;
   group?: { id: number; name: string; is_fansub?: number } | null;
+  files?: TsukihimeTorrentFileEntry[];
   trackers?: {
     tier?: number;
     lastupdate?: number;
@@ -138,7 +148,9 @@ function languageFilters(langType?: string): Query {
 function titleQuery(titles: (string | null | undefined)[], quality?: VideoResolutionQuality) {
   return [...new Set(titles.flatMap(title => {
     const words = title?.normalize("NFKC").replace(/[^\p{L}\p{M}\p{N}]+/gu, " ").trim().slice(0, 100);
-    return words && words.length >= 2 ? [words + (quality ? " " + quality : "")] : [];
+    const significantChars = words ? (words.match(/[\p{L}\p{N}]/gu)?.length ?? 0) : 0;
+    if (!words || significantChars < 2 || /^(?:2160p|1080p|720p|480p)$/i.test(words)) return [];
+    return [words + (quality ? " " + quality : "")];
   }))].slice(0, 3).join(" | ");
 }
 
@@ -362,7 +374,10 @@ export class TsukihimeClient {
           : expectedIds.some(([field, expected]) => isId(expected) && catalogId(entry.anime?.[field]) === expected);
         const verifiedAnime = Boolean(anime && reportedInternalId === anime.id) || matchingExternalId;
         if (!verifiedAnime && !verifiedScope) continue;
-        if (!ReleaseFilter.matchesSeriesTitle(entry.name, titles, { allowUnmarkedSeason: verifiedAnime })) continue;
+        if (!ReleaseFilter.matchesSeriesTitle(entry.name, titles, {
+          allowUnmarkedSeason: verifiedAnime,
+          allowVerifiedSeason: verifiedAnime,
+        })) continue;
         const item = this.toAnimeToshoItem(entry);
         if (!verifiedAnime) item.tsukihime_episode_no = null;
         const hash = torrentInfoHash(item);
@@ -478,6 +493,26 @@ export class TsukihimeClient {
       sublangs: enriched.sublangs?.length ? enriched.sublangs : item.sublangs,
       group_name: item.group_name ?? enriched.group_name,
     };
+  }
+
+  public static async fetchTorrentById(
+    torrentId: number,
+    signal = AbortSignal.timeout(20_000),
+  ): Promise<TsukihimeTorrentEntry | null> {
+    if (!isId(torrentId)) return null;
+    const entry = await this.requestJson<TsukihimeTorrentEntry>(`/torrents/${torrentId}`, signal);
+    if (!entry) return null;
+    if (!isId(entry.id) || typeof entry.name !== "string" || !entry.name.trim() || typeof entry.btih !== "string") {
+      throw new Error(`Tsukihime torrent #${torrentId} returned incomplete metadata`);
+    }
+    if (Number(entry.is_adult) > 0) {
+      throw new Error(`Tsukihime torrent #${torrentId} is flagged as adult content and cannot be processed`);
+    }
+    const hash = torrentInfoHash({ title: entry.name, info_hash: entry.btih });
+    if (!hash) {
+      throw new Error(`Tsukihime torrent #${torrentId} does not have a valid info hash`);
+    }
+    return { ...entry, btih: hash };
   }
 
   public static async hydrateCandidates(candidates: [AnimeToshoItem, number | string][]): Promise<[AnimeToshoItem, number | string][]> {

@@ -144,3 +144,38 @@ test("backfill accepts title-search results and rejects a watermarked alias of t
   assert.equal(options?.quality, "720p");
   assert.equal(options?.groupName, "Group");
 });
+
+test("backfill matches NekoBT split-cour 480p against Nyaa 1080p while rejecting revision and source changes", async t => {
+  const knownTitles = [
+    "Tokyo Revengers: Santen Sensou-hen",
+    "Tokyo Revengers: War of the Three Titans Arc",
+  ];
+  const nyaa1080 = "[Erai-raws] Tokyo Revengers: Santen Sensou Hen - 08 [1080p DSNP WEB-DL AVC AAC][MultiSub][B4344441]";
+  const nekobt480 = torrent(41001, "[Erai-raws] Tokyo Revengers S04E08 (Santen Sensou Hen) [480p DSNP WEB-DL AVC AAC][MultiSub][87B9BF41]", {
+    provider: "tsukihime", tsukihime_id: 41001, tsukihime_episode_no: 8, audiolangs: ["ja"], sublangs: ["en"],
+  });
+  const revV2 = torrent(41099, "[Erai-raws] Tokyo Revengers S04E08v2 (Santen Sensou Hen) [480p DSNP WEB-DL AVC AAC][MultiSub][11111111]", {
+    provider: "tsukihime", tsukihime_id: 41099, tsukihime_episode_no: 8, audiolangs: ["ja"], sublangs: ["en"],
+  });
+  const wrongSource = torrent(41098, "[Erai-raws] Tokyo Revengers S04E08 (Santen Sensou Hen) [480p CR WEB-DL AVC AAC][MultiSub][22222222]", {
+    provider: "tsukihime", tsukihime_id: 41098, tsukihime_episode_no: 8, audiolangs: ["ja"], sublangs: ["en"],
+  });
+  t.mock.method(TsukihimeClient, "fetchTorrents", async () => ({
+    anime: { id: 8785, anilist: 178083, anidb: 18693, title: knownTitles[0], english_title: knownTitles[1] },
+    torrents: [revV2, wrongSource, nekobt480],
+  }));
+  t.mock.method(TsukihimeClient, "hydrateCandidates", async (entries: Parameters<typeof TsukihimeClient.hydrateCandidates>[0]) => entries);
+  t.mock.method(AnimeToshoClient, "fetchTorrents", async () => []);
+
+  const candidates = await findBackfillTorrents({
+    anilistId: 178083,
+    anidbId: 18693,
+    episodeNumber: 8,
+    type: "sub",
+    quality: "480p",
+    knownTitles,
+    releaseGroup: "Erai-raws",
+    torrentTitle: nyaa1080,
+  });
+  assert.deepEqual(candidates.map(c => c.item.tsukihime_id), [41001]);
+});

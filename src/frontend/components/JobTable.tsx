@@ -9,6 +9,42 @@ const statuses = ["all", "active", "queued", "downloading", "download_paused", "
 const statusLabels: Record<string, string> = { all: "All episodes", active: "In progress", queued: "Queued", downloading: "Downloading", download_paused: "Awaiting space", staged: "Staged", encoding: "Processing", completed: "Delivered", failed: "Needs attention", skipped: "Skipped" };
 const isBusyJob = (job: Job) => ["encoding", "downloading"].includes(job.status) || !!job.batchId && !["failed", "completed"].includes(job.status);
 
+function formatJobQualities(job: Job): string {
+  const kind = job.metadata?.kind;
+  const targetQuality = job.metadata?.targetQuality;
+  const trackPayloads = Array.isArray(job.resultPayload?.allTrackPayloads) ? job.resultPayload.allTrackPayloads : job.resultPayload ? [job.resultPayload] : [];
+  const deliveredQualities = Array.from(new Set(trackPayloads.flatMap((track: any) =>
+    Array.isArray(track?.sources) ? track.sources.map((source: any) => source?.quality).filter(Boolean) : [])));
+  if (deliveredQualities.length > 0) return deliveredQualities.join(" · ");
+  if (kind === "quality_backfill" && targetQuality) return String(targetQuality);
+  if (kind === "caption_refresh") return "Captions";
+  const stagedKeys = Object.keys(job.stagedQualities || {});
+  if (stagedKeys.length > 0) return stagedKeys.join(" · ");
+  if (job.stagedFilePath && job.qualityCount) return `${job.qualityCount} qualities`;
+  return "—";
+}
+
+function formatJobWorker(job: Job): string {
+  const mode = job.metadata?.processingMode || job.pipelineType;
+  const hasAssignedWork = Boolean(job.stagedFilePath || Object.keys(job.stagedQualities || {}).length || job.selectionTier || job.torrentTitle || job.status === "completed");
+  if (!hasAssignedWork && ["queued", "downloading", "failed"].includes(job.status)) return "Auto";
+  return mode === "kaggle_gpu" ? "GPU encode" : "Local conversion";
+}
+
+function formatJobKindTag(job: Job): string | null {
+  const tags: string[] = [];
+  if (job.metadata?.kind === "quality_backfill") {
+    tags.push(job.metadata?.targetQuality ? `Backfill ${job.metadata.targetQuality}` : "Backfill");
+  } else if (job.metadata?.kind === "caption_refresh") {
+    tags.push("Captions");
+  }
+  const manualTid = Number(job.metadata?.manualTsukihimeTorrentId);
+  if (Number.isSafeInteger(manualTid) && manualTid > 0) {
+    tags.push(`Manual #${manualTid}`);
+  }
+  return tags.length ? tags.join(" · ") : null;
+}
+
 export function JobTable({ compact = false, externalStatusFilter = "all", onOpenEnqueue, onNotice, onViewAll }: Props) {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [total, setTotal] = useState(0);
@@ -74,14 +110,20 @@ export function JobTable({ compact = false, externalStatusFilter = "all", onOpen
     {confirmDelete && <div className="inline-confirm" role="alert"><span>Delete {selected.size} job(s) and their retained local files? This cannot be undone.</span><button className="btn-secondary" disabled={busy} onClick={() => setConfirmDelete(false)}>Cancel</button><button className="btn-danger" disabled={busy} onClick={() => void runAction("delete")}>Delete files & jobs</button></div>}
     {error && <div className="inline-error" role="alert">{error} {jobs.length > 0 && "Showing the last available results."}<button onClick={refresh}>Try again</button></div>}
     <div className="queue-scroll"><table className="episode-table"><thead><tr>{!compact && <th className="select-cell"><input type="checkbox" aria-label="Select all eligible episodes on this page" checked={allChecked} onChange={() => setSelected(allChecked ? new Set() : new Set(eligible.map(j => j.id)))} /></th>}<th>Episode</th><th>Status</th><th>Worker</th><th>Quality</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>
-      {jobs.map(job => <tr key={job.id}>
+      {jobs.map(job => {
+        const kindTag = formatJobKindTag(job);
+        const retryAt = job.status === "queued" && job.discoverAfter && new Date(job.discoverAfter).getTime() > Date.now()
+          ? new Date(job.discoverAfter).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          : null;
+        return <tr key={job.id}>
         {!compact && <td className="select-cell"><input type="checkbox" aria-label={`Select job ${job.id}`} disabled={isBusyJob(job)} checked={selected.has(job.id)} onChange={e => setSelected(prev => { const next = new Set(prev); e.target.checked ? next.add(job.id) : next.delete(job.id); return next; })} /></td>}
-        <td><button className="episode-title" onClick={() => setDetail(job)}><span className="episode-art"><Film size={18} /></span><span><strong>{job.metadata?.primaryTitle || job.knownTitles?.[0] || job.torrentTitle || `Episode job #${job.id}`}</strong><small>Episode {job.episodeNumber} <span>·</span> #{job.id} <span>·</span> {(job.types || []).join(" / ").toUpperCase()}</small></span></button></td>
-        <td><span className={`job-status status-${job.status}`}><span className="status-dot" />{statusLabels[job.status] || job.status}</span>{job.lastError && <button className="error-detail" onClick={() => setDetail(job)}>View diagnostic</button>}</td>
-        <td><span className="worker-label">{(job.pipelineType || job.metadata?.processingMode) === "kaggle_gpu" ? "GPU encode" : "Local conversion"}</span></td>
-        <td><span className="quality-label">{Object.keys(job.stagedQualities || {}).join(" · ") || (job.qualityCount ? `${job.qualityCount} qualities` : "—")}</span></td>
+        <td><button className="episode-title" onClick={() => setDetail(job)}><span className="episode-art"><Film size={18} /></span><span><strong>{job.metadata?.primaryTitle || job.knownTitles?.[0] || job.torrentTitle || `Episode job #${job.id}`}</strong><small>Episode {job.episodeNumber} <span>·</span> #{job.id} <span>·</span> {(job.types || []).join(" / ").toUpperCase()}{kindTag && <> <span>·</span> {kindTag}</>}</small></span></button></td>
+        <td><span className={`job-status status-${job.status}`}><span className="status-dot" />{statusLabels[job.status] || job.status}{retryAt ? ` (retry ${retryAt})` : ""}</span>{job.lastError && <button className="error-detail" onClick={() => setDetail(job)}>View diagnostic</button>}</td>
+        <td><span className="worker-label">{formatJobWorker(job)}</span></td>
+        <td><span className="quality-label">{formatJobQualities(job)}</span></td>
         <td><button className="icon-button" aria-label={`View job ${job.id}`} onClick={() => setDetail(job)}><ChevronRight size={17} /></button></td>
-      </tr>)}
+      </tr>;
+      })}
     </tbody></table></div>
     {!jobs.length && <div className="queue-empty">{loading ? <Loader2 className="animate-spin" size={25} /> : <Film size={27} />}<h3>{loading ? "Fetching your episodes" : error ? "The queue is unavailable" : query || status !== "all" || mode !== "all" ? "No matching episodes" : "A fresh start"}</h3><p>{error ? "Check the connection and try again." : query || status !== "all" || mode !== "all" ? "Try another search or filter." : "Add episodes to start discovery and processing."}</p>{!loading && !error && status === "all" && !query && <button className="btn-secondary" onClick={onOpenEnqueue}>Add episodes</button>}</div>}
     {!compact && <div className="queue-pagination"><span>{total ? `${page * limit + 1}–${Math.min((page + 1) * limit, total)} of ${total}` : "0 episodes"} · Updates automatically</span><div><button className="icon-button" aria-label="Previous page" disabled={!page || loading} onClick={() => setPage(p => p - 1)}><ChevronLeft size={17} /></button><span>Page {page + 1}</span><button className="icon-button" aria-label="Next page" disabled={(page + 1) * limit >= total || loading} onClick={() => setPage(p => p + 1)}><ChevronRight size={17} /></button></div></div>}

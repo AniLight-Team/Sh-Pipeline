@@ -68,6 +68,33 @@ export class ReleaseFilter {
     return typeof title === "string" && this.WATERMARKED_WEB_SOURCE_PATTERN.test(title.normalize("NFKC"));
   }
 
+  private static readonly SEQUEL_ROMAN_TO_ARABIC: Record<string, string> = {
+    ii: "2",
+    iii: "3",
+    iv: "4",
+    v: "5",
+    vi: "6",
+    vii: "7",
+    viii: "8",
+    ix: "9",
+    x: "10",
+  };
+
+  private static readonly SEQUEL_ARABIC_TO_ROMAN: Record<string, string> = {
+    "2": "II",
+    "3": "III",
+    "4": "IV",
+    "5": "V",
+    "6": "VI",
+    "7": "VII",
+    "8": "VIII",
+    "9": "IX",
+    "10": "X",
+  };
+
+  private static readonly TRAILING_NON_TITLE_PAREN =
+    /^(?:dual[\s._-]*audio|multi[\s._-]*(?:audio|subs?|dub)|english[\s._-]*dub|eng[\s._-]*dub|dub|weekly|batch|complete|uncensored|censored|web-?dl|webrip|bd|bluray|\d{3,4}p|4k|hevc|av1|x26[45]|h\.?26[45]|avc1?|aac.*|flac|opus|[0-9a-f]{8})(?:[\s,._-]|$)/i;
+
   private static normalizeSeriesTitle(title: string): string {
     return title.normalize("NFKC").normalize("NFD")
       .replace(/(\p{Script=Latin})\p{M}+/gu, "$1")
@@ -76,6 +103,12 @@ export class ReleaseFilter {
       .replace(/['’`]/g, "")
       .replace(/[^\p{L}\p{M}\p{N}]+/gu, " ")
       .trim();
+  }
+
+  private static normalizeSequelRomanNumerals(normalized: string): string {
+    return normalized.replace(/\b(ii|iii|iv|v|vi|vii|viii|ix|x)\b/g, (match) =>
+      this.SEQUEL_ROMAN_TO_ARABIC[match] ?? match,
+    );
   }
 
   private static seriesTitleEnd(release: string, title: string): number {
@@ -94,14 +127,53 @@ export class ReleaseFilter {
       .replace(/\.(?:mkv|mp4|avi|webm)$/i, "");
   }
 
+  private static extractSubtitledFranchise(raw: string): { franchise: string; subtitle: string; hasExplicitSeason: boolean } | null {
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const colon = trimmed.match(/^([^:]+):\s*(.+)$/);
+    const dashParts = !colon ? trimmed.split(/\s+[-–—]\s+/) : [];
+    const franchise = colon ? colon[1].trim() : dashParts.length > 1 ? dashParts.slice(0, -1).join(" ").trim() : "";
+    const subtitle = colon ? colon[2].trim() : dashParts.length > 1 ? dashParts.at(-1)!.trim() : "";
+    if (!franchise || !subtitle) return null;
+    const normalizedFranchise = this.normalizeSeriesTitle(franchise);
+    if (!normalizedFranchise || normalizedFranchise.length < 2) return null;
+    const hasExplicitSeason = /\b(?:\d{1,2}(?:st|nd|rd|th)\s+season|season\s+\d{1,2}|s\d{1,2})$/i.test(this.normalizeSeriesTitle(trimmed));
+    return { franchise, subtitle, hasExplicitSeason };
+  }
+
+  private static extractNumberedPrefix(raw: string): string | null {
+    const split = this.extractSubtitledFranchise(raw);
+    if (!split) return null;
+    const normalized = this.normalizeSequelRomanNumerals(this.normalizeSeriesTitle(split.franchise));
+    // Require a trailing sequel number (2..10) so Season 1 is never confused with a sequel.
+    if (!/\s(?:[2-9]|10)$/.test(normalized)) return null;
+    return normalized;
+  }
+
+  private static hasConflictingArcParen(releaseName: string, knownTitles: (string | null | undefined)[]): boolean {
+    const afterSeasonEp = releaseName.match(/\bs\d{1,2}\s*e\d{1,4}(?:v\d+)?\s*\(([^()]+)\)/i);
+    if (!afterSeasonEp) return false;
+    const parenContent = afterSeasonEp[1].trim();
+    if (!parenContent || this.TRAILING_NON_TITLE_PAREN.test(parenContent)) return false;
+    const normalizedParen = this.normalizeSeriesTitle(parenContent);
+    if (!normalizedParen) return false;
+    return !knownTitles.some((raw) => {
+      if (!raw) return false;
+      const split = this.extractSubtitledFranchise(raw);
+      if (!split) return false;
+      const expectedSub = this.normalizeSeriesTitle(split.subtitle);
+      return expectedSub && this.seriesTitleEnd(normalizedParen, expectedSub) === normalizedParen.length;
+    });
+  }
+
   public static matchesSeriesTitle(
     releaseTitle: string,
     knownTitles: (string | null | undefined)[],
-    { allowUnmarkedSeason = false } = {},
+    { allowUnmarkedSeason = false, allowVerifiedSeason = false } = {},
   ): boolean {
     if (typeof releaseTitle !== "string") return false;
     const releaseName = this.releaseName(releaseTitle);
-    return this.matchesLeadingSeriesTitle(releaseName, knownTitles, allowUnmarkedSeason) ||
+    return this.matchesLeadingSeriesTitle(releaseName, knownTitles, allowUnmarkedSeason, false, allowVerifiedSeason) ||
       this.findTrailingCourAlias(releaseName, knownTitles, allowUnmarkedSeason) !== undefined;
   }
 
@@ -110,19 +182,42 @@ export class ReleaseFilter {
     knownTitles: (string | null | undefined)[],
     allowUnmarkedSeason: boolean,
     verifiedCourAlias = false,
+    allowVerifiedSeason = false,
   ): boolean {
     const release = this.normalizeSeriesTitle(releaseName);
+    const releaseNum = this.normalizeSequelRomanNumerals(release);
     const episodeDivider = Array.from(releaseName.matchAll(/\s+[-–—]\s+(?=\d{1,4}(?:v\d+)?\b)/gi)).at(-1);
     const beforeEpisode = episodeDivider ? this.normalizeSeriesTitle(releaseName.slice(0, episodeDivider.index)) : "";
     const seasonStart = /^(?:(\d{1,2})(?:st|nd|rd|th) season|season (\d{1,2})|s(\d{1,2}))(?=e\d| |$)/;
     const releaseSuffix = /^(?:\d{1,4}(?:v\d+)?|e(?:p(?:isode)?)? ?\d+(?:v\d+)?|第 ?\d+ ?話|\d{3,4}p|4k|batch|complete|collection|web|bd|bluray|hevc|av1|h264|x264|x265)(?: |$)/;
 
-    return knownTitles.some(raw => {
+    const numberedPrefixes = knownTitles
+      .map(raw => (raw ? this.extractNumberedPrefix(raw) : null))
+      .filter((prefix): prefix is string => Boolean(prefix));
+
+    const consumePairedTitle = (candidateSuffix: string, useRomanNormalized: boolean): string => {
+      if (!candidateSuffix) return candidateSuffix;
+      const alternateTitles = [
+        ...knownTitles.map(raw => {
+          const norm = this.normalizeSeriesTitle(raw ?? "");
+          return useRomanNormalized ? this.normalizeSequelRomanNumerals(norm) : norm;
+        }),
+        ...(useRomanNormalized ? numberedPrefixes : []),
+      ].filter(Boolean);
+      for (const alt of alternateTitles) {
+        const end = this.seriesTitleEnd(candidateSuffix, alt);
+        if (end > 0) return candidateSuffix.slice(end).trimStart();
+      }
+      return candidateSuffix;
+    };
+
+    const directMatch = knownTitles.some(raw => {
       const title = this.normalizeSeriesTitle(raw ?? "");
       if (!title) return false;
       if (release === title) return true;
       const seasonEnd = title.match(/ (\d{1,2}(?:st|nd|rd|th) season|season \d{1,2}|s\d{1,2})$/);
       const baseTitle = seasonEnd ? title.slice(0, seasonEnd.index) : title;
+      const hasNamedSubtitle = Boolean(raw && this.extractSubtitledFranchise(raw));
       const titleEnd = this.seriesTitleEnd(release, baseTitle);
       if (titleEnd < 0) return false;
 
@@ -131,7 +226,8 @@ export class ReleaseFilter {
       if (releaseSeason) {
         const season = Number(releaseSeason[1] || releaseSeason[2] || releaseSeason[3]);
         const expectedSeason = seasonEnd ? Number(seasonEnd[1].match(/\d+/)?.[0]) : null;
-        if (expectedSeason !== null ? season !== expectedSeason : season !== 1 && !verifiedCourAlias) {
+        const allowsArcSeason = allowVerifiedSeason && hasNamedSubtitle && season > 1;
+        if (expectedSeason !== null ? season !== expectedSeason : season !== 1 && !verifiedCourAlias && !allowsArcSeason) {
           return false;
         }
         suffix = suffix.slice(releaseSeason[0].length).trimStart();
@@ -143,8 +239,55 @@ export class ReleaseFilter {
         return false;
       }
 
-      return !suffix || releaseSuffix.test(suffix);
+      if (!suffix || releaseSuffix.test(suffix)) return true;
+      const afterPaired = consumePairedTitle(suffix, false);
+      return afterPaired !== suffix && (!afterPaired || releaseSuffix.test(afterPaired));
     });
+    if (directMatch) return true;
+
+    // Match explicitly numbered colon-prefixes (e.g. "Douluo Dalu II - Soul Land 2 - 178" against "Douluo Dalu 2: Jueshi Tangmen" / "Soul Land 2: ...").
+    if (numberedPrefixes.length > 0) {
+      const matchedNumberedPrefix = numberedPrefixes.some(prefix => {
+        const titleEnd = this.seriesTitleEnd(releaseNum, prefix);
+        if (titleEnd < 0) return false;
+        let suffix = releaseNum.slice(titleEnd).trimStart();
+        const afterPaired = consumePairedTitle(suffix, true);
+        if (afterPaired !== suffix) suffix = afterPaired;
+        const releaseSeason = suffix.match(seasonStart);
+        if (releaseSeason) {
+          const season = Number(releaseSeason[1] || releaseSeason[2] || releaseSeason[3]);
+          const expectedSequel = Number(prefix.match(/(\d+)$/)?.[1]);
+          if (season !== 1 && season !== expectedSequel) return false;
+          suffix = suffix.slice(releaseSeason[0].length).trimStart();
+        }
+        return !suffix || releaseSuffix.test(suffix);
+      });
+      if (matchedNumberedPrefix) return true;
+    }
+
+    // For provider ID-verified releases (Tsukihime anime_id or AnimeTosho anidb_aid), allow standard TVDB/scene
+    // "Franchise S04E08" naming (e.g. ToonsHub/VARYG/Judas) against subtitled sequel arcs like "Tokyo Revengers: Santen Sensou-hen",
+    // strictly requiring S02+ and rejecting conflicting trailing arc subtitles.
+    if (allowVerifiedSeason && !this.hasConflictingArcParen(releaseName, knownTitles)) {
+      const matchedFranchiseSeason = knownTitles.some(raw => {
+        if (!raw) return false;
+        const split = this.extractSubtitledFranchise(raw);
+        if (!split || split.hasExplicitSeason) return false;
+        const franchise = this.normalizeSeriesTitle(split.franchise);
+        const titleEnd = this.seriesTitleEnd(release, franchise);
+        if (titleEnd < 0) return false;
+        let suffix = release.slice(titleEnd).trimStart();
+        const releaseSeason = suffix.match(seasonStart);
+        if (!releaseSeason) return false;
+        const season = Number(releaseSeason[1] || releaseSeason[2] || releaseSeason[3]);
+        if (season < 2) return false;
+        suffix = suffix.slice(releaseSeason[0].length).trimStart();
+        return !suffix || releaseSuffix.test(suffix);
+      });
+      if (matchedFranchiseSeason) return true;
+    }
+
+    return false;
   }
 
   private static findTrailingCourAlias(
@@ -154,12 +297,20 @@ export class ReleaseFilter {
   ): { relativeEpisode?: number } | undefined {
     const namedCourTitles = knownTitles.flatMap(raw => {
       if (!raw) return [];
-      const parts = raw.trim().split(/\s+[-–—]\s+/);
-      return parts.length > 1 ? [{ title: raw, franchise: parts.slice(0, -1).join(" ") }] : [];
+      const entries: { title: string; franchise: string }[] = [];
+      const dashParts = raw.trim().split(/\s+[-–—]\s+/);
+      if (dashParts.length > 1) {
+        entries.push({ title: raw, franchise: dashParts.slice(0, -1).join(" ") });
+      }
+      const colon = raw.trim().match(/^([^:]+):\s*(.+)$/);
+      if (colon && colon[1].trim() && colon[2].trim()) {
+        entries.push({ title: raw, franchise: colon[1].trim() });
+      }
+      return entries;
     });
     if (!namedCourTitles.length) return;
 
-    const franchiseTitles = namedCourTitles.map(cour => cour.franchise);
+    const franchiseTitles = Array.from(new Set(namedCourTitles.map(cour => cour.franchise)));
     const aliases = releaseName.matchAll(/(?:\(([^()]*)\)|\[([^\[\]]*)\])(?=(?:\s*(?:\([^()]*\)|\[[^\]]*\]))*\s*$)/g);
     for (const alias of aliases) {
       const aliasTitle = alias[1] ?? alias[2];
@@ -211,6 +362,21 @@ export class ReleaseFilter {
       const base = trimmed.replace(trailingSeasonSuffixRx, "").trim();
       if (base && base.length >= 2) {
         variants.add(base);
+      }
+      // Also strip colon-split franchise/numbered-sequel prefixes (e.g. "Douluo Dalu 2", "Douluo Dalu II", "Soul Land 2")
+      // so sequel numbers before " - <ep>" are never misparsed as episode ranges.
+      const split = this.extractSubtitledFranchise(trimmed);
+      if (split) {
+        const prefix = split.franchise.trim();
+        if (prefix.length >= 2) {
+          variants.add(prefix);
+          const arabicToRoman = prefix.replace(/\b([2-9]|10)$/, (n) => this.SEQUEL_ARABIC_TO_ROMAN[n] ?? n);
+          if (arabicToRoman !== prefix) variants.add(arabicToRoman);
+          const romanToArabic = prefix.replace(/\b(ii|iii|iv|v|vi|vii|viii|ix|x)$/i, (r) =>
+            this.SEQUEL_ROMAN_TO_ARABIC[r.toLowerCase()] ?? r,
+          );
+          if (romanToArabic !== prefix) variants.add(romanToArabic);
+        }
       }
     }
 
@@ -364,13 +530,15 @@ export class ReleaseFilter {
         isForeign = true;
       }
     }
-
-    if (Array.isArray(item?.sublangs) && item.sublangs.length > 0) {
-      const subLangs = item.sublangs.map((l) => String(l).toLowerCase().trim());
-      const hasEnSub = subLangs.some(
-        (l) => l === "en" || l === "eng" || l === "multi" || l.startsWith("en-") || l.startsWith("eng"),
-      );
-      if (!hasEnSub && !isEnglishDub && !isDualAudio) {
+    const hasExplicitSubLangs = Array.isArray(item?.sublangs);
+    const explicitSubLangs = hasExplicitSubLangs
+      ? item!.sublangs!.map((l) => String(l).toLowerCase().trim()).filter(Boolean)
+      : [];
+    const hasExplicitEnSub = explicitSubLangs.some(
+      (l) => l === "en" || l === "eng" || l === "multi" || l.startsWith("en-") || l.startsWith("eng"),
+    );
+    if (explicitSubLangs.length > 0) {
+      if (!hasExplicitEnSub && !isEnglishDub && !isDualAudio) {
         isForeign = true;
       }
     }
@@ -427,15 +595,31 @@ export class ReleaseFilter {
     );
 
     const rangeMatch = cleanedForEp.match(
-      /(?:(?:S(?:eason\s*)?0?(\d{1,2})[\s._-]*)?E(?:p(?:isode)?\s*)?0*(\d{1,4})|(?:\b|[\(\[\s_-])0*(\d{1,4}))\s*[-~–]\s*(?:(?:S(?:eason\s*)?0?\d{1,2}[\s._-]*)?E(?:p(?:isode)?\s*)?|(?:\b|[\(\[\s_-]))?0*(\d{1,4})(?:v\d+)?(?=\b|[\)\]\s_.-]|$)/i,
+      /(?:(?:S(?:eason\s*)?0?(\d{1,2})[\s._-]*)?E(?:p(?:isode)?\s*)?0*(\d{1,4})|(?:\b|[\(\[\s_-])0*(\d{1,4}))(\s*[-~–]\s*)(?:(?:S(?:eason\s*)?0?\d{1,2}[\s._-]*)?E(?:p(?:isode)?\s*)?|(?:\b|[\(\[\s_-]))?0*(\d{1,4})(?:v\d+)?(?=\b|[\)\]\s_.-]|$)/i,
     );
     if (rangeMatch) {
-      if (rangeMatch[1]) {
-        seasonNum = parseInt(rangeMatch[1], 10);
-      }
+      const fullMatch = rangeMatch[0];
+      const matchStart = rangeMatch.index ?? 0;
+      const beforeMatch = cleanedForEp.slice(0, matchStart);
+      const separator = rangeMatch[4];
       const rStart = parseInt(rangeMatch[2] || rangeMatch[3], 10);
-      const rEnd = parseInt(rangeMatch[4], 10);
-      if (rStart >= 0 && rStart < rEnd && rEnd <= 2000) {
+      const rEnd = parseInt(rangeMatch[5], 10);
+      const hasExplicitEpPrefix = Boolean(rangeMatch[1] || rangeMatch[2]);
+      const isSpacedHyphen = /^\s+-\s+$/.test(separator);
+      const startsZeroPadded = /^(?:[\(\[\s_-])*0\d/.test(fullMatch);
+      // Guard against "<Title> 2 - 178" (sequel number in title followed by standard " - <ep>" divider).
+      const looksLikeSequelTitleBeforeEp =
+        !hasExplicitEpPrefix &&
+        isSpacedHyphen &&
+        !startsZeroPadded &&
+        rStart >= 0 &&
+        rStart <= 10 &&
+        /\p{L}\s*$/u.test(beforeMatch) &&
+        !/[([{\s_-]$/.test(beforeMatch.trimEnd());
+      if (!looksLikeSequelTitleBeforeEp && rStart >= 0 && rStart < rEnd && rEnd <= 2000) {
+        if (rangeMatch[1]) {
+          seasonNum = parseInt(rangeMatch[1], 10);
+        }
         epRange = [rStart, rEnd];
       }
     }
@@ -512,7 +696,7 @@ export class ReleaseFilter {
       isDualAudio,
       isEnglishDub,
       lacksSubtitles: /\b(?:raw|no[ ._-]*subs?(?:titles?)?|unsubbed)\b/i.test(lower)
-        || (Array.isArray(item?.sublangs) && item.sublangs.length === 0),
+        || (hasExplicitSubLangs && (explicitSubLangs.length === 0 || !hasExplicitEnSub)),
       isForeign,
       isCam,
       isBluray,
@@ -756,10 +940,16 @@ export class ReleaseFilter {
     return torrentIdentityKey(item);
   }
 
+  private static isVerifiedProviderItem(item?: AnimeToshoItem): boolean {
+    return Boolean(item && (item.provider === "tsukihime" || Number(item.anidb_aid) > 0));
+  }
+
   private static matchesCandidateTitle(item: AnimeToshoItem, knownTitles?: (string | null | undefined)[]) {
+    const verified = this.isVerifiedProviderItem(item);
     return typeof item.title === "string" && Boolean(item.title.trim()) &&
       (!knownTitles?.length || this.matchesSeriesTitle(item.title, knownTitles, {
-        allowUnmarkedSeason: item.provider === "tsukihime" || Number(item.anidb_aid) > 0,
+        allowUnmarkedSeason: verified,
+        allowVerifiedSeason: verified,
       }));
   }
 
@@ -931,8 +1121,11 @@ export class ReleaseFilter {
             if (relative === target && parsed.singleEp !== target &&
                 (episodeOffset > 0 ? parsed.singleEp !== target + episodeOffset : absoluteMatches.size > 1)) continue;
           }
-          // A scoped provider may omit the expected season marker only for a verified cumulative number.
-          if (relative === undefined && knownTitles?.length && !this.matchesSeriesTitle(t.title, knownTitles)) continue;
+          // A scoped provider may omit the expected season marker only for a verified cumulative number,
+          // while an explicit S02+ season tag on a verified provider entry is allowed for subtitled sequel arcs.
+          if (relative === undefined && knownTitles?.length && !this.matchesSeriesTitle(t.title, knownTitles, {
+            allowVerifiedSeason: this.isVerifiedProviderItem(t),
+          })) continue;
           const effectiveEpForFile = relative === target && parsed.singleEp !== null ? parsed.singleEp : candidateEp;
           const key = this.torrentKey(t);
           const existing = bestByItemKey.get(key);
@@ -1132,12 +1325,23 @@ export class ReleaseFilter {
       effectiveEp?: number | string | null;
       totalExpectedEps?: number | null;
       allowWatermarkedSource?: boolean;
+      allowVerifiedSeason?: boolean;
+      manualTorrent?: boolean;
       torrentTitle?: string;
     } = {},
   ): Map<number, [number, string]> {
     const epMap = new Map<number, [number, string]>();
-    const { knownTitles = [], targetEp, effectiveEp, torrentTitle, totalExpectedEps, allowWatermarkedSource = false } = options;
-    if (!Array.isArray(files) || !knownTitles.some(title => title?.trim())) return epMap;
+    const {
+      knownTitles = [],
+      targetEp,
+      effectiveEp,
+      torrentTitle,
+      totalExpectedEps,
+      allowWatermarkedSource = false,
+      allowVerifiedSeason = false,
+      manualTorrent = false,
+    } = options;
+    if (!Array.isArray(files) || (!manualTorrent && !knownTitles.some(title => title?.trim()))) return epMap;
 
     const singleEpisode = targetEp != null && String(targetEp).toLowerCase() !== "all";
     const target = singleEpisode ? Number(targetEp) : null;
@@ -1145,72 +1349,118 @@ export class ReleaseFilter {
     if (target !== null && (!Number.isSafeInteger(target) || target < 1)) return epMap;
     if (expected !== null && (!Number.isSafeInteger(expected) || expected < 1)) return epMap;
 
-    const titleMatch = { allowUnmarkedSeason: expected !== null && expected !== target };
-    const trustedTorrentTitle = torrentTitle && this.matchesSeriesTitle(torrentTitle, knownTitles, titleMatch);
-    const torrent = trustedTorrentTitle ? this.parseTitle(torrentTitle, knownTitles) : undefined;
     const videoName = (name: unknown): name is string => typeof name === "string" && /\.(?:mkv|mp4|avi|webm)$/i.test(name);
-    const standalone = target === 1 && expected === 1 && totalExpectedEps === 1 && torrent && !torrent.isBatch &&
-      (torrent.singleEp === null || torrent.singleEp === 1) && files.filter(file => videoName(file?.name)).length === 1;
-    const canonicalSeasons = new Set(knownTitles.flatMap(title => {
-      const suffix = title?.match(/(?:\b(\d{1,2})(?:st|nd|rd|th)\s+season|\bseason\s+(\d{1,2})|\bs(\d{1,2}))\s*$/i);
-      return suffix ? [Number(suffix[1] || suffix[2] || suffix[3])] : [];
-    }));
-    const defaultSeason = canonicalSeasons.size === 1 ? [...canonicalSeasons][0] : 1;
-    const expectedSeason = torrent?.seasonNum ?? defaultSeason;
-    const seenEpisodes = new Set<number>();
-    const verifiedEpisodes = new Set<number>();
+    const safeVideoFiles = files
+      .map((f, idx) => ({ idx, relPath: f?.name }))
+      .filter((entry): entry is { idx: number; relPath: string } => {
+        if (!videoName(entry.relPath) || /^[a-z]:|[\u0000-\u001f\u007f]/i.test(entry.relPath)) return false;
+        const segments = entry.relPath.split(/[\\/]/);
+        if (segments.some(segment => !segment || segment === "." || segment === "..")) return false;
+        const folders = segments.slice(0, -1);
+        return !folders.some(segment => /^(?:extras?|bonus|samples?|specials?|ncop|nced)$/i.test(segment) ||
+          /^(?:s|season\s*)0+$/i.test(segment));
+      });
 
-    for (let idx = 0; idx < files.length; idx++) {
-      const relPath = files[idx]?.name;
-      if (!videoName(relPath) || /^[a-z]:|[\u0000-\u001f\u007f]/i.test(relPath)) continue;
-      const segments = relPath.split(/[\\/]/);
-      if (segments.some(segment => !segment || segment === "." || segment === "..")) continue;
-
-      const file = segments.at(-1)!;
-      const folders = segments.slice(0, -1);
-      if (folders.some(segment => /^(?:extras?|bonus|samples?|specials?|ncop|nced)$/i.test(segment) ||
-          /^(?:s|season\s*)0+$/i.test(segment))) continue;
-      const parsed = this.parseTitle(file, knownTitles);
-      if (parsed.isBatch || parsed.isBonusOrExtra || parsed.isUnsupportedContainer ||
-          this.WEIRD_OR_PROMO_PATTERN.test(file) || (parsed.isCam && !ALLOW_CAM)) continue;
-      if (parsed.seasonNum !== null && torrent?.seasonNum != null && parsed.seasonNum !== expectedSeason) continue;
-
-      const namedFile = this.matchesSeriesTitle(file, knownTitles, titleMatch);
-      let episode = parsed.singleEp ?? (namedFile && standalone ? 1 : null);
-      if (!namedFile) {
-        if (!torrent || canonicalSeasons.size > 1) continue;
-        const folder = folders.at(-1);
-        if (folder && !this.matchesSeriesTitle(folder, knownTitles, titleMatch)) {
-          const number = folder.match(/^(?:s|season\s*)0*(\d{1,2})$/i);
-          const series = folders.at(-2);
-          if (!number || Number(number[1]) !== expectedSeason || !series ||
-              !this.matchesSeriesTitle(series, knownTitles, titleMatch)) continue;
-        }
-        let bareName = file.replace(/\.(?:mkv|mp4|avi|webm)$/i, "").trim();
-        const group = bareName.match(/^\[([^\]]+)\]\s*/);
-        if (group && group[1].trim().toLowerCase() === torrent.groupLower) bareName = bareName.slice(group[0].length);
-        bareName = bareName.replace(/(?:\s*(?:\[(?:1080p|720p|480p|[0-9a-f]{8})\]|\((?:1080p|720p|480p|[0-9a-f]{8})\)))*$/i, "");
-        const label = bareName.match(/^(?:(?:s(\d{1,2})[\s._-]*)?e(?:p(?:isode)?)?[\s._-]*)?(\d{1,4})(?:v\d+)?$/i);
-        if (!label || (label[1] !== undefined && Number(label[1]) !== expectedSeason)) continue;
-        episode = Number(label[2]);
-      }
-      if (episode === null || !Number.isSafeInteger(episode) || episode < 1) continue;
-
-      verifiedEpisodes.add(episode);
-      if (!allowWatermarkedSource && this.hasWatermarkedSource(relPath)) continue;
-      if (expected !== null && (episode !== expected ||
-          (parsed.relativeEpisode !== undefined && parsed.relativeEpisode !== target))) continue;
-
-      const key = target ?? episode;
-      if (seenEpisodes.has(key)) {
-        epMap.delete(key);
-      } else {
-        seenEpisodes.add(key);
-        epMap.set(key, [idx, relPath]);
+    // If an operator explicitly pinned a manual torrent and it has a single safe video file, select it directly.
+    if (manualTorrent && target !== null && safeVideoFiles.length === 1) {
+      const only = safeVideoFiles[0];
+      const parsedOnly = this.parseTitle(only.relPath.split(/[\\/]/).at(-1)!, knownTitles);
+      if (!parsedOnly.isBatch) {
+        epMap.set(target, [only.idx, only.relPath]);
+        return epMap;
       }
     }
 
-    if (torrent?.isBatch && verifiedEpisodes.size < 2) epMap.clear();
+    if (knownTitles.some(title => title?.trim())) {
+      const titleMatch = {
+        allowUnmarkedSeason: expected !== null && expected !== target,
+        allowVerifiedSeason,
+      };
+      const trustedTorrentTitle = torrentTitle && this.matchesSeriesTitle(torrentTitle, knownTitles, titleMatch);
+      const torrent = trustedTorrentTitle ? this.parseTitle(torrentTitle, knownTitles) : undefined;
+      const standalone = target === 1 && expected === 1 && totalExpectedEps === 1 && torrent && !torrent.isBatch &&
+        (torrent.singleEp === null || torrent.singleEp === 1) && files.filter(file => videoName(file?.name)).length === 1;
+      const canonicalSeasons = new Set(knownTitles.flatMap(title => {
+        const suffix = title?.match(/(?:\b(\d{1,2})(?:st|nd|rd|th)\s+season|\bseason\s+(\d{1,2})|\bs(\d{1,2}))\s*$/i);
+        return suffix ? [Number(suffix[1] || suffix[2] || suffix[3])] : [];
+      }));
+      const defaultSeason = canonicalSeasons.size === 1 ? [...canonicalSeasons][0] : 1;
+      const expectedSeason = torrent?.seasonNum ?? defaultSeason;
+      const seenEpisodes = new Set<number>();
+      const verifiedEpisodes = new Set<number>();
+
+      for (let idx = 0; idx < files.length; idx++) {
+        const relPath = files[idx]?.name;
+        if (!videoName(relPath) || /^[a-z]:|[\u0000-\u001f\u007f]/i.test(relPath)) continue;
+        const segments = relPath.split(/[\\/]/);
+        if (segments.some(segment => !segment || segment === "." || segment === "..")) continue;
+
+        const file = segments.at(-1)!;
+        const folders = segments.slice(0, -1);
+        if (folders.some(segment => /^(?:extras?|bonus|samples?|specials?|ncop|nced)$/i.test(segment) ||
+            /^(?:s|season\s*)0+$/i.test(segment))) continue;
+        const parsed = this.parseTitle(file, knownTitles);
+        if (parsed.isBatch || parsed.isBonusOrExtra || parsed.isUnsupportedContainer ||
+            this.WEIRD_OR_PROMO_PATTERN.test(file) || (parsed.isCam && !ALLOW_CAM)) continue;
+        if (parsed.seasonNum !== null && torrent?.seasonNum != null && parsed.seasonNum !== expectedSeason) continue;
+
+        const namedFile = this.matchesSeriesTitle(file, knownTitles, titleMatch);
+        let episode = parsed.singleEp ?? (namedFile && standalone ? 1 : null);
+        if (!namedFile) {
+          if (!torrent || canonicalSeasons.size > 1) continue;
+          const folder = folders.at(-1);
+          if (folder && !this.matchesSeriesTitle(folder, knownTitles, titleMatch)) {
+            const number = folder.match(/^(?:s|season\s*)0*(\d{1,2})$/i);
+            const series = folders.at(-2);
+            if (!number || Number(number[1]) !== expectedSeason || !series ||
+                !this.matchesSeriesTitle(series, knownTitles, titleMatch)) continue;
+          }
+          let bareName = file.replace(/\.(?:mkv|mp4|avi|webm)$/i, "").trim();
+          const group = bareName.match(/^\[([^\]]+)\]\s*/);
+          if (group && group[1].trim().toLowerCase() === torrent.groupLower) bareName = bareName.slice(group[0].length);
+          bareName = bareName.replace(/(?:\s*(?:\[(?:1080p|720p|480p|[0-9a-f]{8})\]|\((?:1080p|720p|480p|[0-9a-f]{8})\)))*$/i, "");
+          const label = bareName.match(/^(?:(?:s(\d{1,2})[\s._-]*)?e(?:p(?:isode)?)?[\s._-]*)?(\d{1,4})(?:v\d+)?$/i);
+          if (!label || (label[1] !== undefined && Number(label[1]) !== expectedSeason)) continue;
+          episode = Number(label[2]);
+        }
+        if (episode === null || !Number.isSafeInteger(episode) || episode < 1) continue;
+
+        verifiedEpisodes.add(episode);
+        if (!allowWatermarkedSource && this.hasWatermarkedSource(relPath)) continue;
+        if (expected !== null && (episode !== expected ||
+            (parsed.relativeEpisode !== undefined && parsed.relativeEpisode !== target))) continue;
+
+        const key = target ?? episode;
+        if (seenEpisodes.has(key)) {
+          epMap.delete(key);
+        } else {
+          seenEpisodes.add(key);
+          epMap.set(key, [idx, relPath]);
+        }
+      }
+
+      if (torrent?.isBatch && verifiedEpisodes.size < 2) epMap.clear();
+    }
+
+    // For a multi-file manual torrent whose filenames don't match canonical knownTitles,
+    // fall back to isolating the unique non-bonus video file matching the target episode number.
+    if (manualTorrent && target !== null && epMap.size === 0 && safeVideoFiles.length > 1) {
+      const seen = new Set<number>();
+      for (const { idx, relPath } of safeVideoFiles) {
+        const file = relPath.split(/[\\/]/).at(-1)!;
+        const parsed = this.parseTitle(file, knownTitles);
+        if (parsed.isBatch || parsed.isBonusOrExtra || parsed.isUnsupportedContainer) continue;
+        const matchesEp = parsed.singleEp === expected || parsed.singleEp === target || parsed.relativeEpisode === target;
+        if (!matchesEp) continue;
+        if (seen.has(target)) {
+          epMap.delete(target);
+        } else {
+          seen.add(target);
+          epMap.set(target, [idx, relPath]);
+        }
+      }
+    }
+
     return epMap;
   }
 }

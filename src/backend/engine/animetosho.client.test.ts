@@ -69,3 +69,18 @@ test("AnimeTosho skips unverified title-only search", async t => {
   assert.deepEqual(await AnimeToshoClient.fetchTorrentsByTitle("Example Show", "1080p"), []);
   assert.equal(fetchPage.mock.callCount(), 0);
 });
+
+test("AnimeTosho never strips non-Latin scripts into a bare 1080p query", async t => {
+  const urls: string[] = [];
+  t.mock.method(client, "fetchPage", async (url: string) => {
+    urls.push(url);
+    return [];
+  });
+  assert.deepEqual(await AnimeToshoClient.fetchTorrentsByTitle("1080p", "1080p", { expectedAnidbId: 19942 }), []);
+  assert.deepEqual(await AnimeToshoClient.fetchTorrentsByTitle("a", "1080p", { expectedAnidbId: 19942 }), []);
+  assert.equal(urls.length, 0);
+
+  await AnimeToshoClient.fetchTorrentsByTitle("เกิดใหม่เป็นก็อบลินแล้วไง", "1080p", { expectedAnidbId: 19942 });
+  assert.equal(urls.length, 1);
+  assert.equal(new URL(urls[0]).searchParams.get("q"), "เกิดใหม่เป็นก็อบลินแล้วไง 1080p");
+});

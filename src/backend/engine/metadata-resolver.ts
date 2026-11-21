@@ -21,6 +21,7 @@ interface AniListMedia {
   id: number;
   idMal?: number;
   title?: { romaji?: string; english?: string; native?: string };
+  synonyms?: string[];
   countryOfOrigin?: string;
   episodes?: number;
   coverImage?: { large?: string; medium?: string };
@@ -64,10 +65,7 @@ export class AnimeMetadataResolver {
   private static async loadDiscoveryTitles(anilistId: number): Promise<string[]> {
     const local = await this.readLocalDiscoveryTitles(sql`anilist_id = ${anilistId}`);
     const localTitles = canonicalDiscoveryTitles(local);
-    const native = local.titleNative?.trim() ?? "";
-    // A title written only in Han characters needs its country to distinguish kanji from Chinese.
-    const needsCountry = /\p{Script=Han}/u.test(native) && !localTitles.includes(native);
-    if (localTitles.length > 0 && !needsCountry) return localTitles;
+    if (localTitles.length > 0) return localTitles;
 
     const media = await this.fetchAniListMedia(anilistId).catch(() => null);
     if (!media) return localTitles;
@@ -75,6 +73,7 @@ export class AnimeMetadataResolver {
       titleRomaji: local.titleRomaji || media.title?.romaji,
       titleEnglish: local.titleEnglish || media.title?.english,
       titleNative: media.title?.native || local.titleNative,
+      synonyms: [...(local.synonyms ?? []), ...(media.synonyms ?? [])],
       countryOfOrigin: media.countryOfOrigin,
     });
   }
@@ -91,20 +90,29 @@ export class AnimeMetadataResolver {
 
   private static async readLocalDiscoveryTitles(where: ReturnType<typeof sql>) {
     const rows = await db.execute(sql`
-      SELECT title_romaji, title_english, title_native
+      SELECT title_romaji, title_english, title_native, synonyms
       FROM anime
       WHERE ${where}
       LIMIT 1
-    `).catch(() => null);
+    `).catch(async () =>
+      db.execute(sql`
+        SELECT title_romaji, title_english, title_native
+        FROM anime
+        WHERE ${where}
+        LIMIT 1
+      `).catch(() => null),
+    );
     const row = rows?.[0] as {
       title_romaji?: string | null;
       title_english?: string | null;
       title_native?: string | null;
+      synonyms?: string[] | null;
     } | undefined;
     return {
       titleRomaji: row?.title_romaji,
       titleEnglish: row?.title_english,
       titleNative: row?.title_native,
+      synonyms: Array.isArray(row?.synonyms) ? row.synonyms : undefined,
     };
   }
 
@@ -257,11 +265,18 @@ export class AnimeMetadataResolver {
 
   private static async resolveFromDatabase(anilistId: number): Promise<Partial<AnimeResolvedMetadata> | null> {
     const animeRows = await db.execute(sql`
-      SELECT id, mal_id, title_romaji, title_english, title_native, poster_url, episode_count
+      SELECT id, mal_id, title_romaji, title_english, title_native, synonyms, poster_url, episode_count
       FROM anime
       WHERE anilist_id = ${anilistId}
       LIMIT 1
-    `).catch(() => null);
+    `).catch(async () =>
+      db.execute(sql`
+        SELECT id, mal_id, title_romaji, title_english, title_native, poster_url, episode_count
+        FROM anime
+        WHERE anilist_id = ${anilistId}
+        LIMIT 1
+      `).catch(() => null),
+    );
 
     if (!animeRows || animeRows.length === 0) return null;
     const anime = animeRows[0] as any;
@@ -288,7 +303,12 @@ export class AnimeMetadataResolver {
     const titleNative = anime.title_native || undefined;
     const primaryTitle = titleRomaji || titleEnglish || `AniList #${anilistId}`;
 
-    const synonyms = canonicalDiscoveryTitles({ titleRomaji, titleEnglish, titleNative });
+    const synonyms = canonicalDiscoveryTitles({
+      titleRomaji,
+      titleEnglish,
+      titleNative,
+      synonyms: Array.isArray(anime.synonyms) ? anime.synonyms : undefined,
+    });
 
     return {
       animeId: Number(anime.id),
@@ -350,6 +370,7 @@ export class AnimeMetadataResolver {
               english
               native
             }
+            synonyms
             countryOfOrigin
             episodes
             coverImage {
@@ -389,7 +410,13 @@ export class AnimeMetadataResolver {
     const titleEnglish = media.title?.english || undefined;
     const titleNative = media.title?.native || undefined;
     const primaryTitle = titleEnglish || titleRomaji || `AniList #${anilistId}`;
-    const synonyms = canonicalDiscoveryTitles({ titleRomaji, titleEnglish, titleNative, countryOfOrigin: media.countryOfOrigin });
+    const synonyms = canonicalDiscoveryTitles({
+      titleRomaji,
+      titleEnglish,
+      titleNative,
+      synonyms: media.synonyms,
+      countryOfOrigin: media.countryOfOrigin,
+    });
 
     return requestQueue.add(async () => {
       let anidbId: number | undefined;

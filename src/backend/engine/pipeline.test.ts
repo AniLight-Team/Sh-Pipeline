@@ -616,6 +616,30 @@ test("Pipeline 1 (vm_remux) 2-slot unbatched worker and Kaggle status normalizat
     false,
   );
 
+  // Verify manual Tsukihime torrent bundle construction (e.g. #41031 DKB HEVC Dual-Audio)
+  const manualBundle = PipelineEngineService.buildManualTsukihimeBundle({
+    id: 41031,
+    name: "[DKB] Tokyo Revengers: Santen Sensou-hen - S04E08 [1080p][HEVC x265 10bit][Dual-Audio][Multi-Subs][weekly]",
+    btih: "3cffee3862053a9ee95159131fd2396a912da2b8",
+    totalsize: 496117380,
+    filecount: 1,
+    audiolangs: ["ja", "en"],
+    sublangs: ["en", "ja"],
+    episode_no: 8,
+    group: { id: 5, name: "DKB", is_fansub: 0 },
+    trackers: [{ tier: 0, seeders: 70, leechers: 29, error: 0, url: "http://nyaa.tracker.wf:7777/announce" }],
+  }, 8, ["Tokyo Revengers: Santen Sensou-hen"]);
+  assert.equal(manualBundle.group, "DKB");
+  assert.equal(manualBundle.isH264, false);
+  assert.equal(manualBundle.isDualAudio, true);
+  assert.equal(manualBundle.isEnglishDub, true);
+  assert.equal(manualBundle.isSolo, true);
+  assert.equal(manualBundle.pipelineType, "kaggle_gpu");
+  assert.equal(manualBundle.selectionTier, "hevc_av1_gpu");
+  assert.equal(manualBundle.primaryEntry.effectiveEp, 8);
+  assert.equal(manualBundle.primaryEntry.item.seeders, 70);
+  assert.equal(manualBundle.primaryEntry.item.tsukihime_id, 41031);
+
   // Verify VM Remux 2-at-a-time concurrency limit is 2
   assert.equal(KIRA_VM_MAX_CONCURRENT_BATCHES, 2);
   assert.equal(PipelineEngineService.getActiveVmRemuxCount(), 0);

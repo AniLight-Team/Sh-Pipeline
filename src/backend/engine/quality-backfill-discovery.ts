@@ -25,26 +25,64 @@ const qualityMarkers = {
   "480p": /\b(?:480p|(?:848|854)x480)\b/i,
 };
 
-function releaseEdition(title: string): string {
-  // Retain the episode, revision, source and audio labels so existing captions can be reused.
-  return title.normalize("NFKC").toLowerCase()
+function releaseEdition(title: string, knownTitles?: (string | null | undefined)[]): string {
+  // Retain the revision, source, codec, and audio/sub labels so existing captions can be reused,
+  // while normalizing provider title reordering (e.g. Nyaa "Title: Arc - 08" vs NekoBT "Title S04E08 (Arc)").
+  const normalized = title.normalize("NFKC");
+  const revMatch = normalized.match(/(?:\bs\d{1,2}\s*e|\bep?(?:isode)?\s*|-\s*)\d{1,4}(v\d+)\b/i);
+  const revision = revMatch ? revMatch[1].toLowerCase() : "";
+
+  let s = normalized.toLowerCase()
     .replace(/^\s*\[[^\]]+\]\s*/, "")
     .replace(/\.(?:mkv|mp4|avi|webm)\s*$/, "")
     .replace(/\[[0-9a-f]{8}\]|\([0-9a-f]{8}\)/g, " ")
     .replace(/\b(?:1080p|1920x1080|720p|1280x720|480p|(?:848|854)x480)\b/g, " ")
-    .replace(/\b(?:x264|h[._-]?264|avc1?)\b/g, "avc")
-    .replace(/[^\p{L}\p{M}\p{N}]+/gu, " ")
-    .trim();
+    .replace(/\b(?:x264|h[._-]?264|avc1?)\b/g, "avc");
+
+  if (knownTitles?.length) {
+    const titleParts = new Set<string>();
+    for (const raw of knownTitles) {
+      if (!raw?.trim()) continue;
+      titleParts.add(raw.trim());
+      const colon = raw.trim().match(/^([^:]+):\s*(.+)$/);
+      if (colon) {
+        if (colon[1].trim().length >= 2) titleParts.add(colon[1].trim());
+        if (colon[2].trim().length >= 2) titleParts.add(colon[2].trim());
+      }
+      const dash = raw.trim().split(/\s+[-–—]\s+/);
+      if (dash.length > 1) {
+        for (const part of dash) {
+          if (part.trim().length >= 2) titleParts.add(part.trim());
+        }
+      }
+    }
+    const sorted = [...titleParts].sort((a, b) => b.length - a.length);
+    for (const part of sorted) {
+      const tokens = part.normalize("NFKC").toLowerCase()
+        .replace(/['’`]/g, "")
+        .split(/[^\p{L}\p{M}\p{N}]+/u)
+        .filter(Boolean)
+        .map(tok => tok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      if (!tokens.length) continue;
+      const rx = new RegExp(`(?<![\\p{L}\\p{N}])${tokens.join("[\\s'’`._:\\-–—]+")}(?![\\p{L}\\p{N}])`, "giu");
+      s = s.replace(rx, " ");
+    }
+    // Strip the episode identifier itself (keeping revision separately via `revision`).
+    s = s.replace(/\bs(?:eason\s*)?0?\d{1,2}[\s._-]*e(?:p(?:isode)?\s*)?0*\d{1,4}(?:v\d+)?\b/gi, " ");
+    s = s.replace(/(?:^|[\s_-])(?:-\s+|\bep?(?:isode)?[\s._-]*)0*\d{1,4}(?:v\d+)?(?=\b|[\s\(\[\._-]|$)/gi, " ");
+  }
+
+  const tags = s.replace(/[^\p{L}\p{M}\p{N}]+/gu, " ").trim();
+  return [revision || "base", tags].filter(Boolean).join(" ").trim();
 }
 
 export async function findBackfillTorrents(job: BackfillSearch): Promise<ReleaseQualityEntry[]> {
   const { quality, type, episodeNumber, torrentTitle } = job;
-  if (!torrentTitle) return [];
+  if (!torrentTitle?.trim()) return [];
 
   const groupName = job.releaseGroup?.trim() || ReleaseFilter.parseTitle(torrentTitle).group;
   const group = groupName.toLowerCase();
-  const edition = releaseEdition(torrentTitle);
-  if (!group || group === "unknown" || !edition) return [];
+  if (!group || group === "unknown") return [];
 
   let knownTitles = job.knownTitles ?? [];
   if (!knownTitles.length && job.anilistId) {
@@ -83,6 +121,8 @@ export async function findBackfillTorrents(job: BackfillSearch): Promise<Release
     if (!items) return;
     searched = true;
     if (!knownTitles.length) return;
+    const expectedEdition = releaseEdition(torrentTitle, knownTitles);
+    if (!expectedEdition) return;
     for (const item of items) {
       if (!torrentInfoHash(item)) continue;
       const declaredAnidb = Number(item.anidb_aid);
@@ -97,7 +137,7 @@ export async function findBackfillTorrents(job: BackfillSearch): Promise<Release
       const parsed = ReleaseFilter.parseTitle(item.title, knownTitles, item);
       const torrentKey = item.info_hash || item.magnet_uri || item.torrent_url;
       if (parsed.groupLower !== group || !parsed.isH264 || !qualityMarkers[quality].test(item.title) ||
-          parsed.resolution !== quality || releaseEdition(item.title) !== edition || !torrentKey) continue;
+          parsed.resolution !== quality || releaseEdition(item.title, knownTitles) !== expectedEdition || !torrentKey) continue;
       if (item.tsukihime_episode_no != null && item.tsukihime_episode_no !== episodeNumber &&
           item.tsukihime_episode_no !== effectiveEp) continue;
 

@@ -121,7 +121,7 @@ export default function App() {
     {notice && <div className="toast" role="status"><span>{notice}</span><button aria-label="Dismiss notification" onClick={() => setNotice(null)}><X size={17} /></button></div>}
     {busy && <div className="action-progress" role="status"><Loader2 size={15} className="animate-spin" /> Working…</div>}
     <Suspense fallback={<div className="action-progress" role="status">Opening…</div>}>
-    {modal === "enqueue" && <EnqueueModal isOpen={modal === "enqueue"} onClose={() => setModal(null)} onSuccess={() => showNotice("Episodes added to the discovery queue.")} />}
+    {modal === "enqueue" && <EnqueueModal isOpen={modal === "enqueue"} onClose={() => setModal(null)} onSuccess={(msg) => showNotice(msg || "Episodes added to the discovery queue.")} />}
     {modal === "kaggle" && <KaggleAccountsModal isOpen={modal === "kaggle"} onClose={() => setModal(null)} stats={stats} />}
     {modal === "hf" && <HuggingFaceModal isOpen={modal === "hf"} onClose={() => setModal(null)} stats={stats} />}
     {modal === "staging" && <StagingExplorerModal isOpen={modal === "staging"} onClose={() => setModal(null)} onNotice={showNotice} />}

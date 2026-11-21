@@ -221,7 +221,13 @@ export interface EnqueueRequest {
   animeId?: number;
   anidbId?: number;
   episodeNumbers?: number[];
-  episodes?: { episodeNumber: number; types: StreamType[]; sourceJobId?: number | null; sourceUrl?: string }[];
+  episodes?: {
+    episodeNumber: number;
+    types: StreamType[];
+    sourceJobId?: number | null;
+    sourceUrl?: string;
+    manualTsukihimeTorrentId?: number;
+  }[];
   kind?: JobKind;
   requestId?: string;
   types?: ("sub" | "dub")[];
@@ -229,6 +235,7 @@ export interface EnqueueRequest {
   episodeCount?: number;
   metadata?: Record<string, any>;
   executionPolicy?: PipelineExecutionPolicy;
+  manualTsukihimeTorrentId?: number;
 }
 
 export interface EnqueueResponse {

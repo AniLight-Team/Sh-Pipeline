@@ -147,6 +147,7 @@ test("Tsukihime tries language and group filters and then includes releases with
   assert.equal(unfiltered.get("sort_by"), "source_date");
   assert.equal(unfiltered.get("order"), "desc");
   assert.equal(unfiltered.has("audiolang"), false);
+  assert.equal(unfiltered.has("sublang"), false);
 });
 
 test("Tsukihime falls back to title search when mappings fail and rejects different titles and IDs", async t => {
@@ -289,4 +290,101 @@ test("Tsukihime retries a rate-limited request and returns the API response", as
   });
   assert.deepEqual(await TsukihimeClient.resolveAnime({ anilistId: 150 }), expected);
   assert.equal(calls, 2);
+});
+
+test("Tsukihime retains verified S04 dual-audio releases, donghua releases, and never queries bare quality tokens", async t => {
+  const anime = {
+    id: 8785,
+    anilist: 178083,
+    anidb: 18693,
+    title: "Tokyo Revengers: Santen Sensou-hen",
+    english_title: "Tokyo Revengers: War of the Three Titans Arc",
+  };
+  const toonsHub = makeEntry(40996, "[ToonsHub] Tokyo Revengers S04E08 1080p UNCENSORED DSNP WEB-DL DUAL AAC2.0 H.264 (Dual-Audio, Multi-Subs)", {
+    anime, episode_no: 8, audiolangs: ["ja", "en"], sublangs: ["en"], group: { id: 1, name: "ToonsHub" },
+  });
+  const erai1080 = makeEntry(41003, "[Erai-raws] Tokyo Revengers S04E08 (Santen Sensou Hen) [1080p DSNP WEB-DL AVC AAC][MultiSub][B4344441]", {
+    anime, episode_no: 8, audiolangs: ["ja"], sublangs: ["en"], group: { id: 3, name: "Erai-raws" },
+  });
+  const wrongShow = makeEntry(99999, "[SubsPlease] Totally Different Show - 08 [1080p]", {
+    anime, episode_no: 8, audiolangs: ["ja", "en"], sublangs: ["en"],
+  });
+  t.mock.method(client, "requestJson", async (path: string) => {
+    const { pathname } = new URL(path, "https://test.invalid");
+    if (pathname === "/animes/anilist/178083") return anime;
+    if (pathname === "/animes/8785/episodes/8") return { anime, results: [toonsHub, erai1080, wrongShow] };
+    return { anime, results: [] };
+  });
+
+  const dubRes = await TsukihimeClient.fetchTorrents({ anilistId: 178083 }, {
+    targetEp: 8,
+    langType: "dub",
+    knownTitles: [anime.title, anime.english_title],
+  });
+  assert.deepEqual(dubRes.torrents.map(item => item.tsukihime_id).sort(), [40996, 41003]);
+
+  // Punctuation-only or resolution-only titles must never trigger a "/search/torrents?q=1080p" query
+  const searchCalls: string[] = [];
+  t.mock.method(client, "requestJson", async (path: string) => {
+    searchCalls.push(path);
+    return null;
+  });
+  await TsukihimeClient.fetchTorrents({ anilistId: 555555 }, {
+    targetEp: 1,
+    quality: "1080p",
+    knownTitles: [" ---！？ ", "1080p"],
+  });
+  assert.equal(searchCalls.some(path => path.startsWith("/search/torrents")), false);
+});
+
+test("TsukihimeClient.fetchTorrentById resolves direct manual torrent payloads and rejects adult/invalid entries", async t => {
+  const entry41031: TsukihimeTorrentEntry = {
+    id: 41031,
+    state: "completed",
+    name: "[DKB] Tokyo Revengers: Santen Sensou-hen - S04E08 [1080p][HEVC x265 10bit][Dual-Audio][Multi-Subs][weekly]",
+    btih: "3cffee3862053a9ee95159131fd2396a912da2b8",
+    is_adult: 0,
+    totalsize: 496117380,
+    filecount: 1,
+    audiolangs: ["ja", "en"],
+    sublangs: ["en", "ja", "ar"],
+    episode_no: 8,
+    anime: {
+      id: 8785,
+      title: "Tokyo Revengers: Santen Sensou-hen",
+      english_title: "Tokyo Revengers: War of the Three Titans Arc",
+      anilist: 178083,
+      mal: 59088,
+      anidb: 18693,
+      total_episodes: 13,
+    },
+    group: { id: 5, name: "DKB", is_fansub: 0 },
+    files: [{
+      id: 64293,
+      filename: "[DKB] Tokyo Revengers Santen Sensou-hen - S04E08 [1080p][HEVC x265 10bit][Dual-Audio][Multi-Subs][9E264CB9].mkv",
+      size: 496117380,
+    }],
+    trackers: [
+      { tier: 0, seeders: 70, leechers: 29, error: 0, url: "http://nyaa.tracker.wf:7777/announce" },
+      { tier: 17, seeders: 10, leechers: 15, error: 1, url: "http://tracker.vanitycore.co:6969/announce" },
+    ],
+  };
+
+  t.mock.method(client, "requestJson", async (path: string) => {
+    if (path === "/torrents/41031") return entry41031;
+    if (path === "/torrents/99999") return { ...entry41031, id: 99999, is_adult: 1 };
+    return null;
+  });
+
+  const fetched = await TsukihimeClient.fetchTorrentById(41031);
+  assert.equal(fetched?.id, 41031);
+  assert.equal(fetched?.anime?.anilist, 178083);
+  const item = TsukihimeClient.toAnimeToshoItem(fetched!);
+  assert.equal(item.seeders, 70);
+  assert.equal(item.tsukihime_id, 41031);
+  assert.match(item.magnet_uri ?? "", /3cffee3862053a9ee95159131fd2396a912da2b8/);
+  assert.match(item.magnet_uri ?? "", /nyaa\.tracker\.wf/);
+
+  assert.equal(await TsukihimeClient.fetchTorrentById(1234567), null);
+  await assert.rejects(() => TsukihimeClient.fetchTorrentById(99999), /adult/i);
 });

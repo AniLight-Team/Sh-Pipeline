@@ -73,3 +73,29 @@ test("verified standalone titles may omit the episode number from the only named
   assert.equal(ReleaseFilter.matchFilesToEpisodes(files("video.mkv"), options).size, 0);
   assert.equal(ReleaseFilter.matchFilesToEpisodes(files(name, "video.mkv"), options).size, 0);
 });
+
+test("verified sequel and donghua filenames isolate cleanly without accepting wrong seasons", () => {
+  const trTitles = ["Tokyo Revengers: Santen Sensou-hen", "Tokyo Revengers: War of the Three Titans Arc"];
+  const toonsHubFile = "[ToonsHub] Tokyo Revengers S04E08 1080p UNCENSORED DSNP WEB-DL DUAL AAC2.0 H.264.mkv";
+  assert.deepEqual(
+    ReleaseFilter.matchFilesToEpisodes(files(toonsHubFile), {
+      knownTitles: trTitles, targetEp: 8, effectiveEp: 8, torrentTitle: toonsHubFile, allowVerifiedSeason: true,
+    }).get(8),
+    [0, toonsHubFile],
+  );
+  assert.equal(
+    ReleaseFilter.matchFilesToEpisodes(files(toonsHubFile.replace("S04E08", "S01E08")), {
+      knownTitles: trTitles, targetEp: 8, effectiveEp: 8, torrentTitle: toonsHubFile.replace("S04E08", "S01E08"), allowVerifiedSeason: true,
+    }).size,
+    0,
+  );
+
+  const slTitles = ["Douluo Dalu 2: Jueshi Tangmen", "Soul Land 2: The Peerless Tang Clan"];
+  const slFile = "[FSP] Douluo Dalu II - Soul Land 2 - 178 [1080p].mkv";
+  assert.deepEqual(
+    ReleaseFilter.matchFilesToEpisodes(files(slFile), {
+      knownTitles: slTitles, targetEp: 178, effectiveEp: 178, torrentTitle: slFile, allowVerifiedSeason: true,
+    }).get(178),
+    [0, slFile],
+  );
+});

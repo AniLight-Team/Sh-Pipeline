@@ -1,6 +1,6 @@
 import { inngest } from "../client.js";
 import { db, schema } from "../../db/index.js";
-import { eq, inArray, lt, and, asc } from "drizzle-orm";
+import { eq, inArray, lt, and, asc, sql } from "drizzle-orm";
 import { PipelineEngineService } from "../../engine/service.js";
 import {
   MAX_JOB_ATTEMPTS,
@@ -48,7 +48,9 @@ export const recoveryWatchdogFn = inngest.createFunction(
             queuedDiscoveryCondition(),
             lt(schema.pipelineJob.updatedAt, twoMinsAgo),
           ),
-        ).orderBy(asc(schema.pipelineJob.updatedAt)).limit(KIRA_DISCOVERY_CONCURRENCY);
+        )
+        .orderBy(sql`${schema.pipelineJob.discoverAfter} asc nulls first`, asc(schema.pipelineJob.updatedAt), asc(schema.pipelineJob.id))
+        .limit(KIRA_DISCOVERY_CONCURRENCY);
 
       // 2. Recover hung "downloading" jobs (no heartbeat for >10m, e.g. after service restart)
       const hungDownloadingJobs = await db

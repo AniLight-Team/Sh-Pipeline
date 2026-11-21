@@ -15,6 +15,7 @@ try {
     "src/backend/engine/torrent-file-selection.test.ts",
     "src/backend/engine/quality-backfill-discovery.test.ts",
     "src/backend/engine/quality-backfill.test.ts",
+    "src/backend/engine/retry-policy.test.ts",
     "src/backend/engine/tsukihime.client.test.ts",
   ], {
     stdio: "inherit",

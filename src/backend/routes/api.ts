@@ -3,10 +3,12 @@ import { db, schema } from "../db/index.js";
 import { eq, desc, sql, and, inArray, asc, notInArray, isNull, or } from "drizzle-orm";
 import { PipelineEngineService } from "../engine/service.js";
 import { AnimeMetadataResolver } from "../engine/metadata-resolver.js";
+import { TsukihimeClient } from "../engine/tsukihime.client.js";
+import { ReleaseFilter } from "../engine/release-filter.js";
 import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
-import { INTERNAL_SECRET } from "../config.js";
-import { discoveryEvent } from "../engine/job-scheduling.js";
+import { INTERNAL_SECRET, TorrentEntryNotFoundException } from "../config.js";
+import { discoveryEvent, resetRetryMetadata } from "../engine/job-scheduling.js";
 import { inngest } from "../inngest/client.js";
 import { log } from "../utils/logger.js";
 import type {
@@ -26,6 +28,7 @@ const enqueueSchema = z.object({
     types: streamTypes,
     sourceJobId: positiveId.nullable().optional(),
     sourceUrl: z.url({ protocol: /^https?$/ }).max(2048).optional(),
+    manualTsukihimeTorrentId: positiveId.optional(),
   })).min(1).max(100).optional(),
   kind: z.enum(["release", "stream_refresh", "caption_refresh"]).optional(),
   requestId: z.string().min(1).max(200).optional(),
@@ -33,6 +36,7 @@ const enqueueSchema = z.object({
   episodeCount: positiveId.optional(),
   metadata: z.record(z.string(), z.any()).optional(),
   executionPolicy: z.enum(["all", "vm_remux_only", "kaggle_gpu_only"]).optional(),
+  manualTsukihimeTorrentId: positiveId.optional(),
 });
 
 async function dispatchJobDiscovery(...jobs: Parameters<typeof discoveryEvent>[0][]) {
@@ -179,14 +183,70 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     }
   });
 
+  // Resolve a single Tsukihime torrent ID directly for manual discovery preview
+  app.get("/tsukihime/torrents/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const torrentId = Number.parseInt(id, 10);
+    if (!Number.isSafeInteger(torrentId) || torrentId <= 0 || String(torrentId) !== id.trim()) {
+      return reply.status(400).send({ error: "Valid numeric Tsukihime torrent ID is required" });
+    }
+
+    try {
+      const entry = await TsukihimeClient.fetchTorrentById(torrentId);
+      if (!entry) {
+        return reply.status(404).send({ error: `Tsukihime torrent #${torrentId} was not found` });
+      }
+      const item = TsukihimeClient.toAnimeToshoItem(entry);
+      const knownTitles = [entry.anime?.title, entry.anime?.english_title].filter(Boolean);
+      const parsed = ReleaseFilter.parseTitle(entry.name, knownTitles, item);
+      return {
+        ok: true,
+        torrent: {
+          id: entry.id,
+          name: entry.name,
+          btih: entry.btih,
+          state: entry.state,
+          totalsize: entry.totalsize ?? null,
+          filecount: entry.filecount ?? entry.files?.length ?? 1,
+          episode_no: entry.episode_no ?? null,
+          audiolangs: entry.audiolangs ?? [],
+          sublangs: entry.sublangs ?? [],
+          group: entry.group ?? null,
+          anime: entry.anime ?? null,
+          seeders: item.seeders ?? 0,
+          leechers: item.leechers ?? 0,
+          resolution: parsed.resolution ?? "1080p",
+          videoCodec: parsed.isAv1 ? "av1" : parsed.isHevcOrAv1 ? "hevc" : "h264",
+          expectedPipeline: parsed.isH264 ? "vm_remux" : "kaggle_gpu",
+          isDualAudio: parsed.isDualAudio,
+          isEnglishDub: parsed.isEnglishDub,
+          files: Array.isArray(entry.files)
+            ? entry.files.slice(0, 25).map(file => ({
+                id: file.id,
+                filename: file.filename,
+                size: file.size,
+              }))
+            : [],
+        },
+      };
+    } catch (err: any) {
+      const message = err?.message || "Failed to look up Tsukihime torrent";
+      const status = /adult|valid info hash|incomplete metadata/i.test(message) ? 400 : 502;
+      return reply.status(status).send({ error: message });
+    }
+  });
+
   app.post("/pipeline/enqueue", async (req, reply) => {
     const parsed = enqueueSchema.safeParse(req.body);
     if (!parsed.success) return reply.status(400).send({ error: "Invalid enqueue request" });
     const body = parsed.data;
-    if (!(body.anilistId || body.animeId || body.anidbId ||
+    const hasManualTorrent = Boolean(
+      body.manualTsukihimeTorrentId || body.episodes?.some(ep => ep.manualTsukihimeTorrentId),
+    );
+    if (!(body.anilistId || body.animeId || body.anidbId || hasManualTorrent ||
         positiveId.safeParse(Number(body.metadata?.anilistId)).success ||
         positiveId.safeParse(Number(body.metadata?.animeId)).success)) {
-      return reply.status(400).send({ error: "An anime identifier is required" });
+      return reply.status(400).send({ error: "An anime identifier or Tsukihime torrent ID is required" });
     }
     if (body.kind || body.episodes || body.requestId) {
       const token = req.headers["x-internal-secret"];
@@ -198,13 +258,24 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
       if (!body.episodes || !body.kind || !body.requestId) {
         return reply.status(400).send({ error: "episodes, kind, and requestId are required" });
       }
-    } else if (!body.episodeNumbers) {
+    } else if (!body.episodeNumbers && !hasManualTorrent) {
       return reply.status(400).send({ error: "episodeNumbers are required" });
     }
 
-    const res = await PipelineEngineService.enqueue(body);
-    await dispatchJobDiscovery(...res.queuedJobs);
-    return res;
+    try {
+      const res = await PipelineEngineService.enqueue(body);
+      await dispatchJobDiscovery(...res.queuedJobs);
+      return res;
+    } catch (err: any) {
+      if (err instanceof TorrentEntryNotFoundException) {
+        return reply.status(404).send({ error: err.message });
+      }
+      const message = err?.message || "Failed to enqueue jobs";
+      if (/adult|valid info hash|incomplete metadata/i.test(message)) {
+        return reply.status(400).send({ error: message });
+      }
+      return reply.status(500).send({ error: message });
+    }
   });
 
   app.get("/jobs", async (req) => {
@@ -260,7 +331,8 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
         batchId: null,
         lastError: null,
         attempt: 0,
-          discoverAfter: null,
+        discoverAfter: null,
+        ...(hasStagedFile ? {} : { metadata: resetRetryMetadata(existing.metadata) }),
         heartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -289,6 +361,95 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     }
 
     return { ok: true, job: updated };
+  });
+
+  // Pin (or clear) a manual Tsukihime torrent ID for an existing job and immediately re-run discovery
+  app.post("/jobs/:id/manual-torrent", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const jobId = Number.parseInt(id, 10);
+    if (!Number.isSafeInteger(jobId) || jobId <= 0) {
+      return reply.status(400).send({ error: "Valid job ID is required" });
+    }
+
+    const body = (req.body || {}) as { tsukihimeTorrentId?: number | string | null };
+    const rawTid = body.tsukihimeTorrentId;
+    const isClear = rawTid === null || rawTid === undefined || rawTid === "";
+    const torrentId = isClear ? null : Number(rawTid);
+    if (!isClear && (!Number.isSafeInteger(torrentId) || (torrentId ?? 0) <= 0)) {
+      return reply.status(400).send({ error: "Valid numeric Tsukihime torrent ID is required" });
+    }
+
+    await PipelineEngineService.ensureTables();
+    const existing = await db.query.pipelineJob.findFirst({
+      where: eq(schema.pipelineJob.id, jobId),
+    });
+    if (!existing) {
+      return reply.status(404).send({ error: "Job not found" });
+    }
+    if (["downloading", "encoding", "completed"].includes(existing.status) || (existing.batchId && existing.status !== "failed")) {
+      return reply.status(409).send({ error: "This job is active or completed. Only inactive unfinished jobs can be reassigned." });
+    }
+    if (existing.metadata?.kind === "quality_backfill") {
+      return reply.status(409).send({ error: "Quality backfill jobs cannot be pinned to a manual Tsukihime torrent." });
+    }
+
+    let entryName: string | undefined;
+    let entryAnimeId: number | undefined;
+    if (torrentId !== null) {
+      try {
+        const entry = await TsukihimeClient.fetchTorrentById(torrentId);
+        if (!entry) {
+          return reply.status(404).send({ error: `Tsukihime torrent #${torrentId} was not found` });
+        }
+        entryName = entry.name;
+        entryAnimeId = entry.anime?.id;
+      } catch (err: any) {
+        return reply.status(400).send({ error: err?.message || `Failed to fetch Tsukihime torrent #${torrentId}` });
+      }
+    }
+
+    const nextMeta = resetRetryMetadata(existing.metadata);
+    if (torrentId !== null) {
+      nextMeta.manualTsukihimeTorrentId = torrentId;
+      if (entryName) nextMeta.manualTsukihimeTorrentName = entryName;
+      if (entryAnimeId && !nextMeta.tsukihimeId) nextMeta.tsukihimeId = entryAnimeId;
+    } else {
+      delete nextMeta.manualTsukihimeTorrentId;
+      delete nextMeta.manualTsukihimeTorrentName;
+    }
+
+    const now = new Date();
+    const [updated] = await db
+      .update(schema.pipelineJob)
+      .set({
+        status: "queued",
+        batchId: null,
+        lastError: null,
+        attempt: 0,
+        discoverAfter: null,
+        stagedFilePath: null,
+        stagedQualities: null,
+        torrentId: torrentId ?? null,
+        torrentTitle: torrentId !== null ? (entryName ?? null) : null,
+        metadata: nextMeta,
+        heartbeatAt: now,
+        updatedAt: now,
+      })
+      .where(and(eq(schema.pipelineJob.id, jobId), eq(schema.pipelineJob.status, existing.status)))
+      .returning();
+
+    if (!updated) {
+      return reply.status(409).send({ error: "Job changed while updating manual torrent. Refresh and try again." });
+    }
+
+    await PipelineEngineService.cleanupJobStagedFiles(existing).catch(() => {});
+    await dispatchJobDiscovery(updated);
+
+    const message = torrentId !== null
+      ? `Job #${jobId} pinned to Tsukihime torrent #${torrentId} and queued for immediate staging.`
+      : `Cleared manual torrent override on Job #${jobId} and queued for automatic discovery.`;
+    log.info("API", message);
+    return { ok: true, job: updated, message };
   });
 
   app.post("/jobs/:id/delete", async (req, reply) => {
@@ -374,6 +535,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
             lastError: null,
             attempt: 0,
             discoverAfter: null,
+            ...(hasStaged ? {} : { metadata: resetRetryMetadata(job.metadata) }),
             heartbeatAt: new Date(),
             updatedAt: new Date(),
           })
@@ -495,6 +657,7 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
           lastError: null,
           attempt: 0,
           discoverAfter: null,
+          ...(hasStaged ? {} : { metadata: resetRetryMetadata(job.metadata) }),
           heartbeatAt: new Date(),
           updatedAt: new Date(),
         })

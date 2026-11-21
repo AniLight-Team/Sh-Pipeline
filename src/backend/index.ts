@@ -19,7 +19,7 @@ import { apiRoutes } from "./routes/api.js";
 import { sseRoutes } from "./routes/sse.js";
 import { PipelineEngineService } from "./engine/service.js";
 import { db, schema } from "./db/index.js";
-import { eq, lt, and, inArray } from "drizzle-orm";
+import { eq, lt, and, inArray, asc, sql } from "drizzle-orm";
 import { log } from "./utils/logger.js";
 import { discoveryEvent, queuedDiscoveryCondition } from "./engine/job-scheduling.js";
 
@@ -197,6 +197,7 @@ async function runAutonomousReconciliationTick() {
             lt(schema.pipelineJob.updatedAt, ninetySecsAgo),
           ),
         )
+        .orderBy(sql`${schema.pipelineJob.discoverAfter} asc nulls first`, asc(schema.pipelineJob.updatedAt), asc(schema.pipelineJob.id))
         .limit(KIRA_DISCOVERY_CONCURRENCY);
 
       for (const j of stuckQueuedJobs) {

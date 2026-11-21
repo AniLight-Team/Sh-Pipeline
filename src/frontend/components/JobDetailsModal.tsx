@@ -13,6 +13,9 @@ import {
   HardDrive,
   Film,
   Subtitles,
+  Link2,
+  Loader2,
+  Search,
 } from "lucide-react";
 
 interface JobDetailsModalProps {
@@ -21,11 +24,32 @@ interface JobDetailsModalProps {
   onUpdated?: (message?: string) => void;
 }
 
+function parseTsukihimeTorrentIdInput(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const urlMatch = trimmed.match(/\/torrents\/(\d+)(?:[/?#]|$)/i);
+  if (urlMatch) {
+    const num = Number.parseInt(urlMatch[1], 10);
+    return Number.isSafeInteger(num) && num > 0 ? num : null;
+  }
+  if (/^\d+$/.test(trimmed)) {
+    const num = Number.parseInt(trimmed, 10);
+    return Number.isSafeInteger(num) && num > 0 ? num : null;
+  }
+  return null;
+}
+
 export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProps) {
   useDialog(Boolean(job), onClose);
   const [copied, setCopied] = useState(false);
   const [copiedUrls, setCopiedUrls] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [manualTorrentInput, setManualTorrentInput] = useState<string>(
+    job?.metadata?.manualTsukihimeTorrentId ? String(job.metadata.manualTsukihimeTorrentId) : "",
+  );
+  const [manualPreview, setManualPreview] = useState<any | null>(null);
+  const [manualError, setManualError] = useState<string | null>(null);
+  const [manualLookingUp, setManualLookingUp] = useState(false);
 
   const allTrackPayloads = Array.isArray(job?.resultPayload?.allTrackPayloads)
     ? job.resultPayload.allTrackPayloads
@@ -65,7 +89,24 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
 
   const cannotReprocess = ["downloading", "encoding", "completed"].includes(job.status) || Boolean(job.batchId && job.status !== "failed");
   const tsukihimeId = job.metadata?.tsukihimeId;
-  const processingMode = job.pipelineType || job.metadata?.processingMode;
+  const manualTorrentId = Number(job.metadata?.manualTsukihimeTorrentId) > 0
+    ? Number(job.metadata.manualTsukihimeTorrentId)
+    : null;
+  const hasAssignedPipeline = Boolean(
+    job.stagedFilePath ||
+    Object.keys(job.stagedQualities || {}).length > 0 ||
+    job.selectionTier ||
+    job.torrentTitle ||
+    job.status === "completed",
+  );
+  const processingMode = hasAssignedPipeline ? (job.metadata?.processingMode || job.pipelineType) : null;
+  const jobKind = job.metadata?.kind;
+  const backfillTargetQuality = jobKind === "quality_backfill" ? job.metadata?.targetQuality : null;
+  const discoveryRetries = Number(job.metadata?.discoveryRetries ?? 0);
+  const maxDiscoveryRetries = Number(job.metadata?.maxDiscoveryRetries ?? 0);
+  const nextRetryLabel = job.status === "queued" && job.discoverAfter && new Date(job.discoverAfter).getTime() > Date.now()
+    ? new Date(job.discoverAfter).toLocaleString()
+    : null;
   const selectionTier = job.selectionTier || job.metadata?.selectionTier;
   const releaseGroup = job.releaseGroup || job.metadata?.releaseGroup;
   const videoCodec = job.videoCodec || job.metadata?.videoCodec;
@@ -116,6 +157,57 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
     }
   };
 
+  const previewManualTorrent = async () => {
+    const parsedId = parseTsukihimeTorrentIdInput(manualTorrentInput);
+    if (!parsedId) {
+      setManualPreview(null);
+      setManualError("Enter a numeric Tsukihime torrent ID (e.g. 41031) or URL.");
+      return;
+    }
+    setManualLookingUp(true);
+    setManualError(null);
+    try {
+      const res = await fetch(`/api/tsukihime/torrents/${parsedId}`);
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.torrent) {
+        setManualPreview(null);
+        setManualError(data?.error || `Tsukihime torrent #${parsedId} was not found.`);
+        return;
+      }
+      setManualPreview(data.torrent);
+    } catch {
+      setManualPreview(null);
+      setManualError("Could not reach Tsukihime lookup endpoint.");
+    } finally {
+      setManualLookingUp(false);
+    }
+  };
+
+  const applyManualTorrent = async (clear = false) => {
+    const parsedId = clear ? null : parseTsukihimeTorrentIdInput(manualTorrentInput);
+    if (!clear && !parsedId) {
+      setManualError("Enter a numeric Tsukihime torrent ID (e.g. 41031) or URL.");
+      return;
+    }
+    setActionBusy(clear ? "clear_manual" : "apply_manual");
+    setManualError(null);
+    try {
+      const res = await fetch(`/api/jobs/${job.id}/manual-torrent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tsukihimeTorrentId: parsedId }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || "Failed to update manual torrent");
+      onUpdated?.(data?.message || `Updated Job #${job.id}`);
+      onClose();
+    } catch (error) {
+      setManualError(error instanceof Error ? error.message : "Failed to update manual torrent");
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
   return (
     <div
       role="dialog"
@@ -135,6 +227,34 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
               <span>Episode {job.episodeNumber}</span>
               <span>·</span>
               <span>{job.types?.join(" + ").toUpperCase() || "SUB"}</span>
+              {jobKind === "quality_backfill" && (
+                <>
+                  <span>·</span>
+                  <span className="text-[#52734c] font-semibold">
+                    Quality Backfill{backfillTargetQuality ? ` (${backfillTargetQuality})` : ""}
+                  </span>
+                </>
+              )}
+              {jobKind === "caption_refresh" && (
+                <>
+                  <span>·</span>
+                  <span className="text-[#52734c] font-semibold">Caption Refresh</span>
+                </>
+              )}
+              {manualTorrentId && (
+                <>
+                  <span>·</span>
+                  <a
+                    href={`https://api.tsukihime.org/v1/torrents/${manualTorrentId}`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-[#9a563b] font-semibold hover:underline inline-flex items-center gap-1"
+                  >
+                    <span>Manual Tsuki #{manualTorrentId}</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                </>
+              )}
               {processingMode && (
                 <>
                   <span>·</span>
@@ -214,6 +334,82 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
           </div>
         </div>
 
+        {/* Manual Tsukihime Torrent Override */}
+        {!cannotReprocess && jobKind !== "quality_backfill" && (
+          <div className="mb-4 p-3 rounded-lg bg-[#f5f3ed] border border-[#e6e3db] space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-xs font-medium text-[#302e2a] inline-flex items-center gap-1.5">
+                <Link2 className="w-3.5 h-3.5 text-[#9a563b]" />
+                <span>Manual Tsukihime Torrent Discovery</span>
+              </span>
+              {manualTorrentId && (
+                <button
+                  type="button"
+                  disabled={actionBusy !== null}
+                  onClick={() => void applyManualTorrent(true)}
+                  className="text-[11px] font-mono text-[#716c63] hover:text-[#302e2a] underline cursor-pointer disabled:opacity-50"
+                >
+                  Clear Pin &amp; Auto-Discover
+                </button>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="text"
+                placeholder="Tsukihime torrent ID or URL (e.g. 41031)"
+                value={manualTorrentInput}
+                onChange={(e) => { setManualTorrentInput(e.target.value); setManualError(null); }}
+                className="flex-1 min-w-[200px] px-2.5 py-1.5 rounded-md bg-white border border-[#e6e3db] text-[#302e2a] placeholder-[#817a70] font-mono text-xs focus:outline-none focus:border-indigo-500"
+              />
+              <button
+                type="button"
+                disabled={manualLookingUp || actionBusy !== null}
+                onClick={() => void previewManualTorrent()}
+                className="btn-secondary px-2.5 py-1.5 rounded-md text-xs font-medium inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {manualLookingUp ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Search className="w-3.5 h-3.5" />
+                )}
+                <span>Preview</span>
+              </button>
+              <button
+                type="button"
+                disabled={actionBusy !== null}
+                onClick={() => void applyManualTorrent(false)}
+                className="btn-primary px-3 py-1.5 rounded-md text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                {actionBusy === "apply_manual" ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Play className="w-3.5 h-3.5" />
+                )}
+                <span>Use Torrent &amp; Run</span>
+              </button>
+            </div>
+            {manualError && (
+              <div className="text-[11px] text-[#ad4a3e] font-mono">{manualError}</div>
+            )}
+            {manualPreview && (
+              <div className="p-2 rounded-md bg-white border border-[#e6e3db] text-[11px] font-mono space-y-1">
+                <div className="text-[#302e2a] font-semibold break-all">{manualPreview.name}</div>
+                <div className="flex flex-wrap items-center gap-x-2 text-[#716c63]">
+                  {manualPreview.group?.name && <span className="text-[#9a563b]">[{manualPreview.group.name}]</span>}
+                  <span>{manualPreview.resolution} · {String(manualPreview.videoCodec || "").toUpperCase()}</span>
+                  <span className={manualPreview.expectedPipeline === "vm_remux" ? "text-[#52734c]" : "text-[#9a563b]"}>
+                    → {manualPreview.expectedPipeline === "vm_remux" ? "VM Remux" : "GPU Encode"}
+                  </span>
+                  {manualPreview.totalsize ? <span>· {(manualPreview.totalsize / (1024 * 1024)).toFixed(1)} MB</span> : null}
+                  <span>· {manualPreview.seeders} seeds</span>
+                  <span>· Audio: {manualPreview.audiolangs?.length ? manualPreview.audiolangs.join(", ") : "untagged"}</span>
+                  <span>· Subs: {manualPreview.sublangs?.length ? manualPreview.sublangs.slice(0, 3).join(", ") : "none"}</span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Identifiers & Codec Metadata Row */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
           <div className="p-3 rounded-lg bg-[#f5f3ed] border border-[#e6e3db]">
@@ -244,7 +440,7 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
           <div className="p-3 rounded-lg bg-[#f5f3ed] border border-[#e6e3db]">
             <span className="text-[11px] text-[#817a70] block mb-0.5">Release Group & Tier</span>
             <span className="font-mono text-xs font-semibold text-[#5b554a] truncate block">
-              {releaseGroup || "auto"} · {(videoCodec || "h264").toUpperCase()}
+              {releaseGroup || "auto"} · {videoCodec ? videoCodec.toUpperCase() : "auto"}
               {selectionTier ? ` (${selectionTier})` : ""}
             </span>
           </div>
@@ -307,15 +503,27 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
         )}
 
         {/* Error Trace if Failed */}
-        {job.lastError && (
+        {(job.lastError || nextRetryLabel || discoveryRetries > 0) && (
           <div className="mb-4 p-3.5 rounded-lg bg-rose-500/10 border border-rose-500/25 text-[#ad4a3e] text-xs">
-            <div className="font-semibold flex items-center gap-1.5 mb-1 text-rose-200">
-              <AlertTriangle className="w-4 h-4" />
-              <span>Diagnostic Trace</span>
+            <div className="font-semibold flex items-center justify-between gap-1.5 mb-1 text-rose-200">
+              <span className="flex items-center gap-1.5">
+                <AlertTriangle className="w-4 h-4" />
+                <span>Diagnostic Trace</span>
+              </span>
+              {(discoveryRetries > 0 || nextRetryLabel) && (
+                <span className="font-mono text-[11px] font-normal text-[#716c63]">
+                  {discoveryRetries > 0
+                    ? `Discovery retry ${discoveryRetries}${maxDiscoveryRetries > 0 ? `/${maxDiscoveryRetries}` : ""}`
+                    : ""}
+                  {nextRetryLabel ? ` · Next attempt ${nextRetryLabel}` : ""}
+                </span>
+              )}
             </div>
-            <pre className="font-mono text-[11px] whitespace-pre-wrap break-all text-[#ad4a3e]">
-              {job.lastError}
-            </pre>
+            {job.lastError && (
+              <pre className="font-mono text-[11px] whitespace-pre-wrap break-all text-[#ad4a3e]">
+                {job.lastError}
+              </pre>
+            )}
           </div>
         )}
 
