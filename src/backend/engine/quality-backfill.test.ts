@@ -28,19 +28,15 @@ test("stored source staging checks checksum and transfer size", async t => {
 
 test("fetchMissingBackfillQualities returns ordered missing lower qualities or null when source changed", async t => {
   const { fetchMissingBackfillQualities, missingBackfillQualities } = await import("./quality-backfill.js");
-  assert.deepEqual(missingBackfillQualities([{ quality: "1080p", url: sourceUrl }]), ["720p", "480p"]);
-  assert.deepEqual(
-    missingBackfillQualities([{ quality: "1080p", url: sourceUrl }, { quality: "720p", url: sourceUrl }]),
-    ["480p"],
-  );
-  assert.deepEqual(
-    missingBackfillQualities([
-      { quality: "1080p", url: sourceUrl },
-      { quality: "720p", url: sourceUrl },
-      { quality: "480p", url: sourceUrl },
-    ]),
-    [],
-  );
+  const src = (quality: "1080p" | "720p" | "480p") => ({
+    quality,
+    url: sourceUrl,
+    downloadUrl: sourceUrl,
+    sha256,
+  });
+  assert.deepEqual(missingBackfillQualities([src("1080p")]), ["720p", "480p"]);
+  assert.deepEqual(missingBackfillQualities([src("1080p"), src("720p")]), ["480p"]);
+  assert.deepEqual(missingBackfillQualities([src("1080p"), src("720p"), src("480p")]), []);
 
   let mockResponse: unknown = { status: "ready", missingQualities: ["480p", "720p"], sourceUrl };
   t.mock.method(globalThis, "fetch", async () => Response.json(mockResponse));
@@ -83,9 +79,15 @@ test("Kaggle GPU kernel script preserves exact 1080p/720p/480p scale filters and
     },
   ]);
 
-  // Manifest embeds exact lower-quality targets for backfill job and omits them for full 3-quality encode
-  assert.match(script, /"jobId":101.*"outputQualities":\["720p","480p"\]/);
-  assert.ok(!/"jobId":102[^}]*"outputQualities"/.test(script));
+  // Decode embedded base64 manifest and verify exact lower-quality targets
+  const b64Match = script.match(/base64\.b64decode\("([^"]+)"\)/);
+  assert.ok(b64Match, "Expected base64 manifest in kernel script");
+  const decodedManifest = JSON.parse(Buffer.from(b64Match[1], "base64").toString("utf8")) as any[];
+  assert.equal(decodedManifest.length, 2);
+  assert.equal(decodedManifest[0].jobId, 101);
+  assert.deepEqual(decodedManifest[0].outputQualities, ["720p", "480p"]);
+  assert.equal(decodedManifest[1].jobId, 102);
+  assert.equal(decodedManifest[1].outputQualities, undefined);
 
   // Verify exact scaling, stream maps, NVENC targets, and quality label assignments
   assert.ok(script.includes('qualities = ("1080p", "720p", "480p")'));
