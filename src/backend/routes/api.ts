@@ -183,6 +183,52 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     }
   });
 
+  // Per-anime discovery rules (strict episode offset, source Tsukihime/AniDB override, custom search titles)
+  app.get("/anime/rules", async () => {
+    const rules = await PipelineEngineService.listAnimeDiscoveryRules();
+    return { ok: true, rules };
+  });
+
+  app.post("/anime/rules", async (req, reply) => {
+    const ruleSchema = z.object({
+      anilistId: positiveId.nullable().optional(),
+      animeId: positiveId.nullable().optional(),
+      episodeOffset: z.number().int().min(0).max(5000).default(0),
+      sourceTsukihimeId: positiveId.nullable().optional(),
+      sourceAnidbId: positiveId.nullable().optional(),
+      searchTitles: z.array(z.string().min(1).max(300)).max(20).optional(),
+      notes: z.string().max(500).nullable().optional(),
+    });
+    const parsed = ruleSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: "Invalid anime discovery rule payload" });
+    }
+    if (!parsed.data.anilistId && !parsed.data.animeId) {
+      return reply.status(400).send({ error: "Either anilistId or animeId is required" });
+    }
+    try {
+      const rule = await PipelineEngineService.upsertAnimeDiscoveryRule(parsed.data);
+      return {
+        ok: true,
+        rule,
+        message: `Saved discovery rule for ${rule.anilistId ? `AniList #${rule.anilistId}` : `Anime #${rule.animeId}`} (offset +${rule.episodeOffset}).`,
+      };
+    } catch (err: any) {
+      return reply.status(500).send({ error: err?.message || "Failed to save anime discovery rule" });
+    }
+  });
+
+  app.delete("/anime/rules/:id", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const ruleId = Number.parseInt(id, 10);
+    if (!Number.isSafeInteger(ruleId) || ruleId <= 0) {
+      return reply.status(400).send({ error: "Valid rule ID is required" });
+    }
+    const deleted = await PipelineEngineService.deleteAnimeDiscoveryRule(ruleId);
+    if (!deleted) return reply.status(404).send({ error: "Rule not found" });
+    return { ok: true, message: `Deleted discovery rule #${ruleId}.` };
+  });
+
   // Resolve a single Tsukihime torrent ID directly for manual discovery preview
   app.get("/tsukihime/torrents/:id", async (req, reply) => {
     const { id } = req.params as { id: string };

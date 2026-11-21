@@ -127,11 +127,16 @@ export class ReleaseFilter {
       .replace(/\.(?:mkv|mp4|avi|webm)$/i, "");
   }
 
+  private static readonly TRAILING_STAGE_OR_COUR_RANGE =
+    /\s*(?:[-:–~|/]+\s*)?(?:\d{1,2}(?:st|nd|rd|th)(?:\s*[-–—&]\s*\d{1,2}(?:st|nd|rd|th))*\s+(?:stage|cour|part)|(?:stage|cour|part)\s*\d{1,2}(?:\s*[-–—&]\s*\d{1,2})*)\s*$/i;
+
   private static extractSubtitledFranchise(raw: string): { franchise: string; subtitle: string; hasExplicitSeason: boolean } | null {
     const trimmed = raw.trim();
     if (!trimmed) return null;
-    const colon = trimmed.match(/^([^:]+):\s*(.+)$/);
-    const dashParts = !colon ? trimmed.split(/\s+[-–—]\s+/) : [];
+    const withoutStageSuffix = trimmed.replace(this.TRAILING_STAGE_OR_COUR_RANGE, "").trim();
+    const target = withoutStageSuffix || trimmed;
+    const colon = target.match(/^([^:]+):\s*(.+)$/);
+    const dashParts = !colon ? target.split(/\s+[-–—]\s+/) : [];
     const franchise = colon ? colon[1].trim() : dashParts.length > 1 ? dashParts.slice(0, -1).join(" ").trim() : "";
     const subtitle = colon ? colon[2].trim() : dashParts.length > 1 ? dashParts.at(-1)!.trim() : "";
     if (!franchise || !subtitle) return null;
@@ -215,9 +220,12 @@ export class ReleaseFilter {
       const title = this.normalizeSeriesTitle(raw ?? "");
       if (!title) return false;
       if (release === title) return true;
-      const seasonEnd = title.match(/ (\d{1,2}(?:st|nd|rd|th) season|season \d{1,2}|s\d{1,2})$/);
+      const seasonEnd = title.match(
+        / (\d{1,2}(?:st|nd|rd|th)(?: \d{1,2}(?:st|nd|rd|th))* (?:season|stage|cour|part)|(?:season|stage|cour|part) \d{1,2}(?: \d{1,2})*|s\d{1,2})$/,
+      );
       const baseTitle = seasonEnd ? title.slice(0, seasonEnd.index) : title;
-      const hasNamedSubtitle = Boolean(raw && this.extractSubtitledFranchise(raw));
+      const hasNamedSubtitle = Boolean(raw && this.extractSubtitledFranchise(raw)) ||
+        Boolean(seasonEnd && /\b(?:stage|cour|part)\b/.test(seasonEnd[1]));
       const titleEnd = this.seriesTitleEnd(release, baseTitle);
       if (titleEnd < 0) return false;
 
@@ -225,7 +233,8 @@ export class ReleaseFilter {
       const releaseSeason = suffix.match(seasonStart);
       if (releaseSeason) {
         const season = Number(releaseSeason[1] || releaseSeason[2] || releaseSeason[3]);
-        const expectedSeason = seasonEnd ? Number(seasonEnd[1].match(/\d+/)?.[0]) : null;
+        const isExplicitSeasonSuffix = Boolean(seasonEnd && /\b(?:season|s\d{1,2})\b/.test(seasonEnd[1]));
+        const expectedSeason = isExplicitSeasonSuffix ? Number(seasonEnd![1].match(/\d+/)?.[0]) : null;
         const allowsArcSeason = allowVerifiedSeason && hasNamedSubtitle && season > 1;
         if (expectedSeason !== null ? season !== expectedSeason : season !== 1 && !verifiedCourAlias && !allowsArcSeason) {
           return false;
@@ -234,7 +243,7 @@ export class ReleaseFilter {
       } else if (seasonEnd && !allowUnmarkedSeason) {
         return false;
       } else if (/^\d/.test(beforeEpisode.slice(titleEnd).trimStart()) ||
-                 /^\d{1,4} (?:(?:s\d{1,2} ?)?e(?:p(?:isode)?)? ?\d+)/.test(suffix)) {
+        /^\d{1,4} (?:(?:s\d{1,2} ?)?e(?:p(?:isode)?)? ?\d+)/.test(suffix)) {
         // A number in the title before the explicit episode separator can denote a different series.
         return false;
       }
@@ -244,6 +253,34 @@ export class ReleaseFilter {
       return afterPaired !== suffix && (!afterPaired || releaseSuffix.test(afterPaired));
     });
     if (directMatch) return true;
+
+    // Match swapped two-part colon titles when both halves are distinctive (e.g. "Steel Ball Run: JoJo no Kimyou na Bouken"
+    // vs "JoJo no Kimyou na Bouken: Steel Ball Run" or "STEEL BALL RUN JoJo no Kimyou na Bouken 2nd - 3rd STAGE").
+    const swappedMatch = knownTitles.some(raw => {
+      if (!raw) return false;
+      const strippedRaw = raw
+        .trim()
+        .replace(/\s*(?:[-:–~|/]+\s*)?(?:\d{1,2}(?:st|nd|rd|th)(?:\s*[-–—&]\s*\d{1,2}(?:st|nd|rd|th))*\s+(?:stage|cour|part)|(?:stage|cour|part)\s*\d{1,2}(?:\s*[-–—&]\s*\d{1,2})*)\s*$/i, "")
+        .trim();
+      const split = this.extractSubtitledFranchise(strippedRaw);
+      if (!split) return false;
+      const partA = this.normalizeSeriesTitle(split.franchise);
+      const partB = this.normalizeSeriesTitle(split.subtitle);
+      if (!partA || !partB || partA.split(" ").length < 2 || partB.split(" ").length < 2) return false;
+      const swapped = `${partB} ${partA}`;
+      const titleEnd = this.seriesTitleEnd(release, swapped);
+      if (titleEnd < 0) return false;
+      let suffix = release.slice(titleEnd).trimStart();
+      const releaseSeason = suffix.match(seasonStart);
+      if (releaseSeason) {
+        const season = Number(releaseSeason[1] || releaseSeason[2] || releaseSeason[3]);
+        if (season !== 1 && !allowVerifiedSeason && !verifiedCourAlias) return false;
+        suffix = suffix.slice(releaseSeason[0].length).trimStart();
+      }
+      if (!allowUnmarkedSeason && strippedRaw !== raw.trim()) return false;
+      return !suffix || releaseSuffix.test(suffix);
+    });
+    if (swappedMatch) return true;
 
     // Match explicitly numbered colon-prefixes (e.g. "Douluo Dalu II - Soul Land 2 - 178" against "Douluo Dalu 2: Jueshi Tangmen" / "Soul Land 2: ...").
     if (numberedPrefixes.length > 0) {
@@ -266,23 +303,30 @@ export class ReleaseFilter {
     }
 
     // For provider ID-verified releases (Tsukihime anime_id or AnimeTosho anidb_aid), allow standard TVDB/scene
-    // "Franchise S04E08" naming (e.g. ToonsHub/VARYG/Judas) against subtitled sequel arcs like "Tokyo Revengers: Santen Sensou-hen",
-    // strictly requiring S02+ and rejecting conflicting trailing arc subtitles.
+    // "Franchise S04E08" naming (e.g. ToonsHub/VARYG/Judas) against subtitled sequel arcs like "Tokyo Revengers: Santen Sensou-hen"
+    // or "Steel Ball Run: JoJo's Bizarre Adventure", strictly requiring S02+ and rejecting conflicting trailing arc subtitles.
     if (allowVerifiedSeason && !this.hasConflictingArcParen(releaseName, knownTitles)) {
       const matchedFranchiseSeason = knownTitles.some(raw => {
         if (!raw) return false;
         const split = this.extractSubtitledFranchise(raw);
         if (!split || split.hasExplicitSeason) return false;
-        const franchise = this.normalizeSeriesTitle(split.franchise);
-        const titleEnd = this.seriesTitleEnd(release, franchise);
-        if (titleEnd < 0) return false;
-        let suffix = release.slice(titleEnd).trimStart();
-        const releaseSeason = suffix.match(seasonStart);
-        if (!releaseSeason) return false;
-        const season = Number(releaseSeason[1] || releaseSeason[2] || releaseSeason[3]);
-        if (season < 2) return false;
-        suffix = suffix.slice(releaseSeason[0].length).trimStart();
-        return !suffix || releaseSuffix.test(suffix);
+        const candidates = [this.normalizeSeriesTitle(split.franchise)];
+        const normalizedSub = this.normalizeSeriesTitle(split.subtitle);
+        if (normalizedSub && normalizedSub.split(" ").length >= 2) {
+          candidates.push(normalizedSub);
+        }
+        return candidates.some(franchise => {
+          if (!franchise) return false;
+          const titleEnd = this.seriesTitleEnd(release, franchise);
+          if (titleEnd < 0) return false;
+          let suffix = release.slice(titleEnd).trimStart();
+          const releaseSeason = suffix.match(seasonStart);
+          if (!releaseSeason) return false;
+          const season = Number(releaseSeason[1] || releaseSeason[2] || releaseSeason[3]);
+          if (season < 2) return false;
+          suffix = suffix.slice(releaseSeason[0].length).trimStart();
+          return !suffix || releaseSuffix.test(suffix);
+        });
       });
       if (matchedFranchiseSeason) return true;
     }
@@ -297,12 +341,13 @@ export class ReleaseFilter {
   ): { relativeEpisode?: number } | undefined {
     const namedCourTitles = knownTitles.flatMap(raw => {
       if (!raw) return [];
+      const cleaned = raw.trim().replace(this.TRAILING_STAGE_OR_COUR_RANGE, "").trim() || raw.trim();
       const entries: { title: string; franchise: string }[] = [];
-      const dashParts = raw.trim().split(/\s+[-–—]\s+/);
+      const dashParts = cleaned.split(/\s+[-–—]\s+/);
       if (dashParts.length > 1) {
         entries.push({ title: raw, franchise: dashParts.slice(0, -1).join(" ") });
       }
-      const colon = raw.trim().match(/^([^:]+):\s*(.+)$/);
+      const colon = cleaned.match(/^([^:]+):\s*(.+)$/);
       if (colon && colon[1].trim() && colon[2].trim()) {
         entries.push({ title: raw, franchise: colon[1].trim() });
       }
@@ -313,19 +358,33 @@ export class ReleaseFilter {
     const franchiseTitles = Array.from(new Set(namedCourTitles.map(cour => cour.franchise)));
     const aliases = releaseName.matchAll(/(?:\(([^()]*)\)|\[([^\[\]]*)\])(?=(?:\s*(?:\([^()]*\)|\[[^\]]*\]))*\s*$)/g);
     for (const alias of aliases) {
-      const aliasTitle = alias[1] ?? alias[2];
+      const rawAliasTitle = alias[1] ?? alias[2];
+      // Strip trailing audio/sub tag clauses inside the same parenthesis (e.g. "(JoJo no Kimyou na Bouken: Steel Ball Run, Dual-Audio, Multi-Subs)")
+      const aliasTitle = rawAliasTitle
+        .replace(/(?:,\s*(?:dual[\s._-]*audio|multi[\s._-]*(?:audio|subs?|dub)|english[\s._-]*dub|eng[\s._-]*dub|subbed|dubbed|weekly|uncensored|censored))+\s*$/i, "")
+        .trim();
       const normalizedAlias = this.normalizeSeriesTitle(aliasTitle);
       const leadingTitle = releaseName.slice(0, alias.index);
       for (const { title } of namedCourTitles) {
         if (this.matchesSplitCourTitle(leadingTitle, normalizedAlias, title)) return {};
         const end = this.seriesTitleEnd(normalizedAlias, this.normalizeSeriesTitle(title));
-        if (end < 0) continue;
-        const suffix = normalizedAlias.slice(end).trim();
-        const episode = suffix.match(/^(?:(?:s(\d{1,2}) ?)?e(?:p(?:isode)?)? ?)?(\d{1,4})(?:v\d+)?$/);
-        if (suffix && (!episode || Number(episode[1]) === 0 || Number(episode[2]) === 0)) continue;
-        if (!this.matchesLeadingSeriesTitle(aliasTitle, [title], true, true)) continue;
-        if (this.matchesLeadingSeriesTitle(leadingTitle, franchiseTitles, allowUnmarkedSeason, true)) {
-          return { relativeEpisode: episode ? Number(episode[2]) : undefined };
+        if (end >= 0) {
+          const suffix = normalizedAlias.slice(end).trim();
+          const episode = suffix.match(/^(?:(?:s(\d{1,2}) ?)?e(?:p(?:isode)?)? ?)?(\d{1,4})(?:v\d+)?$/);
+          if (suffix && (!episode || Number(episode[1]) === 0 || Number(episode[2]) === 0)) continue;
+          if (!this.matchesLeadingSeriesTitle(aliasTitle, [title], true, true)) continue;
+          if (this.matchesLeadingSeriesTitle(leadingTitle, franchiseTitles, allowUnmarkedSeason, true)) {
+            return { relativeEpisode: episode ? Number(episode[2]) : undefined };
+          }
+          continue;
+        }
+        // Also support verified full alias inside parens when the leading title is the franchise + S02+E##
+        // (e.g. "[ToonsHub] JoJos Bizarre Adventure S06E10 ... (JoJo no Kimyou na Bouken: Steel Ball Run, Dual-Audio, Multi-Subs)")
+        if (allowUnmarkedSeason && this.matchesLeadingSeriesTitle(aliasTitle, [title], true, true, true)) {
+          const leadingNorm = this.normalizeSeriesTitle(leadingTitle);
+          if (/\bs0?[2-9]\s*e0*[1-9]\d*\b|\bs[1-9]\d\s*e0*[1-9]\d*\b/.test(leadingNorm)) {
+            return {};
+          }
         }
       }
     }
@@ -352,7 +411,7 @@ export class ReleaseFilter {
     if (!knownTitles || knownTitles.length === 0) return [];
     const variants = new Set<string>();
     const trailingSeasonSuffixRx =
-      /\s*(?:[-:–~|/]+\s*)?(?:(?:\d+(?:st|nd|rd|th)\s+Season)|(?:Season\s*\d+)|(?:S\d+)|(?:Part\s*\d+)|(?:Cour\s*\d+))\s*$/i;
+      /\s*(?:[-:–~|/]+\s*)?(?:(?:\d+(?:st|nd|rd|th)(?:\s*[-–—&]\s*\d+(?:st|nd|rd|th))*\s+(?:Season|Stage|Cour|Part))|(?:(?:Season|Stage|Part|Cour)\s*\d+(?:\s*[-–—&]\s*\d+)?)|(?:S\d+))\s*$/i;
 
     for (const raw of knownTitles) {
       if (!raw) continue;
@@ -678,10 +737,10 @@ export class ReleaseFilter {
 
     const relativeEpisode = !isBatch && knownTitles?.length && singleEp !== null
       ? this.findTrailingCourAlias(
-          this.releaseName(titleClean),
-          knownTitles,
-          item?.provider === "tsukihime" || Number(item?.anidb_aid) > 0,
-        )?.relativeEpisode
+        this.releaseName(titleClean),
+        knownTitles,
+        item?.provider === "tsukihime" || Number(item?.anidb_aid) > 0,
+      )?.relativeEpisode
       : undefined;
 
     return {
@@ -772,6 +831,7 @@ export class ReleaseFilter {
     totalExpectedEps?: number | null,
     item?: AnimeToshoItem,
     knownTitles?: (string | null | undefined)[],
+    expectedOffset?: number,
   ): boolean {
     if (parsed.isWeirdOrPromo || parsed.isUnsupportedContainer) return false;
     if (parsed.isCam && !ALLOW_CAM) return false;
@@ -812,9 +872,9 @@ export class ReleaseFilter {
     if (!parsed.isBatch) {
       if (parsed.singleEp === null) return false;
       const indexed = this.providerEpisode(item);
-      const relative = this.mappedRelativeEpisode(parsed, item, totalExpectedEps, knownTitles);
+      const relative = this.mappedRelativeEpisode(parsed, item, totalExpectedEps, knownTitles, expectedOffset);
       if ((parsed.relativeEpisode !== undefined && relative === undefined) ||
-          (indexed !== undefined && indexed !== parsed.singleEp && indexed !== relative)) return false;
+        (indexed !== undefined && indexed !== parsed.singleEp && indexed !== relative)) return false;
       return parsed.singleEp === targetEpNum || relative === targetEpNum;
     }
 
@@ -852,6 +912,7 @@ export class ReleaseFilter {
     langType: string,
     knownTitles?: (string | null | undefined)[],
     totalExpectedEps?: number | null,
+    expectedOffset?: number,
   ): number {
     if (!this.matchesCandidateTitle(item, knownTitles)) return -10_000;
     const parsed = this.parseTitle(item.title || "", knownTitles, item);
@@ -859,7 +920,7 @@ export class ReleaseFilter {
     const seeders = item.seeders || 0;
     const isSeadex = Boolean(item.is_seadex);
 
-    if (!this.matchesTarget(parsed, targetEp, langType, numFiles, totalExpectedEps, item, knownTitles)) {
+    if (!this.matchesTarget(parsed, targetEp, langType, numFiles, totalExpectedEps, item, knownTitles, expectedOffset)) {
       return -10000;
     }
 
@@ -917,7 +978,7 @@ export class ReleaseFilter {
         !parsed.isBatch &&
         numFiles === 1;
       if (!parsed.isBatch && numFiles === 1 &&
-          (parsed.singleEp === targetEpNum || parsed.relativeEpisode === targetEpNum || isTsukihimeEpMatch)) {
+        (parsed.singleEp === targetEpNum || parsed.relativeEpisode === targetEpNum || isTsukihimeEpMatch)) {
         score += 120;
         if (isTsukihimeEpMatch) score += 15;
       } else if (parsed.isBatch || numFiles > 1) {
@@ -964,6 +1025,7 @@ export class ReleaseFilter {
     item?: AnimeToshoItem,
     expectedCount?: number | null,
     knownTitles?: (string | null | undefined)[],
+    expectedOffset?: number,
   ): number | undefined {
     const absolute = parsed.singleEp;
     if (parsed.isBatch || absolute === null) return;
@@ -971,13 +1033,16 @@ export class ReleaseFilter {
     const alias = parsed.relativeEpisode;
     if (alias !== undefined) {
       if (alias <= absolute && (!expectedCount || alias <= expectedCount) &&
-          (indexed === undefined || indexed === alias || indexed === absolute)) return alias;
+        (indexed === undefined || indexed === alias || indexed === absolute)) return alias;
       return;
     }
+    if (expectedOffset && expectedOffset > 0 && indexed !== undefined && absolute - indexed === expectedOffset) {
+      return indexed;
+    }
     const continuation = !knownTitles?.length || knownTitles.some(title =>
-      title && (/\s[-–—]\s/.test(title) || /\b(?:season\s*\d+|\d+(?:st|nd|rd|th)\s+season|part\s*\d+|cour\s*\d+|s\d+)$/i.test(title.trim())));
+      title && (/\s[-–—]\s/.test(title) || /\b(?:season\s*\d+|\d+(?:st|nd|rd|th)\s+(?:season|stage|cour|part)|stage\s*\d+|part\s*\d+|cour\s*\d+|s\d+)$/i.test(title.trim())));
     if (indexed !== undefined && continuation && expectedCount && indexed <= expectedCount && absolute > expectedCount &&
-        this.VALID_COUR_OFFSETS.has(absolute - indexed)) return indexed;
+      this.VALID_COUR_OFFSETS.has(absolute - indexed)) return indexed;
   }
 
   public static inferCumulativeOffsets(
@@ -1038,6 +1103,7 @@ export class ReleaseFilter {
       knownTitles?: (string | null | undefined)[];
       totalExpectedEps?: number | null;
       episodeOffset?: number;
+      strictEpisodeOffset?: boolean;
       maxBundles?: number;
       minSeeders?: number;
     } = {},
@@ -1046,19 +1112,21 @@ export class ReleaseFilter {
       knownTitles,
       totalExpectedEps,
       episodeOffset = 0,
+      strictEpisodeOffset = false,
       maxBundles = 5,
       minSeeders = DEFAULT_MIN_SEEDERS,
     } = options;
     const isSingleEpTarget = String(targetEp).toLowerCase() !== "all";
     const target = Number(targetEp);
     if (isSingleEpTarget && (!Number.isSafeInteger(target) || target < 0 ||
-        (typeof targetEp === "string" && !/^\d+$/.test(targetEp)) ||
-        (totalExpectedEps && totalExpectedEps > 0 && target > totalExpectedEps))) return [];
+      (typeof targetEp === "string" && !/^\d+$/.test(targetEp)) ||
+      (totalExpectedEps && totalExpectedEps > 0 && target > totalExpectedEps))) return [];
 
     const blocked = new Set(torrentList.filter(item => this.hasWatermarkedSource(item.title)).map(item => this.torrentKey(item)));
     const eligibleTorrents = torrentList.filter(item =>
       !blocked.has(this.torrentKey(item)) && this.matchesCandidateTitle(item, knownTitles));
-    const candidatesToTry: (number | string)[] = [targetEp];
+    const useStrictOffset = isSingleEpTarget && episodeOffset > 0 && strictEpisodeOffset;
+    const candidatesToTry: (number | string)[] = useStrictOffset ? [target + episodeOffset] : [targetEp];
     const absoluteMatches = new Set<number>();
 
     if (isSingleEpTarget) {
@@ -1067,9 +1135,11 @@ export class ReleaseFilter {
         const parsed = this.parseTitle(item.title, knownTitles, item);
         if (parsed.isWeirdOrPromo || parsed.isBonusOrExtra || parsed.isUnsupportedContainer) continue;
         if (parsed.singleEp !== null && parsed.singleEp > target &&
-            this.mappedRelativeEpisode(parsed, item, totalExpectedEps, knownTitles) === target) absoluteMatches.add(parsed.singleEp);
+          this.mappedRelativeEpisode(parsed, item, totalExpectedEps, knownTitles, episodeOffset || undefined) === target) {
+          absoluteMatches.add(parsed.singleEp);
+        }
       }
-      if (episodeOffset && episodeOffset > 0) {
+      if (!useStrictOffset && episodeOffset && episodeOffset > 0) {
         candidatesToTry.unshift(target + episodeOffset);
       }
       const inferredOffsets = episodeOffset > 0 ? [] : this.inferCumulativeOffsets(
@@ -1101,7 +1171,7 @@ export class ReleaseFilter {
     >();
 
     for (const candidateEp of candidatesToTry) {
-      const isDirectMatch = candidateEp === targetEp;
+      const isDirectMatch = !useStrictOffset && candidateEp === targetEp;
       for (const t of eligibleTorrents) {
         let score = this.scoreTorrent(
           t,
@@ -1109,21 +1179,30 @@ export class ReleaseFilter {
           langType,
           knownTitles,
           totalExpectedEps,
+          episodeOffset > 0 ? episodeOffset : undefined,
         );
         if (score > 0) {
           if (isDirectMatch) {
             score += 15;
           }
           const parsed = this.parseTitle(t.title || "", knownTitles, t);
-          const relative = this.mappedRelativeEpisode(parsed, t, totalExpectedEps, knownTitles);
+          const relative = this.mappedRelativeEpisode(
+            parsed,
+            t,
+            totalExpectedEps,
+            knownTitles,
+            episodeOffset > 0 ? episodeOffset : undefined,
+          );
           if (isSingleEpTarget) {
             if (relative !== undefined && relative !== target) continue;
             if (relative === target && parsed.singleEp !== target &&
-                (episodeOffset > 0 ? parsed.singleEp !== target + episodeOffset : absoluteMatches.size > 1)) continue;
+              (episodeOffset > 0 ? parsed.singleEp !== target + episodeOffset : absoluteMatches.size > 1)) continue;
           }
-          // A scoped provider may omit the expected season marker only for a verified cumulative number,
+          // A scoped provider may omit the expected season/stage marker for a verified cumulative offset,
           // while an explicit S02+ season tag on a verified provider entry is allowed for subtitled sequel arcs.
+          const verifiedOffsetRelease = useStrictOffset && this.isVerifiedProviderItem(t);
           if (relative === undefined && knownTitles?.length && !this.matchesSeriesTitle(t.title, knownTitles, {
+            allowUnmarkedSeason: verifiedOffsetRelease,
             allowVerifiedSeason: this.isVerifiedProviderItem(t),
           })) continue;
           const effectiveEpForFile = relative === target && parsed.singleEp !== null ? parsed.singleEp : candidateEp;
@@ -1284,6 +1363,7 @@ export class ReleaseFilter {
       knownTitles?: (string | null | undefined)[];
       totalExpectedEps?: number | null;
       episodeOffset?: number;
+      strictEpisodeOffset?: boolean;
       maxCandidates?: number;
       minSeeders?: number;
     } = {},
@@ -1303,6 +1383,7 @@ export class ReleaseFilter {
       knownTitles?: (string | null | undefined)[];
       totalExpectedEps?: number | null;
       episodeOffset?: number;
+      strictEpisodeOffset?: boolean;
       minSeeders?: number;
     } = {},
   ): [AnimeToshoItem | null, number | string] {
@@ -1398,10 +1479,10 @@ export class ReleaseFilter {
         const file = segments.at(-1)!;
         const folders = segments.slice(0, -1);
         if (folders.some(segment => /^(?:extras?|bonus|samples?|specials?|ncop|nced)$/i.test(segment) ||
-            /^(?:s|season\s*)0+$/i.test(segment))) continue;
+          /^(?:s|season\s*)0+$/i.test(segment))) continue;
         const parsed = this.parseTitle(file, knownTitles);
         if (parsed.isBatch || parsed.isBonusOrExtra || parsed.isUnsupportedContainer ||
-            this.WEIRD_OR_PROMO_PATTERN.test(file) || (parsed.isCam && !ALLOW_CAM)) continue;
+          this.WEIRD_OR_PROMO_PATTERN.test(file) || (parsed.isCam && !ALLOW_CAM)) continue;
         if (parsed.seasonNum !== null && torrent?.seasonNum != null && parsed.seasonNum !== expectedSeason) continue;
 
         const namedFile = this.matchesSeriesTitle(file, knownTitles, titleMatch);
@@ -1413,7 +1494,7 @@ export class ReleaseFilter {
             const number = folder.match(/^(?:s|season\s*)0*(\d{1,2})$/i);
             const series = folders.at(-2);
             if (!number || Number(number[1]) !== expectedSeason || !series ||
-                !this.matchesSeriesTitle(series, knownTitles, titleMatch)) continue;
+              !this.matchesSeriesTitle(series, knownTitles, titleMatch)) continue;
           }
           let bareName = file.replace(/\.(?:mkv|mp4|avi|webm)$/i, "").trim();
           const group = bareName.match(/^\[([^\]]+)\]\s*/);
@@ -1428,7 +1509,7 @@ export class ReleaseFilter {
         verifiedEpisodes.add(episode);
         if (!allowWatermarkedSource && this.hasWatermarkedSource(relPath)) continue;
         if (expected !== null && (episode !== expected ||
-            (parsed.relativeEpisode !== undefined && parsed.relativeEpisode !== target))) continue;
+          (parsed.relativeEpisode !== undefined && parsed.relativeEpisode !== target))) continue;
 
         const key = target ?? episode;
         if (seenEpisodes.has(key)) {

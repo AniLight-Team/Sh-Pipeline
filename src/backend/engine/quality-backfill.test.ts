@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { createHash, randomInt } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -27,7 +26,81 @@ test("stored source staging checks checksum and transfer size", async t => {
   await assert.rejects(stageStored1080p({ ...source, url: "https://example.test/1080p.mp4" }, path.join(scratch, "external.mp4"), media.length), /Hugging Face/);
 });
 
-test("VM release seeds independent quality retries once and reuses stored 1080p when searches expire", { skip: !testDb }, async t => {
+test("fetchMissingBackfillQualities returns ordered missing lower qualities or null when source changed", async t => {
+  const { fetchMissingBackfillQualities, missingBackfillQualities } = await import("./quality-backfill.js");
+  assert.deepEqual(missingBackfillQualities([{ quality: "1080p", url: sourceUrl }]), ["720p", "480p"]);
+  assert.deepEqual(
+    missingBackfillQualities([{ quality: "1080p", url: sourceUrl }, { quality: "720p", url: sourceUrl }]),
+    ["480p"],
+  );
+  assert.deepEqual(
+    missingBackfillQualities([
+      { quality: "1080p", url: sourceUrl },
+      { quality: "720p", url: sourceUrl },
+      { quality: "480p", url: sourceUrl },
+    ]),
+    [],
+  );
+
+  let mockResponse: unknown = { status: "ready", missingQualities: ["480p", "720p"], sourceUrl };
+  t.mock.method(globalThis, "fetch", async () => Response.json(mockResponse));
+  const stream = { animeId: 1, anilistId: 2, anidbId: 3, episodeNumber: 4, type: "sub" as const, sourceJobId: 10, sourceUrl };
+
+  // Returned in canonical descending order ["720p", "480p"]
+  assert.deepEqual(await fetchMissingBackfillQualities(stream), ["720p", "480p"]);
+
+  mockResponse = { status: "source_changed", missingQualities: [] };
+  assert.equal(await fetchMissingBackfillQualities(stream), null);
+
+  mockResponse = { status: "ready", missingQualities: ["480p"], sourceUrl: "https://other.test/1080p.mp4" };
+  await assert.rejects(fetchMissingBackfillQualities(stream), /Invalid published quality status/);
+});
+
+test("Kaggle GPU kernel script preserves exact 1080p/720p/480p scale filters and quality labels for full and backfill encodes", async () => {
+  const { VideoEncodingManager } = await import("./video.manager.js");
+  const manager = new VideoEncodingManager();
+
+  const hf = { owner: "anilight", bucket: "store", token: "hf_test" };
+  const script = manager.generateBatchGpuKernelScript([
+    {
+      jobId: 101,
+      filename: "job_101_1080p.mp4",
+      mode: "transcode",
+      outputQualities: ["720p", "480p"],
+      animeId: 8785,
+      episodeNumber: 9,
+      tracks: [["sub", 0]],
+      hf,
+    },
+    {
+      jobId: 102,
+      filename: "job_102_source.mkv",
+      mode: "transcode",
+      animeId: 8785,
+      episodeNumber: 10,
+      tracks: [["sub", 0], ["dub", 1]],
+      hf,
+    },
+  ]);
+
+  // Manifest embeds exact lower-quality targets for backfill job and omits them for full 3-quality encode
+  assert.match(script, /"jobId":101.*"outputQualities":\["720p","480p"\]/);
+  assert.ok(!/"jobId":102[^}]*"outputQualities"/.test(script));
+
+  // Verify exact scaling, stream maps, NVENC targets, and quality label assignments
+  assert.ok(script.includes('qualities = ("1080p", "720p", "480p")'));
+  assert.ok(script.includes('qualities = tuple(q for q in ("720p", "480p") if q in requested_qualities)'));
+  assert.ok(script.includes('scale=-2:720:flags={lanczos_flags},format=yuv420p,split=2[b720][s720];'));
+  assert.ok(script.includes('[s720]scale=-2:480:flags={lanczos_flags},format=yuv420p[b480];'));
+  assert.ok(script.includes('"-map", "[out720]", "-map", "3:a:0"] + nvenc_720'));
+  assert.ok(script.includes('"-map", "[out480]", "-map", "3:a:0"] + nvenc_480'));
+  assert.ok(script.includes('"-map", "[out1080]", "-map", "4:a:0"] + nvenc_1080'));
+  assert.ok(script.includes('"-map", f"[out{quality[:-1]}]", "-map", "2:a:0"] + nvenc_args'));
+  assert.ok(script.includes('"quality": q_name'));
+  assert.ok(script.includes('remote_path = f"{f1}/{f2}/{q_name}.mp4"'));
+});
+
+test("VM release seeds one direct-to-GPU multi-quality backfill job and skips torrent searches completely", { skip: !testDb }, async t => {
   const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "kira-backfill-test-"));
   process.env.KIRA_STAGING_DIR = scratch;
   process.env.KIRA_EXECUTION_POLICY = "all";
@@ -36,7 +109,6 @@ test("VM release seeds independent quality retries once and reuses stored 1080p 
   const { PipelineEngineService } = await import("./service.js");
   const { AnimeToshoClient } = await import("./animetosho.client.js");
   const { TsukihimeClient } = await import("./tsukihime.client.js");
-  const { QUALITY_BACKFILL_SEARCH_DELAYS_MS } = await import("./job-scheduling.js");
   const animeId = randomInt(100_000_000, 2_000_000_000);
   t.after(async () => {
     try { await db.delete(schema.pipelineJob).where(eq(schema.pipelineJob.animeId, animeId)); }
@@ -51,13 +123,9 @@ test("VM release seeds independent quality retries once and reuses stored 1080p 
   t.mock.method(PipelineEngineService, "checkStorageCapacityForDownload", async () => ({
     allowed: true, usedBytes: 0, reservedBytes: 0, freeDiskBytes: 64 * 1024 ** 3,
   }));
-  t.mock.method(TsukihimeClient, "fetchTorrents", async () => ({ anime: null, torrents: [] }));
-  t.mock.method(TsukihimeClient, "hydrateCandidates", async (entries: Parameters<typeof TsukihimeClient.hydrateCandidates>[0]) => entries);
-  let torrentAvailable = false;
-  const lowerTitle = "[SubsPlease] Example Anime - 02 (720p) [ABCDEF01].mkv";
-  const search = t.mock.method(AnimeToshoClient, "fetchTorrents", async (_aid: number, quality: string) =>
-    quality === "720p" && torrentAvailable ? [{ title: lowerTitle, seeders: 10, info_hash: "1".repeat(40) }] : []);
-  t.mock.method(AnimeToshoClient, "fetchTorrentsByTitle", async () => []);
+  const tsukiSearch = t.mock.method(TsukihimeClient, "fetchTorrents", async () => ({ anime: null, torrents: [] }));
+  const aniDbSearch = t.mock.method(AnimeToshoClient, "fetchTorrents", async () => []);
+  const titleSearch = t.mock.method(AnimeToshoClient, "fetchTorrentsByTitle", async () => []);
   let storedDownloads = 0;
   t.mock.method(globalThis, "fetch", async (request: Parameters<typeof fetch>[0]) => {
     const url = String(request);
@@ -77,49 +145,32 @@ test("VM release seeds independent quality retries once and reuses stored 1080p 
     metadata: { kind: "release", callbackDelivered: false },
     resultPayload: { type: "sub", kind: "release", sources: [{ quality: "1080p", url: sourceUrl, sha256, sizeBytes: media.length }] },
   }).returning();
+
   assert.equal(await PipelineEngineService.retryJobCallback(parent.id), true);
   assert.equal(await PipelineEngineService.retryJobCallback(parent.id, true), true);
+
   const allJobs = await db.query.pipelineJob.findMany({ where: eq(schema.pipelineJob.animeId, animeId) });
-  assert.equal(allJobs.length, 3);
-  const children = allJobs.filter(row => row.metadata?.kind === "quality_backfill");
-  const lower720 = children.find(row => row.metadata?.targetQuality === "720p")!;
-  const lower480 = children.find(row => row.metadata?.targetQuality === "480p")!;
-  const lookup = (id: number) => db.query.pipelineJob.findFirst({ where: eq(schema.pipelineJob.id, id) });
-  const makeDue = (id: number) => db.update(schema.pipelineJob).set({ discoverAfter: new Date(0) }).where(eq(schema.pipelineJob.id, id));
-  assert.ok(lower720.discoverAfter && lower720.discoverAfter > new Date());
-  assert.equal((await PipelineEngineService.discoverAndStageJob(lower720.id)).status, "skipped");
-  assert.equal(search.mock.callCount(), 0);
-  await makeDue(lower720.id);
-  assert.equal((await PipelineEngineService.discoverAndStageJob(lower720.id)).status, "retry_scheduled");
-  assert.equal((await lookup(lower720.id))?.metadata?.qualitySearchAttempts, 1);
+  assert.equal(allJobs.length, 2, "Should create exactly one combined GPU backfill job per track");
+  const backfillJob = allJobs.find(row => row.metadata?.kind === "quality_backfill")!;
+  assert.equal(backfillJob.pipelineType, "kaggle_gpu");
+  assert.equal(backfillJob.discoverAfter, null);
+  assert.deepEqual(backfillJob.metadata?.targetQualities, ["720p", "480p"]);
 
-  const fixture = path.join(scratch, "720p.mkv");
-  execFileSync("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "color=s=1280x720:d=1", "-f", "lavfi", "-i",
-    "sine=frequency=440:duration=1", "-c:v", "libx264", "-c:a", "aac", "-metadata:s:a:0", "language=jpn", fixture]);
-  torrentAvailable = true;
-  const transfer = t.mock.method(PipelineEngineService as any, "downloadCandidateEpisodeToStaging", async () => ({
-    ok: true, stagedPath: fixture, sizeBytes: (await fs.stat(fixture)).size, magnetUri: "fixture",
-  }));
-  await makeDue(lower720.id);
-  assert.equal((await PipelineEngineService.discoverAndStageJob(lower720.id)).pipelineType, "vm_remux");
-  assert.deepEqual((await lookup(lower720.id))?.stagedQualities, { "720p": fixture });
-  assert.equal(transfer.mock.callCount(), 1);
-  assert.equal(storedDownloads, 0);
-
-  for (let round = 0; round < QUALITY_BACKFILL_SEARCH_DELAYS_MS.length; round++) {
-    await makeDue(lower480.id);
-    const result = await PipelineEngineService.discoverAndStageJob(lower480.id);
-    if (round + 1 < QUALITY_BACKFILL_SEARCH_DELAYS_MS.length) {
-      assert.equal(result.status, "retry_scheduled");
-      assert.equal(storedDownloads, 0);
-    } else {
-      assert.equal(result.pipelineType, "kaggle_gpu");
-    }
-    assert.equal((await lookup(lower480.id))?.metadata?.qualitySearchAttempts, round + 1);
-  }
-  const gpu = await lookup(lower480.id);
+  const staged = await PipelineEngineService.discoverAndStageJob(backfillJob.id);
+  assert.equal(staged.status, "staged");
+  assert.equal(staged.pipelineType, "kaggle_gpu");
+  assert.equal(tsukiSearch.mock.callCount(), 0, "Backfill must never waste time searching Tsukihime");
+  assert.equal(aniDbSearch.mock.callCount(), 0, "Backfill must never waste time searching AnimeTosho by AniDB");
+  assert.equal(titleSearch.mock.callCount(), 0, "Backfill must never waste time searching AnimeTosho by title");
   assert.equal(storedDownloads, 1);
+
+  const gpu = await db.query.pipelineJob.findFirst({ where: eq(schema.pipelineJob.id, backfillJob.id) });
+  assert.equal(gpu?.qualityCount, 2);
+  assert.deepEqual(gpu?.metadata?.targetQualities, ["720p", "480p"]);
   assert.deepEqual(gpu?.tracksConfig, [["sub", 0]]);
   assert.deepEqual(await fs.readFile(gpu?.stagedFilePath ?? ""), media);
-  assert.deepEqual((await lookup(parent.id))?.resultPayload, parent.resultPayload);
+  assert.deepEqual(
+    (await db.query.pipelineJob.findFirst({ where: eq(schema.pipelineJob.id, parent.id) }))?.resultPayload,
+    parent.resultPayload,
+  );
 });

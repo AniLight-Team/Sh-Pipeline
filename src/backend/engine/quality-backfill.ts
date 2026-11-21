@@ -12,10 +12,9 @@ export function missingBackfillQualities(sources: PipelineEncodedSource[]) {
   return BACKFILL_QUALITIES.filter(quality => !sources.some(source => source.quality === quality));
 }
 
-export async function isBackfillQualityMissing(
+export async function fetchMissingBackfillQualities(
   stream: Pick<PipelineEpisodeResult, "animeId" | "anilistId" | "anidbId" | "episodeNumber" | "type" | "sourceJobId" | "sourceUrl">,
-  quality: BackfillQuality,
-) {
+): Promise<BackfillQuality[] | null> {
   const response = await fetch(`${MAIN_BACKEND_URL}/api/internal/pipeline/quality-backfill/status`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-internal-secret": INTERNAL_SECRET },
@@ -25,11 +24,19 @@ export async function isBackfillQualityMissing(
   });
   if (!response.ok) throw new Error(`Could not check published qualities (HTTP ${response.status})`);
   const result = await response.json() as { status?: string; missingQualities?: BackfillQuality[]; sourceUrl?: string };
-  if (result.status === "source_changed") return false;
+  if (result.status === "source_changed") return null;
   if (result.status !== "ready" || result.sourceUrl !== stream.sourceUrl || !Array.isArray(result.missingQualities)) {
     throw new Error("Invalid published quality status from Main API");
   }
-  return result.missingQualities.includes(quality);
+  return BACKFILL_QUALITIES.filter(q => result.missingQualities!.includes(q));
+}
+
+export async function isBackfillQualityMissing(
+  stream: Pick<PipelineEpisodeResult, "animeId" | "anilistId" | "anidbId" | "episodeNumber" | "type" | "sourceJobId" | "sourceUrl">,
+  quality: BackfillQuality,
+) {
+  const missing = await fetchMissingBackfillQualities(stream);
+  return Boolean(missing?.includes(quality));
 }
 
 export async function stageStored1080p(

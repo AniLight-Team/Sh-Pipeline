@@ -101,7 +101,21 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
   );
   const processingMode = hasAssignedPipeline ? (job.metadata?.processingMode || job.pipelineType) : null;
   const jobKind = job.metadata?.kind;
-  const backfillTargetQuality = jobKind === "quality_backfill" ? job.metadata?.targetQuality : null;
+  const backfillTargetQualities: string[] =
+    jobKind === "quality_backfill"
+      ? Array.isArray(job.metadata?.targetQualities) && job.metadata.targetQualities.length > 0
+        ? job.metadata.targetQualities.map(String)
+        : job.metadata?.targetQuality
+          ? [String(job.metadata.targetQuality)]
+          : []
+      : [];
+  const episodeOffset = Number(job.metadata?.episodeOffset);
+  const hasEpisodeOffset = Number.isSafeInteger(episodeOffset) && episodeOffset > 0;
+  const effectiveEpisodeNumber =
+    Number(job.metadata?.effectiveEpisodeNumber) ||
+    (hasEpisodeOffset ? Number(job.episodeNumber) + episodeOffset : null);
+  const episodeOffsetReason =
+    typeof job.metadata?.episodeOffsetReason === "string" ? job.metadata.episodeOffsetReason : null;
   const discoveryRetries = Number(job.metadata?.discoveryRetries ?? 0);
   const maxDiscoveryRetries = Number(job.metadata?.maxDiscoveryRetries ?? 0);
   const nextRetryLabel = job.status === "queued" && job.discoverAfter && new Date(job.discoverAfter).getTime() > Date.now()
@@ -231,7 +245,19 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
                 <>
                   <span>·</span>
                   <span className="text-[#52734c] font-semibold">
-                    Quality Backfill{backfillTargetQuality ? ` (${backfillTargetQuality})` : ""}
+                    Quality Backfill{backfillTargetQualities.length > 0 ? ` (${backfillTargetQualities.join(" · ")})` : ""}
+                  </span>
+                </>
+              )}
+              {hasEpisodeOffset && (
+                <>
+                  <span>·</span>
+                  <span
+                    className="text-[#9a563b] font-semibold"
+                    title={episodeOffsetReason || undefined}
+                  >
+                    Offset +{episodeOffset}
+                    {effectiveEpisodeNumber ? ` (Torrent Ep ${effectiveEpisodeNumber})` : ""}
                   </span>
                 </>
               )}
@@ -484,7 +510,9 @@ export function JobDetailsModal({ job, onClose, onUpdated }: JobDetailsModalProp
             {stagedQualityKeys.length > 0 && (
               <div className="pt-2 border-t border-[#e6e3db]">
                 <span className="text-[11px] text-[#817a70] block mb-1">
-                  Same-Group Staged Quality Files ({stagedQualityKeys.join(" · ")})
+                  {jobKind === "quality_backfill"
+                    ? `Staged Source Input (${stagedQualityKeys.join(" · ")}) → Target GPU Outputs (${backfillTargetQualities.join(" · ") || "720p · 480p"})`
+                    : `Same-Group Staged Quality Files (${stagedQualityKeys.join(" · ")})`}
                 </span>
                 <div className="space-y-1">
                   {stagedQualityKeys.map((qKey) => (

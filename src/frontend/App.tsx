@@ -7,6 +7,7 @@ const EnqueueModal = lazy(() => import("./components/EnqueueModal.js").then(m =>
 const KaggleAccountsModal = lazy(() => import("./components/KaggleAccountsModal.js").then(m => ({ default: m.KaggleAccountsModal })));
 const HuggingFaceModal = lazy(() => import("./components/HuggingFaceModal.js").then(m => ({ default: m.HuggingFaceModal })));
 const StagingExplorerModal = lazy(() => import("./components/StagingExplorerModal.js").then(m => ({ default: m.StagingExplorerModal })));
+const AnimeRulesPanel = lazy(() => import("./components/AnimeRulesPanel.js").then(m => ({ default: m.AnimeRulesPanel })));
 import { usePipelineStream } from "./hooks/usePipelineStream.js";
 import { api } from "./api.js";
 
@@ -114,6 +115,7 @@ export default function App() {
           <section className="panel"><h2>Storage & accounts</h2><p className="empty-description">Inspect retained files and configured upload destinations.</p><div className="operation-buttons"><button className="btn-secondary" onClick={() => setModal("staging")}><HardDrive size={16} /> Staged files</button><button className="btn-secondary" onClick={() => setModal("hf")}><Cloud size={16} /> Hugging Face</button><button className="btn-secondary" onClick={() => setModal("kaggle")}><Cpu size={16} /> GPU accounts</button></div></section>
           <section className="panel"><h2>Recovery & reconciliation</h2><p className="empty-description">Recover stale work and verify remote worker status.</p><div className="operation-buttons"><button className="btn-secondary" disabled={!!busy} onClick={() => void action("/api/jobs/retry-all-failed")}>Retry failed episodes</button><button className="btn-secondary" disabled={!!busy} onClick={() => void action("/api/system/sync-callbacks")}>Retry delivery callbacks</button><button className="btn-secondary" disabled={!!busy} onClick={() => void action("/api/system/recovery")}>Run recovery</button><button className="btn-secondary" disabled={!!busy} onClick={() => void action("/api/system/sync-encoding")}>Check GPU status</button><button className="btn-secondary" disabled={!!busy} onClick={() => void action("/api/jobs/requeue-skipped")}>Recheck skipped episodes</button></div></section>
           <section className="panel"><h2>Start a partial GPU batch</h2><p className="empty-description">Send available staged GPU jobs to processing without waiting for a full batch.</p><button className="btn-secondary" disabled={!!busy} onClick={flush}>Process staged batch <ArrowRight size={16} /></button></section>
+          <Suspense fallback={<section className="panel" style={{ gridColumn: "1 / -1" }} role="status">Loading discovery rules…</section>}><AnimeRulesPanel onNotice={showNotice} /></Suspense>
         </div>}
         <footer className="workspace-footer"><span>AniLight · A quieter place to keep things moving.</span><span>{connected ? "Live · refreshes automatically" : "Awaiting connection"}</span></footer>
       </main>

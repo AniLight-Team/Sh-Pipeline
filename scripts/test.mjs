@@ -11,6 +11,7 @@ try {
     "src/backend/engine/hf-upload.test.ts",
     "src/backend/engine/animetosho.client.test.ts",
     "src/backend/engine/discovery-titles.test.ts",
+    "src/backend/engine/episode-offset.test.ts",
     "src/backend/engine/release-filter.test.ts",
     "src/backend/engine/torrent-file-selection.test.ts",
     "src/backend/engine/quality-backfill-discovery.test.ts",

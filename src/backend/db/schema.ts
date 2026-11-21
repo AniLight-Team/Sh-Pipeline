@@ -118,3 +118,26 @@ export const pipelineJob = pgTable(
     index("sh_pipeline_job_callback_after_idx").on(table.status, table.callbackAfter),
   ],
 );
+
+export const pipelineAnimeRule = pgTable(
+  "pipeline_anime_rule",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    anilistId: integer("anilist_id").unique(),
+    animeId: integer("anime_id"),
+    episodeOffset: integer("episode_offset").notNull().default(0),
+    sourceTsukihimeId: integer("source_tsukihime_id"),
+    sourceAnidbId: integer("source_anidb_id"),
+    searchTitles: jsonb("search_titles").$type<string[]>(),
+    notes: text("notes"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    index("sh_pipeline_anime_rule_anime_idx").on(table.animeId),
+  ],
+);

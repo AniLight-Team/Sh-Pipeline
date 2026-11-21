@@ -9,14 +9,22 @@ const statuses = ["all", "active", "queued", "downloading", "download_paused", "
 const statusLabels: Record<string, string> = { all: "All episodes", active: "In progress", queued: "Queued", downloading: "Downloading", download_paused: "Awaiting space", staged: "Staged", encoding: "Processing", completed: "Delivered", failed: "Needs attention", skipped: "Skipped" };
 const isBusyJob = (job: Job) => ["encoding", "downloading"].includes(job.status) || !!job.batchId && !["failed", "completed"].includes(job.status);
 
+function getBackfillQualities(job: Job): string[] {
+  if (Array.isArray(job.metadata?.targetQualities) && job.metadata.targetQualities.length > 0) {
+    return job.metadata.targetQualities.map(String);
+  }
+  return job.metadata?.targetQuality ? [String(job.metadata.targetQuality)] : [];
+}
+
 function formatJobQualities(job: Job): string {
   const kind = job.metadata?.kind;
-  const targetQuality = job.metadata?.targetQuality;
+  const backfillQualities = getBackfillQualities(job);
   const trackPayloads = Array.isArray(job.resultPayload?.allTrackPayloads) ? job.resultPayload.allTrackPayloads : job.resultPayload ? [job.resultPayload] : [];
   const deliveredQualities = Array.from(new Set(trackPayloads.flatMap((track: any) =>
-    Array.isArray(track?.sources) ? track.sources.map((source: any) => source?.quality).filter(Boolean) : [])));
+    Array.isArray(track?.sources) ? track.sources.map((source: any) => source?.quality).filter(Boolean) : [])))
+    .sort((a, b) => parseInt(String(b), 10) - parseInt(String(a), 10));
   if (deliveredQualities.length > 0) return deliveredQualities.join(" · ");
-  if (kind === "quality_backfill" && targetQuality) return String(targetQuality);
+  if (kind === "quality_backfill") return backfillQualities.length > 0 ? backfillQualities.join(" · ") : "720p · 480p";
   if (kind === "caption_refresh") return "Captions";
   const stagedKeys = Object.keys(job.stagedQualities || {});
   if (stagedKeys.length > 0) return stagedKeys.join(" · ");
@@ -34,9 +42,14 @@ function formatJobWorker(job: Job): string {
 function formatJobKindTag(job: Job): string | null {
   const tags: string[] = [];
   if (job.metadata?.kind === "quality_backfill") {
-    tags.push(job.metadata?.targetQuality ? `Backfill ${job.metadata.targetQuality}` : "Backfill");
+    const backfillQualities = getBackfillQualities(job);
+    tags.push(backfillQualities.length > 0 ? `Backfill ${backfillQualities.join(" · ")}` : "Backfill");
   } else if (job.metadata?.kind === "caption_refresh") {
     tags.push("Captions");
+  }
+  const episodeOffset = Number(job.metadata?.episodeOffset);
+  if (Number.isSafeInteger(episodeOffset) && episodeOffset > 0) {
+    tags.push(`Offset +${episodeOffset}`);
   }
   const manualTid = Number(job.metadata?.manualTsukihimeTorrentId);
   if (Number.isSafeInteger(manualTid) && manualTid > 0) {

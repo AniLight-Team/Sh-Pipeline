@@ -71,6 +71,8 @@ export interface TsukihimeAnimeLookup {
   anilistId?: number | null;
   malId?: number | null;
   anidbId?: number | null;
+  /** Operator-configured source Tsukihime ID override (from pipeline_anime_rule); bypasses AniList mismatch rejection. */
+  trustedSourceTsukihimeId?: number | null;
 }
 
 export interface TsukihimeFetchOptions extends FetchTorrentsOptions {
@@ -78,6 +80,8 @@ export interface TsukihimeFetchOptions extends FetchTorrentsOptions {
   quality?: VideoResolutionQuality;
   groupName?: string;
   preferredPipeline?: PipelineExecutionType;
+  /** Fetch 1 page of recent /torrents for the anime even when /episodes/{ep} returned results (used to verify prequel offsets via air dates). */
+  probeRecentTorrents?: boolean;
 }
 
 interface TsukihimeDiscoveryResult {
@@ -145,6 +149,38 @@ function languageFilters(langType?: string): Query {
   return {};
 }
 
+const TITLE_OVERLAP_STOPWORDS = new Set([
+  "the", "and", "for", "with", "from", "into", "that", "this", "season", "part", "cour", "stage",
+  "1st", "2nd", "3rd", "4th", "5th", "episode", "movie", "ova", "ona", "special", "arc", "hen",
+]);
+
+function significantTitleTokens(title: string | null | undefined): Set<string> {
+  if (!title) return new Set();
+  const normalized = title.normalize("NFKC").toLowerCase().replace(/['’`]/g, "");
+  const tokens = normalized.match(/[\p{L}\p{N}]+/gu) ?? [];
+  return new Set(tokens.filter(tok => tok.length >= 3 && !TITLE_OVERLAP_STOPWORDS.has(tok)));
+}
+
+export function sharesDistinctiveTitleOverlap(
+  candidate: string | null | undefined,
+  knownTitles: (string | null | undefined)[],
+): boolean {
+  const candTokens = significantTitleTokens(candidate);
+  if (candTokens.size === 0) return false;
+  for (const known of knownTitles) {
+    const knownTokens = significantTitleTokens(known);
+    if (knownTokens.size === 0) continue;
+    let shared = 0;
+    for (const tok of candTokens) {
+      if (knownTokens.has(tok)) shared++;
+    }
+    if (shared >= 2 || (shared === 1 && Math.min(candTokens.size, knownTokens.size) === 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function titleQuery(titles: (string | null | undefined)[], quality?: VideoResolutionQuality) {
   return [...new Set(titles.flatMap(title => {
     const words = title?.normalize("NFKC").replace(/[^\p{L}\p{M}\p{N}]+/gu, " ").trim().slice(0, 100);
@@ -198,7 +234,23 @@ export class TsukihimeClient {
     signal = AbortSignal.timeout(30_000),
     knownTitles: (string | null | undefined)[] = [],
   ): Promise<TsukihimeAnime | null> {
-    const { tsukihimeId, anilistId, malId, anidbId } = lookup;
+    const { tsukihimeId, anilistId, malId, anidbId, trustedSourceTsukihimeId } = lookup;
+    if (isId(trustedSourceTsukihimeId)) {
+      const cachedTrusted = animeCache.get(`id:${trustedSourceTsukihimeId}`);
+      try {
+        const lookupSignal = AbortSignal.any([signal, AbortSignal.timeout(8_000)]);
+        const anime = cachedTrusted && cachedTrusted.expiresAt > Date.now()
+          ? cachedTrusted.anime
+          : (await this.requestJson<TorrentPage>(pathWithQuery(`/animes/${trustedSourceTsukihimeId}`, { limit: 1, offset: 0 }), lookupSignal))?.anime;
+        if (anime && isId(anime.id) && typeof anime.title === "string") {
+          animeCache.set(`id:${anime.id}`, { anime, expiresAt: Date.now() + 3_600_000 });
+          log.info("Tsukihime", `Using explicit rule override Tsukihime #${anime.id} ("${anime.title}").`);
+          return anime;
+        }
+      } catch (error) {
+        if (reportErrors) throw error;
+      }
+    }
     const external = [["anilist", anilistId], ["mal", malId], ["anidb", anidbId]] as const;
     const titleKeys = knownTitles.map(catalogTitle).filter(Boolean);
     const failures: unknown[] = [];
@@ -339,19 +391,31 @@ export class TsukihimeClient {
     const anime = await attempt(this.resolveAnime(
       lookup, true, AbortSignal.any([deadline, AbortSignal.timeout(20_000)]), options.knownTitles,
     ));
-    const titles = options.knownTitles?.some(title => title?.trim()) ? options.knownTitles
+    const baseTitles = options.knownTitles?.some(title => title?.trim()) ? [...options.knownTitles]
       : canonicalDiscoveryTitles({ titleRomaji: anime?.title, titleEnglish: anime?.english_title });
+    const providerTitles = anime
+      ? canonicalDiscoveryTitles({ titleRomaji: anime.title, titleEnglish: anime.english_title })
+      : [];
+    const titles = [...baseTitles];
+    for (const pt of providerTitles) {
+      const alreadyPresent = titles.some(t => t?.trim().toLowerCase() === pt.toLowerCase());
+      if (!alreadyPresent && (isId(lookup.trustedSourceTsukihimeId) || sharesDistinctiveTitleOverlap(pt, baseTitles))) {
+        titles.push(pt);
+      }
+    }
     const episode = isId(options.targetEp) ? options.targetEp : null;
     const episodeCount = options.episodeCount ?? anime?.total_episodes;
     const maxPages = Math.max(1, Math.min(options.maxPages ?? 4, 8));
     const preferredPipeline = options.preferredPipeline ?? "vm_remux";
     const filters = languageFilters(options.langType);
     const preferredGroup = options.groupName?.trim().toLowerCase();
-    const expectedIds = [
-      ["anilist", catalogId(anime?.anilist) ?? lookup.anilistId],
-      ["mal", catalogId(anime?.mal) ?? lookup.malId],
-      ["anidb", catalogId(anime?.anidb) ?? lookup.anidbId],
-    ] as const;
+    const expectedIds = isId(lookup.trustedSourceTsukihimeId)
+      ? ([] as readonly (readonly ["anilist" | "mal" | "anidb", number | null | undefined])[])
+      : ([
+          ["anilist", catalogId(anime?.anilist) ?? lookup.anilistId],
+          ["mal", catalogId(anime?.mal) ?? lookup.malId],
+          ["anidb", catalogId(anime?.anidb) ?? lookup.anidbId],
+        ] as const);
     const torrents = new Map<string, AnimeToshoItem>();
     let groupId: number | undefined;
     let searched = false;
@@ -426,11 +490,13 @@ export class TsukihimeClient {
         await Promise.all(aliases.map(ep => read(`${episodePath}/${ep}`, {}, maxPages, id)));
       }
 
-      if (!hasCoverage()) {
+      if (options.probeRecentTorrents || !hasCoverage()) {
         const query = { anime_id: id, is_adult: 0, sort_by: "source_date", order: "desc" };
         const preferred = preferredFilters();
-        if (Object.keys(preferred).length) await read("/torrents", { ...query, ...preferred }, 1, id);
-        if (!hasCoverage() && !await read("/torrents", query, maxPages, id)) {
+        if (!hasCoverage() && Object.keys(preferred).length) await read("/torrents", { ...query, ...preferred }, 1, id);
+        if (options.probeRecentTorrents) {
+          await read("/torrents", query, hasCoverage() ? 1 : maxPages, id);
+        } else if (!hasCoverage() && !await read("/torrents", query, maxPages, id)) {
           await read(`/animes/${id}`, {}, maxPages, id);
         }
       }

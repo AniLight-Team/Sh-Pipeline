@@ -8,8 +8,14 @@ import { TransmissionClient } from "./transmission.client.js";
 import { SubtitleManager, inspectMkvStreamsSync, type ExtractedSubtitleTrack, type MkvStreamProbe } from "./subtitles.manager.js";
 import { VideoEncodingManager } from "./video.manager.js";
 import { AnimeToshoClient, type FetchTorrentsOptions } from "./animetosho.client.js";
-import { TsukihimeClient, type TsukihimeTorrentEntry } from "./tsukihime.client.js";
+import { TsukihimeClient, sharesDistinctiveTitleOverlap, type TsukihimeTorrentEntry } from "./tsukihime.client.js";
 import { ReleaseFilter } from "./release-filter.js";
+import {
+  detectVerifiedEpisodeOffset,
+  loadPrequelOffsetContext,
+  type AnimeDiscoveryRule,
+  type PrequelOffsetContext,
+} from "./episode-offset.js";
 import { normalizeBtih, torrentIdentityKey, torrentInfoHash } from "./torrent-identity.js";
 import { AnimeMetadataResolver } from "./metadata-resolver.js";
 import { canonicalDiscoveryTitles } from "./discovery-titles.js";
@@ -46,8 +52,13 @@ import {
   queuedDiscoveryCondition,
   resetRetryMetadata,
 } from "./job-scheduling.js";
-import { BACKFILL_QUALITIES, isBackfillQualityMissing, missingBackfillQualities, stageStored1080p, type BackfillQuality } from "./quality-backfill.js";
-import { findBackfillTorrents } from "./quality-backfill-discovery.js";
+import {
+  BACKFILL_QUALITIES,
+  fetchMissingBackfillQualities,
+  missingBackfillQualities,
+  stageStored1080p,
+  type BackfillQuality,
+} from "./quality-backfill.js";
 import { inngest } from "../inngest/client.js";
 import type {
   AnimeToshoItem,
@@ -338,6 +349,22 @@ export class PipelineEngineService {
         CREATE INDEX IF NOT EXISTS "sh_pipeline_job_callback_after_idx" ON "pipeline_encoding_job" ("status", "callback_after");
       `);
 
+      await db.execute(sql`
+        CREATE TABLE IF NOT EXISTS "pipeline_anime_rule" (
+          "id" bigserial PRIMARY KEY NOT NULL,
+          "anilist_id" integer UNIQUE,
+          "anime_id" integer,
+          "episode_offset" integer DEFAULT 0 NOT NULL,
+          "source_tsukihime_id" integer,
+          "source_anidb_id" integer,
+          "search_titles" jsonb,
+          "notes" text,
+          "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+          "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS "sh_pipeline_anime_rule_anime_idx" ON "pipeline_anime_rule" ("anime_id");
+      `);
+
       tablesInitialized = true;
       log.success("PipelineEngine", "Pipeline dual-pipeline tables & indexes verified.");
     } catch (err: any) {
@@ -525,6 +552,136 @@ export class PipelineEngineService {
   /**
    * Checks whether the staged files can be reused for processing.
    */
+  public static async getAnimeDiscoveryRule(lookup: {
+    anilistId?: number | null;
+    animeId?: number | null;
+  }): Promise<AnimeDiscoveryRule | null> {
+    if (!DATABASE_URL || (!lookup.anilistId && !lookup.animeId)) return null;
+    try {
+      await this.ensureTables();
+      const conditions = [];
+      if (lookup.anilistId && lookup.anilistId > 0) {
+        conditions.push(eq(schema.pipelineAnimeRule.anilistId, lookup.anilistId));
+      }
+      if (lookup.animeId && lookup.animeId > 0) {
+        conditions.push(eq(schema.pipelineAnimeRule.animeId, lookup.animeId));
+      }
+      if (!conditions.length) return null;
+      const row = await db.query.pipelineAnimeRule.findFirst({
+        where: conditions.length > 1 ? or(...conditions) : conditions[0],
+      });
+      if (!row) return null;
+      return {
+        id: row.id,
+        anilistId: row.anilistId,
+        animeId: row.animeId,
+        episodeOffset: Math.max(0, Number(row.episodeOffset || 0)),
+        sourceTsukihimeId: row.sourceTsukihimeId,
+        sourceAnidbId: row.sourceAnidbId,
+        searchTitles: Array.isArray(row.searchTitles) ? row.searchTitles.filter(t => typeof t === "string" && t.trim()) : [],
+        notes: row.notes,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  public static async listAnimeDiscoveryRules(): Promise<AnimeDiscoveryRule[]> {
+    if (!DATABASE_URL) return [];
+    await this.ensureTables();
+    const rows = await db.select().from(schema.pipelineAnimeRule).orderBy(asc(schema.pipelineAnimeRule.id));
+    return rows.map(row => ({
+      id: row.id,
+      anilistId: row.anilistId,
+      animeId: row.animeId,
+      episodeOffset: Math.max(0, Number(row.episodeOffset || 0)),
+      sourceTsukihimeId: row.sourceTsukihimeId,
+      sourceAnidbId: row.sourceAnidbId,
+      searchTitles: Array.isArray(row.searchTitles) ? row.searchTitles.filter(t => typeof t === "string" && t.trim()) : [],
+      notes: row.notes,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    }));
+  }
+
+  public static async upsertAnimeDiscoveryRule(input: {
+    anilistId?: number | null;
+    animeId?: number | null;
+    episodeOffset: number;
+    sourceTsukihimeId?: number | null;
+    sourceAnidbId?: number | null;
+    searchTitles?: string[];
+    notes?: string | null;
+  }): Promise<AnimeDiscoveryRule> {
+    await this.ensureTables();
+    const anilistId = input.anilistId && input.anilistId > 0 ? input.anilistId : null;
+    const animeId = input.animeId && input.animeId > 0 ? input.animeId : null;
+    if (!anilistId && !animeId) {
+      throw new Error("Either anilistId or animeId is required for an anime discovery rule");
+    }
+    const episodeOffset = Math.max(0, Math.min(5000, Math.floor(Number(input.episodeOffset || 0))));
+    const sourceTsukihimeId = input.sourceTsukihimeId && input.sourceTsukihimeId > 0 ? input.sourceTsukihimeId : null;
+    const sourceAnidbId = input.sourceAnidbId && input.sourceAnidbId > 0 ? input.sourceAnidbId : null;
+    const searchTitles = Array.from(new Set((input.searchTitles ?? []).map(t => t.trim()).filter(Boolean))).slice(0, 20);
+    const notes = input.notes?.trim() || null;
+    const now = new Date();
+
+    const existing = await this.getAnimeDiscoveryRule({ anilistId, animeId });
+    const [saved] = existing
+      ? await db
+          .update(schema.pipelineAnimeRule)
+          .set({
+            anilistId: anilistId ?? existing.anilistId,
+            animeId: animeId ?? existing.animeId,
+            episodeOffset,
+            sourceTsukihimeId,
+            sourceAnidbId,
+            searchTitles,
+            notes,
+            updatedAt: now,
+          })
+          .where(eq(schema.pipelineAnimeRule.id, existing.id))
+          .returning()
+      : await db
+          .insert(schema.pipelineAnimeRule)
+          .values({
+            anilistId,
+            animeId,
+            episodeOffset,
+            sourceTsukihimeId,
+            sourceAnidbId,
+            searchTitles,
+            notes,
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning();
+
+    return {
+      id: saved.id,
+      anilistId: saved.anilistId,
+      animeId: saved.animeId,
+      episodeOffset: saved.episodeOffset,
+      sourceTsukihimeId: saved.sourceTsukihimeId,
+      sourceAnidbId: saved.sourceAnidbId,
+      searchTitles: Array.isArray(saved.searchTitles) ? saved.searchTitles : [],
+      notes: saved.notes,
+      createdAt: saved.createdAt,
+      updatedAt: saved.updatedAt,
+    };
+  }
+
+  public static async deleteAnimeDiscoveryRule(id: number): Promise<boolean> {
+    await this.ensureTables();
+    const deleted = await db
+      .delete(schema.pipelineAnimeRule)
+      .where(eq(schema.pipelineAnimeRule.id, id))
+      .returning({ id: schema.pipelineAnimeRule.id });
+    return deleted.length > 0;
+  }
+
   public static hasValidStagedFiles(job: {
     stagedFilePath?: string | null;
     stagedQualities?: Partial<Record<VideoResolutionQuality, string>> | null;
@@ -1391,7 +1548,19 @@ export class PipelineEngineService {
       const resolvedTitles = job.anilistId
         ? await AnimeMetadataResolver.resolveDiscoveryTitles(job.anilistId)
         : job.animeId ? await AnimeMetadataResolver.resolveLocalDiscoveryTitles(job.animeId) : [];
-      let effectiveKnownTitles = resolvedTitles;
+      const animeRule = !captionsOnly && !manualTorrentId
+        ? await this.getAnimeDiscoveryRule({ anilistId: job.anilistId, animeId: job.animeId })
+        : null;
+      let effectiveKnownTitles = Array.from(
+        new Set([...resolvedTitles, ...(animeRule?.searchTitles ?? [])].filter(Boolean)),
+      );
+      const prequelOffsetContext: PrequelOffsetContext = !captionsOnly && !manualTorrentId && !(animeRule && animeRule.episodeOffset > 0)
+        ? await loadPrequelOffsetContext({ animeId: job.animeId, anilistId: job.anilistId })
+        : { candidateOffsets: [], prequelStartDates: [], localEpisodes: [] };
+
+      let resolvedEpisodeOffset = animeRule?.episodeOffset && animeRule.episodeOffset > 0 ? animeRule.episodeOffset : 0;
+      let strictEpisodeOffset = resolvedEpisodeOffset > 0;
+      let episodeOffsetReason = resolvedEpisodeOffset > 0 ? "anime_rule" : "default_zero";
 
       const torrentByKey = new Map<string, AnimeToshoItem>();
       const allTorrents: AnimeToshoItem[] = [];
@@ -1435,6 +1604,26 @@ export class PipelineEngineService {
 
       const evaluateBundles = (): ReleaseCandidateBundle[] => {
         if (allTorrents.length === 0) return [];
+        if (!(animeRule && animeRule.episodeOffset > 0) && prequelOffsetContext.candidateOffsets.length > 0) {
+          const detected = detectVerifiedEpisodeOffset({
+            torrents: allTorrents,
+            knownTitles: effectiveKnownTitles,
+            targetEp: job.episodeNumber,
+            totalExpectedEps,
+            context: prequelOffsetContext,
+          });
+          if (detected.offset > 0 && detected.strict) {
+            if (resolvedEpisodeOffset !== detected.offset) {
+              log.info(
+                "PipelineEngine",
+                `[Job #${job.id}] Verified cumulative episode offset +${detected.offset} (${detected.reason}: Ep ${job.episodeNumber} -> Torrent Ep ${job.episodeNumber + detected.offset})`,
+              );
+            }
+            resolvedEpisodeOffset = detected.offset;
+            strictEpisodeOffset = true;
+            episodeOffsetReason = detected.reason;
+          }
+        }
         let bundles = ReleaseFilter.selectTopCandidateBundles(
           allTorrents,
           job.episodeNumber,
@@ -1442,6 +1631,8 @@ export class PipelineEngineService {
           {
             knownTitles: effectiveKnownTitles,
             totalExpectedEps,
+            episodeOffset: resolvedEpisodeOffset,
+            strictEpisodeOffset,
             maxBundles: 10,
           },
         );
@@ -1453,6 +1644,8 @@ export class PipelineEngineService {
             {
               knownTitles: effectiveKnownTitles,
               totalExpectedEps,
+              episodeOffset: resolvedEpisodeOffset,
+              strictEpisodeOffset,
               maxBundles: 10,
             },
           );
@@ -1581,40 +1774,60 @@ export class PipelineEngineService {
         topBundles = [this.buildManualTsukihimeBundle(manualEntry, job.episodeNumber, effectiveKnownTitles)];
       } else {
         // Search both indexes for the target episode and requested language.
-        let tsukihimeAnidbId: number | null = null;
+        let tsukihimeAnidbId: number | null = animeRule?.sourceAnidbId ?? null;
         const gpuSearch = effectivePolicy === "kaggle_gpu_only" || (effectivePolicy === "all" && forcedMode === "kaggle_gpu");
         try {
           const tsukiLookup = {
-            tsukihimeId: job.metadata?.tsukihimeId ? Number(job.metadata.tsukihimeId) : null,
+            tsukihimeId: animeRule?.sourceTsukihimeId ?? (job.metadata?.tsukihimeId ? Number(job.metadata.tsukihimeId) : null),
+            trustedSourceTsukihimeId: animeRule?.sourceTsukihimeId ?? null,
             anilistId: job.anilistId,
             malId: job.metadata?.malId ? Number(job.metadata.malId) : null,
-            anidbId: job.anidbId,
+            anidbId: animeRule?.sourceAnidbId ?? job.anidbId,
           };
           const previousEpisode = Number(job.qualitiesPayload?.["1080p"]?.effectiveEp);
+          const tsukiTargetEp = strictEpisodeOffset ? job.episodeNumber + resolvedEpisodeOffset : job.episodeNumber;
+          const prequelAliases = strictEpisodeOffset
+            ? []
+            : prequelOffsetContext.candidateOffsets.slice(0, 2).map(off => job.episodeNumber + off);
+          const episodeAliases = Array.from(
+            new Set([
+              ...(Number.isInteger(previousEpisode) && previousEpisode > job.episodeNumber ? [previousEpisode] : []),
+              ...prequelAliases,
+            ]),
+          );
           const { anime: tsukiAnime, torrents: tsukiTorrents } = await TsukihimeClient.fetchTorrents(
             tsukiLookup,
             {
-              targetEp: job.episodeNumber,
-              episodeAliases: Number.isInteger(previousEpisode) && previousEpisode > job.episodeNumber ? [previousEpisode] : [],
+              targetEp: tsukiTargetEp,
+              episodeAliases,
               langType: langTypeForSearch,
               knownTitles: effectiveKnownTitles,
-              episodeCount: totalExpectedEps,
+              episodeCount: strictEpisodeOffset ? null : totalExpectedEps,
               preferredPipeline: gpuSearch ? "kaggle_gpu" : "vm_remux",
               maxPages: 4,
               reportErrors: true,
+              probeRecentTorrents: !strictEpisodeOffset && prequelOffsetContext.candidateOffsets.length > 0,
             },
           );
-          if (tsukiAnime && (effectiveKnownTitles.length > 0 || !job.anilistId || Number(tsukiAnime.anilist) === job.anilistId)) {
+          if (tsukiAnime && (effectiveKnownTitles.length > 0 || !job.anilistId || Number(tsukiAnime.anilist) === job.anilistId || Boolean(animeRule?.sourceTsukihimeId))) {
             if (!totalExpectedEps && tsukiAnime.total_episodes && tsukiAnime.total_episodes >= job.episodeNumber) {
               totalExpectedEps = tsukiAnime.total_episodes;
             }
+            const tsukiTitles = canonicalDiscoveryTitles({
+              titleRomaji: tsukiAnime.title,
+              titleEnglish: tsukiAnime.english_title,
+            });
             if (effectiveKnownTitles.length === 0) {
-              effectiveKnownTitles = canonicalDiscoveryTitles({
-                titleRomaji: tsukiAnime.title,
-                titleEnglish: tsukiAnime.english_title,
-              });
+              effectiveKnownTitles = tsukiTitles;
+            } else {
+              for (const tt of tsukiTitles) {
+                const exists = effectiveKnownTitles.some(existing => existing.trim().toLowerCase() === tt.toLowerCase());
+                if (!exists && (Boolean(animeRule?.sourceTsukihimeId) || sharesDistinctiveTitleOverlap(tt, effectiveKnownTitles))) {
+                  effectiveKnownTitles = [...effectiveKnownTitles, tt];
+                }
+              }
             }
-            if (tsukiAnime.anidb && tsukiAnime.anidb > 0) {
+            if (!tsukihimeAnidbId && tsukiAnime.anidb && tsukiAnime.anidb > 0) {
               tsukihimeAnidbId = tsukiAnime.anidb;
             }
             const mapping = {
@@ -1644,10 +1857,10 @@ export class PipelineEngineService {
         }
 
         const opts: FetchTorrentsOptions = {
-          targetEp: job.episodeNumber,
+          targetEp: strictEpisodeOffset ? job.episodeNumber + resolvedEpisodeOffset : job.episodeNumber,
           langType: langTypeForSearch,
           knownTitles: effectiveKnownTitles,
-          episodeCount: totalExpectedEps,
+          episodeCount: strictEpisodeOffset ? null : totalExpectedEps,
           maxPages: 6,
         };
 
@@ -2085,11 +2298,15 @@ export class PipelineEngineService {
               let compatible = false;
               try {
                 const probe = await inspectMkvStreamsSync(sibDl.stagedPath);
-                compatible = probe.isBrowserCompatibleH264 && tracksConfig.every(([type]) =>
+                const matchesRes =
+                  siblingQ === "720p" || siblingQ === "480p"
+                    ? this.matchesBackfillResolution(probe, siblingQ)
+                    : true;
+                compatible = probe.isBrowserCompatibleH264 && matchesRes && tracksConfig.every(([type]) =>
                   videoManager.determineTracksToEncode(probe, type).length > 0);
               } catch {}
               if (!compatible) {
-                log.warn("PipelineEngine", `[Job #${job.id}] Sibling ${siblingQ} has incompatible video or missing audio`);
+                log.warn("PipelineEngine", `[Job #${job.id}] Sibling ${siblingQ} has incompatible video, mismatched resolution, or missing audio`);
                 await fs.promises.unlink(sibDl.stagedPath).catch(() => {});
                 return;
               }
@@ -2137,6 +2354,13 @@ export class PipelineEngineService {
         isBatchTorrent: isBatchExtracted,
         stagedQualities,
         availableQualities: stagedQualityList,
+        ...(resolvedEpisodeOffset > 0
+          ? {
+              episodeOffset: resolvedEpisodeOffset,
+              episodeOffsetReason,
+              effectiveEpisodeNumber: job.episodeNumber + resolvedEpisodeOffset,
+            }
+          : {}),
       };
 
       await db
@@ -2241,7 +2465,7 @@ export class PipelineEngineService {
 
   private static async discoverAndStageQualityBackfill(
     job: PipelineJob,
-    transmission: TransmissionClient,
+    _transmission: TransmissionClient,
     videoManager: VideoEncodingManager,
     stagingDir: string,
     downloadedPaths: Set<string>,
@@ -2249,7 +2473,7 @@ export class PipelineEngineService {
     const jobId = job.id;
     const type = job.types[0];
     const metadata = job.metadata ?? {};
-    const quality = this.backfillOutputQuality(job);
+    const requestedQualities = this.backfillOutputQualities(job);
     const sourceUrl = metadata.sourceUrl as string | undefined;
     if (!type || !sourceUrl || !metadata.sourceJobId) throw new Error("Missing backfill source");
 
@@ -2259,105 +2483,36 @@ export class PipelineEngineService {
         status: "queued", discoverAfter: new Date(Date.now() + delay), metadata: nextMetadata,
         lastError: reason, heartbeatAt: new Date(), updatedAt: new Date(),
       }).where(runningJob);
-      log.info("PipelineEngine", `[Job #${jobId}] ${quality} backfill: ${reason}`);
+      log.info("PipelineEngine", `[Job #${jobId}] ${requestedQualities.join("/")} backfill: ${reason}`);
       return { status: "retry_scheduled", jobId, error: reason };
     };
 
     const { animeId, anilistId, anidbId, episodeNumber } = job;
     const sourceWatermarked = typeof metadata.sourceTorrentTitle === "string" &&
       ReleaseFilter.hasWatermarkedSource(metadata.sourceTorrentTitle);
-    if (sourceWatermarked || !await isBackfillQualityMissing({ animeId, anilistId, anidbId, episodeNumber, type,
-      sourceUrl, sourceJobId: metadata.sourceJobId }, quality)) {
+    const missingFromApi = sourceWatermarked
+      ? null
+      : await fetchMissingBackfillQualities({
+          animeId, anilistId, anidbId, episodeNumber, type,
+          sourceUrl, sourceJobId: metadata.sourceJobId,
+        });
+    const targetQualities = missingFromApi
+      ? requestedQualities.filter(q => missingFromApi.includes(q))
+      : [];
+    if (sourceWatermarked || targetQualities.length === 0) {
       await db.update(schema.pipelineJob).set({
         status: "skipped",
-        lastError: sourceWatermarked ? "Published source is marked as watermarked" : "Published source changed or quality is already available",
+        lastError: sourceWatermarked ? "Published source is marked as watermarked" : "Published source changed or qualities are already available",
         updatedAt: new Date(),
       }).where(runningJob);
       return { status: "skipped", jobId };
     }
 
-    const stage = async (input: {
-      path: string; sizeBytes: number; mode: PipelineExecutionType; tracks: [string, number][];
-      torrentTitle?: string; torrentMagnet?: string;
-    }): Promise<DiscoveryResult> => {
-      const policy = this.getExecutionPolicy();
-      if ((policy === "vm_remux_only" && input.mode === "kaggle_gpu") ||
-          (policy === "kaggle_gpu_only" && input.mode === "vm_remux")) {
-        await fs.promises.unlink(input.path).catch(() => {});
-        return retryLater(QUALITY_BACKFILL_SEARCH_DELAYS_MS[0], "Execution policy changed during backfill staging");
-      }
-      const now = new Date();
-      const [updated] = await db.update(schema.pipelineJob).set({
-        status: "staged", pipelineType: input.mode, selectionTier: null, videoCodec: "h264", qualityCount: 1,
-        stagedQualities: { [input.mode === "vm_remux" ? quality : "1080p"]: input.path },
-        stagedFilePath: input.path, sizeBytes: input.sizeBytes, tracksConfig: input.tracks,
-        torrentTitle: input.torrentTitle ?? null, torrentMagnet: input.torrentMagnet ?? null,
-        metadata: { ...metadata, processingMode: input.mode },
-        lastError: null, stagedAt: now, heartbeatAt: now, updatedAt: now,
-      }).where(runningJob).returning({ id: schema.pipelineJob.id });
-      if (!updated) throw new Error("Lost the backfill staging claim");
-      if (input.mode === "vm_remux") setImmediate(() => { this.drainVmRemuxQueue().catch(() => {}); });
-      log.success("PipelineEngine", `[Job #${jobId}] Staged ${quality} backfill for ${input.mode}`);
-      return { status: "staged", jobId, pipelineType: input.mode, sizeBytes: input.sizeBytes };
-    };
-
     const searchDelays = QUALITY_BACKFILL_SEARCH_DELAYS_MS;
-    const searchAttempts = Number(metadata.qualitySearchAttempts ?? 0);
-    if (searchAttempts < searchDelays.length) {
-      let reason = `No compatible ${quality} torrent`;
-      let candidates = [] as Awaited<ReturnType<typeof findBackfillTorrents>>;
-      const knownTitles = job.knownTitles?.length
-        ? job.knownTitles
-        : anilistId
-          ? await AnimeMetadataResolver.resolveDiscoveryTitles(anilistId)
-          : animeId ? await AnimeMetadataResolver.resolveLocalDiscoveryTitles(animeId) : [];
-      if (this.getExecutionPolicy() !== "kaggle_gpu_only") {
-        try {
-          candidates = await findBackfillTorrents({
-            animeId, anilistId, anidbId, episodeNumber, type, quality,
-            knownTitles, metadata, releaseGroup: job.releaseGroup,
-            torrentTitle: metadata.sourceTorrentTitle, sourceEffectiveEp: metadata.sourceEffectiveEp,
-          });
-        } catch (error) {
-          if (!(error instanceof AggregateError)) throw error;
-          reason = error.message;
-        }
-      } else {
-        reason = "Torrent remux disabled by the active execution policy";
-      }
-      for (const candidate of candidates) {
-        const downloaded = await this.downloadCandidateEpisodeToStaging({
-          jobId, episodeNumber, knownTitles, candidate: candidate.item,
-          effectiveEp: candidate.effectiveEp, qualityTag: quality, transmission, stagingDir,
-          totalExpectedEps: Number(metadata.totalEpisodes) || null,
-          enforceHardCapBeforeStart: true,
-        });
-        if (!downloaded.ok) {
-          if (downloaded.pausedForCapacity) return retryLater(searchDelays[0], downloaded.reason);
-          log.warn("PipelineEngine", `[Job #${jobId}] ${quality} torrent unavailable: ${downloaded.reason}`);
-          continue;
-        }
-        downloadedPaths.add(downloaded.stagedPath);
-        const probe = await inspectMkvStreamsSync(downloaded.stagedPath).catch(() => null);
-        if (probe?.isBrowserCompatibleH264 && this.matchesBackfillResolution(probe, quality) &&
-            (!metadata.sourceDurationSeconds || !probe.durationSeconds ||
-              Math.abs(metadata.sourceDurationSeconds - probe.durationSeconds) <= 2)) {
-          const tracks = videoManager.determineTracksToEncode(probe, type);
-          if (tracks.length) return stage({ path: downloaded.stagedPath, sizeBytes: downloaded.sizeBytes,
-            mode: "vm_remux", tracks, torrentTitle: candidate.item.title, torrentMagnet: downloaded.magnetUri });
-        }
-        await fs.promises.unlink(downloaded.stagedPath).catch(() => {});
-      }
-      metadata.qualitySearchAttempts = searchAttempts + 1;
-      const delay = searchDelays[searchAttempts + 1];
-      if (delay) return retryLater(delay, `${reason} after search ${searchAttempts + 1}/${searchDelays.length}`);
-      // Persist the phase change before transferring the stored source so a restart resumes GPU staging.
-      await db.update(schema.pipelineJob).set({ metadata }).where(runningJob);
+    if (this.getExecutionPolicy() === "vm_remux_only" || !videoManager.getKaggleAccounts().length) {
+      return retryLater(searchDelays[1], "Waiting for Kaggle GPU encoding to be available for lower-quality backfill");
     }
 
-    if (this.getExecutionPolicy() === "vm_remux_only" || !videoManager.getKaggleAccounts().length) {
-      return retryLater(searchDelays[1], "Torrent searches exhausted. Waiting for GPU encoding to be available");
-    }
     const expectedBytes = Number(metadata.sourceSizeBytes) || undefined;
     if (expectedBytes && expectedBytes > KIRA_MAX_STAGING_BYTES) throw new Error("Stored 1080p exceeds the staging limit");
     if (this.storedSourceDownload) {
@@ -2374,10 +2529,49 @@ export class PipelineEngineService {
 
       const destination = path.join(stagingDir, `job_${jobId}_ep${episodeNumber}_1080p_${crypto.randomUUID().slice(0, 6)}.mp4`);
       downloadedPaths.add(destination);
-      const sizeBytes = await stageStored1080p({ url: sourceUrl, sha256: metadata.sourceSha256, sizeBytes: expectedBytes },
-        destination, availableBytes);
+      const sizeBytes = await stageStored1080p(
+        { url: sourceUrl, sha256: metadata.sourceSha256, sizeBytes: expectedBytes },
+        destination,
+        availableBytes,
+      );
+
+      if (this.getExecutionPolicy() === "vm_remux_only") {
+        await fs.promises.unlink(destination).catch(() => {});
+        return retryLater(searchDelays[0], "Execution policy changed during backfill staging");
+      }
+
+      const now = new Date();
       // The published 1080p MP4 already contains the requested language as its only audio track.
-      return await stage({ path: destination, sizeBytes, mode: "kaggle_gpu", tracks: [[type, 0]] });
+      const nextMetadata = {
+        ...metadata,
+        processingMode: "kaggle_gpu" as const,
+        targetQualities,
+        targetQuality: targetQualities[0],
+      };
+      const [updated] = await db.update(schema.pipelineJob).set({
+        status: "staged",
+        pipelineType: "kaggle_gpu",
+        selectionTier: null,
+        videoCodec: "h264",
+        qualityCount: targetQualities.length,
+        stagedQualities: { "1080p": destination },
+        stagedFilePath: destination,
+        sizeBytes,
+        tracksConfig: [[type, 0]],
+        torrentTitle: null,
+        torrentMagnet: null,
+        metadata: nextMetadata,
+        lastError: null,
+        stagedAt: now,
+        heartbeatAt: now,
+        updatedAt: now,
+      }).where(runningJob).returning({ id: schema.pipelineJob.id });
+      if (!updated) throw new Error("Lost the backfill staging claim");
+      log.success(
+        "PipelineEngine",
+        `[Job #${jobId}] Staged stored 1080p directly for Kaggle GPU encode (${targetQualities.join(" + ")})`,
+      );
+      return { status: "staged", jobId, pipelineType: "kaggle_gpu", sizeBytes };
     } finally {
       this.storedSourceDownload = null;
     }
@@ -2901,13 +3095,15 @@ export class PipelineEngineService {
         return true;
       });
 
-      const sources = trackRecords.map((o) => ({
-        quality: o.quality,
-        url: o.huggingface?.downloadUrl || "",
-        downloadUrl: o.huggingface?.downloadUrl || "",
-        sha256: o.sha256,
-        sizeBytes: o.metadata?.size,
-      }));
+      const sources = trackRecords
+        .map((o) => ({
+          quality: o.quality,
+          url: o.huggingface?.downloadUrl || "",
+          downloadUrl: o.huggingface?.downloadUrl || "",
+          sha256: o.sha256,
+          sizeBytes: o.metadata?.size,
+        }))
+        .sort((a, b) => parseInt(String(b.quality), 10) - parseInt(String(a.quality), 10));
 
       const formattedSubs = SubtitleManager.formatForCallback(rawSubtitles, trackType);
 
@@ -2990,7 +3186,7 @@ export class PipelineEngineService {
 
         const isBackfill = job.metadata?.kind === "quality_backfill";
         const allowedQualities: VideoResolutionQuality[] = isBackfill
-          ? [this.backfillOutputQuality(job)]
+          ? this.backfillOutputQualities(job)
           : job.selectionTier === "h264_single_1080p"
             ? ["1080p"]
             : (["1080p", "720p", "480p"] as VideoResolutionQuality[]);
@@ -3205,7 +3401,7 @@ export class PipelineEngineService {
           // If Tier 2 (h264_single_1080p), strictly only remux 1080p (1 quality)
           const isBackfill = job.metadata?.kind === "quality_backfill";
           const allowedQualities: VideoResolutionQuality[] = isBackfill
-            ? [this.backfillOutputQuality(job)]
+            ? this.backfillOutputQualities(job)
             : job.selectionTier === "h264_single_1080p"
               ? ["1080p"]
               : (["1080p", "720p", "480p"] as VideoResolutionQuality[]);
@@ -3403,7 +3599,7 @@ export class PipelineEngineService {
         filename: safeRel,
         mode: isRemux ? "remux" : "transcode",
         qualityFiles: Object.keys(qualityFilesManifest).length > 0 ? qualityFilesManifest : undefined,
-        outputQualities: job.metadata?.kind === "quality_backfill" ? [this.backfillOutputQuality(job)] : undefined,
+        outputQualities: job.metadata?.kind === "quality_backfill" ? this.backfillOutputQualities(job) : undefined,
         animeId: job.animeId || job.anilistId || job.anidbId || job.id,
         anilistId: job.anilistId || undefined,
         anidbId: job.anidbId || undefined,
@@ -3416,10 +3612,15 @@ export class PipelineEngineService {
     return { jobs, uploadItems, manifestItems };
   }
 
-  private static backfillOutputQuality(job: PipelineJob): BackfillQuality {
-    const quality = BACKFILL_QUALITIES.find(quality => quality === job.metadata?.targetQuality);
-    if (!quality) throw new Error(`Job #${job.id} is missing a valid backfill output quality`);
-    return quality;
+  private static backfillOutputQualities(job: PipelineJob): BackfillQuality[] {
+    const rawList = Array.isArray(job.metadata?.targetQualities)
+      ? job.metadata.targetQualities
+      : job.metadata?.targetQuality
+        ? [job.metadata.targetQuality]
+        : [];
+    const qualities = BACKFILL_QUALITIES.filter(q => rawList.includes(q));
+    if (!qualities.length) throw new Error(`Job #${job.id} is missing valid backfill output qualities`);
+    return qualities;
   }
 
   private static resolveBatchKaggleAccount(batchKaggleUsername: string | null) {
@@ -3925,9 +4126,13 @@ export class PipelineEngineService {
 
     for (const job of jobs) {
       if (job.status === "completed") continue;
-      const backfillQuality = job.metadata?.kind === "quality_backfill" ? this.backfillOutputQuality(job) : undefined;
+      const backfillQualities = job.metadata?.kind === "quality_backfill" ? this.backfillOutputQualities(job) : undefined;
       const jobOutputs = records.filter((o) => {
-        if (backfillQuality) return o.job_id === job.id && o.quality === backfillQuality && o.type === job.types[0];
+        if (backfillQualities) {
+          return o.job_id === job.id &&
+            backfillQualities.includes(o.quality as BackfillQuality) &&
+            o.type === job.types[0];
+        }
         if (o.job_id != null) return o.job_id === job.id;
         const matchesAnime =
           (job.animeId && o.anime_id === job.animeId) ||
@@ -3936,7 +4141,12 @@ export class PipelineEngineService {
         return Boolean(matchesAnime && o.episode_number === job.episodeNumber);
       });
 
-      if (jobOutputs.length === 0 || (backfillQuality && jobOutputs.length !== 1)) {
+      const producedQualities = new Set(jobOutputs.map(o => o.quality));
+      const missingExpectedBackfill = Boolean(
+        backfillQualities &&
+        (jobOutputs.length !== backfillQualities.length || !backfillQualities.every(q => producedQualities.has(q))),
+      );
+      if (jobOutputs.length === 0 || missingExpectedBackfill) {
         const failErr = failedJobMap.get(job.id) || "No encoded output records produced by kernel";
         const canReStage = job.attempt < MAX_JOB_ATTEMPTS && this.hasValidStagedFiles(job);
 
@@ -4802,25 +5012,35 @@ export class PipelineEngineService {
     const delivered = payloads.every(payload => deliveredTypes.has(payload.type));
     const backfillTracks = new Set<string>(metadata.qualityBackfillTracks ?? []);
     const backfills: (typeof schema.pipelineJob.$inferInsert)[] = [];
-    if (metadata.kind === "release" && this.isJobVmRemux(job) && job.qualitiesPayload?.["1080p"] &&
+    const isEligibleForBackfill =
+      !metadata.kind || metadata.kind === "release" || metadata.kind === "stream_refresh";
+    if (isEligibleForBackfill && this.isJobVmRemux(job) && job.qualitiesPayload?.["1080p"] &&
         !ReleaseFilter.hasWatermarkedSource(job.torrentTitle)) {
       for (const payload of payloads) {
         if (!deliveredTypes.has(payload.type) || backfillTracks.has(payload.type)) continue;
         const source = payload.sources.find(source => source.quality === "1080p");
         const sourceUrl = source?.downloadUrl || source?.url;
         if (!source || !sourceUrl) continue;
-        for (const quality of missingBackfillQualities(payload.sources)) {
+        const missing = missingBackfillQualities(payload.sources);
+        if (missing.length > 0) {
           backfills.push({
             animeId: job.animeId, anilistId: job.anilistId, anidbId: job.anidbId,
             episodeNumber: job.episodeNumber, types: [payload.type], knownTitles: job.knownTitles,
             releaseGroup: job.releaseGroup,
-            discoverAfter: new Date(Date.now() + QUALITY_BACKFILL_SEARCH_DELAYS_MS[0]),
+            pipelineType: "kaggle_gpu",
+            qualityCount: missing.length,
+            discoverAfter: null,
             metadata: {
-              kind: "quality_backfill", targetQuality: quality, sourceJobId: job.id, sourceUrl,
+              kind: "quality_backfill",
+              targetQualities: missing,
+              targetQuality: missing[0],
+              processingMode: "kaggle_gpu",
+              sourceJobId: job.id, sourceUrl,
               sourceTorrentTitle: job.torrentTitle, sourceEffectiveEp: job.qualitiesPayload?.["1080p"]?.effectiveEp,
               sourceDurationSeconds: job.qualitiesPayload?.["1080p"]?.durationSeconds,
               sourceSha256: source.sha256, sourceSizeBytes: source.sizeBytes,
               totalEpisodes: metadata.totalEpisodes, tsukihimeId: metadata.tsukihimeId, malId: metadata.malId,
+              ...(metadata.manualTsukihimeTorrentId ? { manualTsukihimeTorrentId: metadata.manualTsukihimeTorrentId } : {}),
             },
           });
         }
@@ -4829,6 +5049,7 @@ export class PipelineEngineService {
     }
 
     // Record callback delivery and enqueue its backfills together. A lost callback lease cannot enqueue duplicates.
+    const insertedBackfills: { id: number; animeId: number | null; anilistId: number | null; anidbId: number | null; episodeNumber: number; types: ("sub" | "dub")[] }[] = [];
     const committed = await db.transaction(async tx => {
       const [updated] = await tx.update(schema.pipelineJob).set({
         callbackAfter: delivered ? null : nextAttempt,
@@ -4844,11 +5065,22 @@ export class PipelineEngineService {
       }).where(and(eq(schema.pipelineJob.id, id), eq(schema.pipelineJob.status, "completed"),
         eq(schema.pipelineJob.callbackAfter, nextAttempt))).returning({ id: schema.pipelineJob.id });
       if (!updated) return false;
-      if (backfills.length) await tx.insert(schema.pipelineJob).values(backfills);
+      if (backfills.length) {
+        const rows = await tx.insert(schema.pipelineJob).values(backfills).returning({
+          id: schema.pipelineJob.id,
+          animeId: schema.pipelineJob.animeId,
+          anilistId: schema.pipelineJob.anilistId,
+          anidbId: schema.pipelineJob.anidbId,
+          episodeNumber: schema.pipelineJob.episodeNumber,
+          types: schema.pipelineJob.types,
+        });
+        insertedBackfills.push(...rows);
+      }
       return true;
     });
-    if (committed && backfills.length) {
-      log.info("PipelineEngine", `[Job #${id}] Queued ${backfills.length} missing release qualities for backfill`);
+    if (committed && insertedBackfills.length) {
+      log.info("PipelineEngine", `[Job #${id}] Queued ${insertedBackfills.length} direct GPU backfill job(s) for missing lower qualities`);
+      await inngest.send(insertedBackfills.map(bf => discoveryEvent(bf, "discover"))).catch(() => {});
     }
     return committed && delivered;
   }
