@@ -279,6 +279,16 @@ export function detectVerifiedEpisodeOffset(params: {
   const zeroScore = evaluate(0);
   const candidateScores = candidateOffsets.map(evaluate);
 
+  // Dual-numbering guard: if offset=0 has ZERO early violations AND has genuine positive proof
+  // (e.g. Erai-raws releases "2nd Season Part 2 - 07" while DKB/VARYG release "S02E19" in the same feed),
+  // we must NOT exclude offset=0 (strict: false), so BOTH relative and cumulative releases remain eligible!
+  const hasValidZeroProof =
+    zeroScore.earlyViolations === 0 &&
+    zeroScore.prequelDateMatches === 0 &&
+    (zeroScore.exactAirDateMatches > 0 ||
+      zeroScore.titleMatches > 0 ||
+      (tsukihimeDeltaEps.get(0)?.size ?? 0) > 0);
+
   // Proof 1: Episode-title consensus (works even on same-day batch drops & heavy broadcast delays!)
   const titleWinners = candidateScores.filter(
     c => c.titleMatches >= 1 && c.titleMatches > zeroScore.titleMatches && c.earlyViolations === 0,
@@ -289,8 +299,8 @@ export function detectVerifiedEpisodeOffset(params: {
       const winner = titleWinners[0];
       return {
         offset: winner.offset,
-        strict: true,
-        reason: "episode_title_verified",
+        strict: !hasValidZeroProof,
+        reason: hasValidZeroProof ? "episode_title_dual_verified" : "episode_title_verified",
         evidence: {
           candidateOffset: winner.offset,
           exactAirDateMatches: winner.exactAirDateMatches,
@@ -336,8 +346,8 @@ export function detectVerifiedEpisodeOffset(params: {
         const winner = airWinners[0];
         return {
           offset: winner.offset,
-          strict: true,
-          reason: "air_date_verified",
+          strict: !hasValidZeroProof,
+          reason: hasValidZeroProof ? "air_date_dual_verified" : "air_date_verified",
           evidence: {
             candidateOffset: winner.offset,
             exactAirDateMatches: winner.exactAirDateMatches,
@@ -349,6 +359,40 @@ export function detectVerifiedEpisodeOffset(params: {
             prequelDateMatches: zeroScore.prequelDateMatches,
           },
         };
+      }
+    }
+
+    // Proof 2c: Dual-numbering split-cour air-date alignment (e.g. Erai-raws releases Part 2 Ep 7
+    // on Ep 7's air date while DKB/VARYG/ToonsHub release S02E17/E18/E19 on Ep 5/6/7's air dates).
+    // Both offset=0 and offset=+K have 0 early violations, and +K matches 2+ episodes on their exact air dates.
+    if (zeroScore.earlyViolations === 0 && zeroScore.prequelDateMatches === 0) {
+      const dualAirWinners = candidateScores.filter(
+        c => c.earlyViolations === 0 && c.exactAirDateMatches >= 2,
+      );
+      if (dualAirWinners.length > 0) {
+        dualAirWinners.sort(
+          (a, b) =>
+            b.exactAirDateMatches - a.exactAirDateMatches ||
+            b.delayedAirDateMatches - a.delayedAirDateMatches,
+        );
+        if (dualAirWinners.length === 1 || dualAirWinners[0].exactAirDateMatches > dualAirWinners[1].exactAirDateMatches) {
+          const winner = dualAirWinners[0];
+          return {
+            offset: winner.offset,
+            strict: false,
+            reason: "air_date_dual_verified",
+            evidence: {
+              candidateOffset: winner.offset,
+              exactAirDateMatches: winner.exactAirDateMatches,
+              zeroExactAirDateMatches: zeroScore.exactAirDateMatches,
+              earlyViolations: winner.earlyViolations,
+              zeroEarlyViolations: zeroScore.earlyViolations,
+              titleMatches: winner.titleMatches,
+              zeroTitleMatches: zeroScore.titleMatches,
+              prequelDateMatches: zeroScore.prequelDateMatches,
+            },
+          };
+        }
       }
     }
 
@@ -380,7 +424,7 @@ export function detectVerifiedEpisodeOffset(params: {
     }
   }
 
-  // Proof 3: Prequel-verified Tsukihime episode_no mapping (unanimous across indexed torrents)
+  // Proof 3: Prequel-verified Tsukihime episode_no mapping (unanimous, or split-cour dual-numbering with delta=0 + valid cour offset)
   if (tsukihimeDeltaEps.size === 1 && zeroScore.exactAirDateMatches === 0 && zeroScore.titleMatches === 0) {
     const [[delta, eps]] = [...tsukihimeDeltaEps.entries()];
     if (delta > 0 && candidateOffsets.includes(delta) && (eps.has(targetEp) || eps.size >= 2)) {
@@ -401,6 +445,35 @@ export function detectVerifiedEpisodeOffset(params: {
             prequelDateMatches: zeroScore.prequelDateMatches,
           },
         };
+      }
+    }
+  } else if (tsukihimeDeltaEps.size === 2 && tsukihimeDeltaEps.has(0) && zeroScore.earlyViolations === 0) {
+    const nonZeroEntry = [...tsukihimeDeltaEps.entries()].find(([delta]) => delta > 0);
+    if (nonZeroEntry) {
+      const [delta, eps] = nonZeroEntry;
+      if (
+        ReleaseFilter.VALID_COUR_OFFSETS.has(delta) &&
+        candidateOffsets.includes(delta) &&
+        (eps.has(targetEp) || eps.size >= 2)
+      ) {
+        const score = candidateScores.find(c => c.offset === delta)!;
+        if (score.earlyViolations === 0) {
+          return {
+            offset: delta,
+            strict: false,
+            reason: "tsukihime_prequel_dual_verified",
+            evidence: {
+              candidateOffset: delta,
+              exactAirDateMatches: score.exactAirDateMatches,
+              zeroExactAirDateMatches: zeroScore.exactAirDateMatches,
+              earlyViolations: score.earlyViolations,
+              zeroEarlyViolations: zeroScore.earlyViolations,
+              titleMatches: score.titleMatches,
+              zeroTitleMatches: zeroScore.titleMatches,
+              prequelDateMatches: zeroScore.prequelDateMatches,
+            },
+          };
+        }
       }
     }
   }

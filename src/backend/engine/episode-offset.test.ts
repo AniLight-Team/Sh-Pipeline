@@ -641,3 +641,216 @@ test("generic episode titles and conflicting Tsukihime deltas never trigger fals
   assert.equal(res.offset, 0);
   assert.equal(res.strict, false);
 });
+
+// ============================================================================
+// 4. COMPOUND SEASON+PART DUAL-NUMBERING (Job #4564: Yozakura S2 Part 2 #213657 / Tsuki #9846)
+// ============================================================================
+
+const YOZAKURA_TITLES = [
+  "Yozakura-san Chi no Daisakusen 2nd Season Part 2",
+  "Mission: Yozakura Family Season 2 Part 2",
+];
+
+test("compound '2nd Season Part 2' matches both explicit Part 2 and verified S02 cumulative releases while isolating Part 1 and S01", () => {
+  const validVerifiedReleases = [
+    "[Erai-raws] Yozakura-san Chi no Daisakusen 2nd Season Part 2 - 07 [1080p DSNP WEB-DL AVC AAC][MultiSub][5077C9E8]",
+    "[Erai-raws] Yozakura-san Chi no Daisakusen 2nd Season Part 2 - 07 [720p DSNP WEB-DL AVC AAC][MultiSub][7537DBDA]",
+    "[Erai-raws] Yozakura-san Chi no Daisakusen 2nd Season Part 2 - 07 [480p DSNP WEB-DL AVC AAC][MultiSub][EBE3678F]",
+    "[DKB] Yozakura-san Chi no Daisakusen - S02E19 [1080p][HEVC x265 10bit][Multi-Subs][weekly]",
+    "[Onalrie] Yozakura-san Chi no Daisakusen - S02E19 [1080p WEBRip AV1]",
+    "[Erai-raws] Mission: Yozakura Family S02E18 [1080p DSNP WEB-DL AVC AAC][MultiSub][0071F5ED]",
+    "[ToonsHub] Mission Yozakura Family S02E18 1080p DSNP WEB-DL AAC2.0 H.264 (Multi-Subs)",
+    "[VARYG] Mission Yozakura Family S02E18 Yozakura Family Feud 1080p DSNP WEB-DL AAC2.0 H.264 (Yozakura-san Chi no Daisakusen 2nd Season, Multi-Subs)",
+    "Mission Yozakura Family S02E18 Yozakura Family Feud 1080p DSNP WEB-DL AAC2.0 H.264-VARYG (Yozakura-san Chi no Daisakusen 2nd Season, Multi-Subs)",
+    "[SubsPlease] Yozakura-san Chi no Daisakusen Season 2 Part 2 - 07 (1080p)",
+    "[SubsPlease] Yozakura-san Chi no Daisakusen Season 2 Cour 2 - 07 (1080p)",
+  ];
+
+  for (const title of validVerifiedReleases) {
+    assert.equal(
+      ReleaseFilter.matchesSeriesTitle(title, YOZAKURA_TITLES, {
+        allowUnmarkedSeason: true,
+        allowVerifiedSeason: true,
+      }),
+      true,
+      `Expected verified Yozakura S2 Part 2 release to match: ${title}`,
+    );
+  }
+
+  // Exact "2nd Season Part 2" release must match EVEN when unverified
+  assert.equal(
+    ReleaseFilter.matchesSeriesTitle(
+      "[Erai-raws] Yozakura-san Chi no Daisakusen 2nd Season Part 2 - 07 [1080p DSNP WEB-DL AVC AAC][MultiSub][5077C9E8]",
+      YOZAKURA_TITLES,
+      { allowUnmarkedSeason: false, allowVerifiedSeason: false },
+    ),
+    true,
+  );
+
+  // Unverified S02E07 (missing Part 2) must NOT match Part 2
+  assert.equal(
+    ReleaseFilter.matchesSeriesTitle(
+      "[DKB] Yozakura-san Chi no Daisakusen - S02E07 [1080p][HEVC x265 10bit][Multi-Subs]",
+      YOZAKURA_TITLES,
+      { allowUnmarkedSeason: false, allowVerifiedSeason: false },
+    ),
+    false,
+  );
+
+  // Wrong part or wrong season must NEVER match even when provider-verified
+  for (const wrong of [
+    "[Erai-raws] Yozakura-san Chi no Daisakusen 2nd Season Part 1 - 07 [1080p]",
+    "[DKB] Yozakura-san Chi no Daisakusen - S01E19 [1080p]",
+    "[DKB] Yozakura-san Chi no Daisakusen - S03E01 [1080p]",
+  ]) {
+    assert.equal(
+      ReleaseFilter.matchesSeriesTitle(wrong, YOZAKURA_TITLES, {
+        allowUnmarkedSeason: true,
+        allowVerifiedSeason: true,
+      }),
+      false,
+      `Wrong part/season must be rejected: ${wrong}`,
+    );
+  }
+
+  // Part 2 release must NOT leak into a Part 1 ("2nd Season") canonical title
+  assert.equal(
+    ReleaseFilter.matchesSeriesTitle(
+      "[Erai-raws] Yozakura-san Chi no Daisakusen 2nd Season Part 2 - 07 [1080p]",
+      ["Yozakura-san Chi no Daisakusen 2nd Season"],
+      { allowUnmarkedSeason: true, allowVerifiedSeason: true },
+    ),
+    false,
+  );
+});
+
+test("Job #4564 (Yozakura S2 Part 2 #213657 / Tsuki #9846) handles mixed Part 2 - 07 and S02E19/E18 dual numbering cleanly", () => {
+  const ep7Air = 1795340000;
+  const ep1Air = ep7Air - 6 * WEEK;
+  const context: PrequelOffsetContext = {
+    candidateOffsets: [12],
+    prequelStartDates: [ep1Air - 180 * DAY],
+    localEpisodes: makeWeeklySchedule(7, ep1Air, { 6: "Yozakura Family Feud" }),
+  };
+
+  const feed: AnimeToshoItem[] = [
+    makeTorrent(41565, "[DKB] Yozakura-san Chi no Daisakusen - S02E19 [1080p][HEVC x265 10bit][Multi-Subs][weekly]", {
+      tsukihime_episode_no: 7,
+      date: 1795372699,
+    }),
+    makeTorrent(41387, "[Erai-raws] Yozakura-san Chi no Daisakusen 2nd Season Part 2 - 07 [1080p DSNP WEBRip HEVC AAC][MultiSub][749956ED]", {
+      tsukihime_episode_no: 7,
+      date: 1795350334,
+    }),
+    makeTorrent(41380, "[Onalrie] Yozakura-san Chi no Daisakusen - S02E19 [1080p WEBRip AV1]", {
+      tsukihime_episode_no: 7,
+      date: 1795343000,
+    }),
+    makeTorrent(41365, "[Erai-raws] Yozakura-san Chi no Daisakusen 2nd Season Part 2 - 07 [480p DSNP WEB-DL AVC AAC][MultiSub][EBE3678F]", {
+      tsukihime_episode_no: 7,
+      date: 1795340358,
+    }),
+    makeTorrent(41364, "[Erai-raws] Yozakura-san Chi no Daisakusen 2nd Season Part 2 - 07 [1080p DSNP WEB-DL AVC AAC][MultiSub][5077C9E8]", {
+      tsukihime_episode_no: 7,
+      date: 1795340356,
+    }),
+    makeTorrent(41363, "[Erai-raws] Yozakura-san Chi no Daisakusen 2nd Season Part 2 - 07 [720p DSNP WEB-DL AVC AAC][MultiSub][7537DBDA]", {
+      tsukihime_episode_no: 7,
+      date: 1795340355,
+    }),
+    // Previous week's Episode 6 (ALL cumulative S02E18, including VARYG with episode title!)
+    makeTorrent(40132, "[Erai-raws] Mission: Yozakura Family S02E18 [1080p DSNP WEB-DL AVC AAC][MultiSub][0071F5ED]", {
+      tsukihime_episode_no: 6,
+      date: 1794756814,
+    }),
+    makeTorrent(40133, "[Erai-raws] Mission: Yozakura Family S02E18 [720p DSNP WEB-DL AVC AAC][MultiSub][C0AE050F]", {
+      tsukihime_episode_no: 6,
+      date: 1794756815,
+    }),
+    makeTorrent(40134, "[Erai-raws] Mission: Yozakura Family S02E18 [480p DSNP WEB-DL AVC AAC][MultiSub][1F1042C1]", {
+      tsukihime_episode_no: 6,
+      date: 1794756817,
+    }),
+    makeTorrent(39976, "[VARYG] Mission Yozakura Family S02E18 Yozakura Family Feud 1080p DSNP WEB-DL AAC2.0 H.264 (Yozakura-san Chi no Daisakusen 2nd Season, Multi-Subs)", {
+      tsukihime_episode_no: 6,
+      date: 1794733504,
+    }),
+    makeTorrent(39953, "[ToonsHub] Mission Yozakura Family S02E18 1080p DSNP WEB-DL AAC2.0 H.264 (Multi-Subs)", {
+      tsukihime_episode_no: 6,
+      date: 1794733035,
+    }),
+    makeTorrent(38798, "[DKB] Yozakura-san Chi no Daisakusen - S02E17 [1080p][HEVC x265 10bit][Multi-Subs][weekly]", {
+      tsukihime_episode_no: 5,
+      date: ep7Air - 2 * WEEK + 2 * HOUR,
+    }),
+  ];
+
+  // 1. Full Episode 7 feed -> dual-numbering mode (strict=false) picks Erai-raws 2nd Season Part 2 - 07 (Tier 1 H.264 3-quality!)
+  const detEp7 = detectVerifiedEpisodeOffset({ torrents: feed, knownTitles: YOZAKURA_TITLES, targetEp: 7, context });
+  assert.equal(detEp7.offset, 12);
+  assert.equal(detEp7.strict, false);
+
+  const ep7Bundles = ReleaseFilter.selectTopCandidateBundles(feed, 7, "sub", {
+    knownTitles: YOZAKURA_TITLES,
+    totalExpectedEps: null,
+    episodeOffset: detEp7.offset,
+    strictEpisodeOffset: detEp7.strict,
+  });
+  assert.ok(ep7Bundles.length >= 2);
+  assert.equal(ep7Bundles[0].group, "Erai-raws");
+  assert.equal(ep7Bundles[0].selectionTier, "h264_multi");
+  assert.equal(ep7Bundles[0].pipelineType, "vm_remux");
+  assert.equal(ep7Bundles[0].primaryEntry.effectiveEp, 7);
+  assert.deepEqual(Object.keys(ep7Bundles[0].qualities).sort(), ["1080p", "480p", "720p"]);
+  assert.ok(ep7Bundles.some(b => b.group === "DKB" && b.primaryEntry.effectiveEp === 19));
+
+  // 2. Episode 7 BEFORE DKB S02E19 uploads (only Erai-raws Part 2 - 07 + Ep 6 S02E18 exist) -> STILL picks Erai-raws Part 2 - 07!
+  const beforeS02E19 = feed.filter(t => t.id !== 41565 && t.id !== 41380);
+  const detBefore19 = detectVerifiedEpisodeOffset({ torrents: beforeS02E19, knownTitles: YOZAKURA_TITLES, targetEp: 7, context });
+  assert.equal(detBefore19.strict, false);
+  const bundlesBefore19 = ReleaseFilter.selectTopCandidateBundles(beforeS02E19, 7, "sub", {
+    knownTitles: YOZAKURA_TITLES,
+    episodeOffset: detBefore19.offset,
+    strictEpisodeOffset: detBefore19.strict,
+  });
+  assert.equal(bundlesBefore19[0]?.group, "Erai-raws");
+  assert.equal(bundlesBefore19[0]?.primaryEntry.effectiveEp, 7);
+
+  // 3. Episode 7 if ONLY S02E19 releases exist -> picks DKB S02E19 (effectiveEp: 19)!
+  const onlyS02E19 = feed.filter(t => t.id !== 41363 && t.id !== 41364 && t.id !== 41365 && t.id !== 41387);
+  const detOnly19 = detectVerifiedEpisodeOffset({ torrents: onlyS02E19, knownTitles: YOZAKURA_TITLES, targetEp: 7, context });
+  assert.equal(detOnly19.offset, 12);
+  const bundlesOnly19 = ReleaseFilter.selectTopCandidateBundles(onlyS02E19, 7, "sub", {
+    knownTitles: YOZAKURA_TITLES,
+    episodeOffset: detOnly19.offset,
+    strictEpisodeOffset: detOnly19.strict,
+  });
+  assert.equal(bundlesOnly19[0]?.group, "DKB");
+  assert.equal(bundlesOnly19[0]?.primaryEntry.effectiveEp, 19);
+
+  // 4. Episode 6 (ONLY S02E18 releases exist, with Ep 7 Part 2 - 07 also present & totalExpectedEps=null) -> picks Erai-raws S02E18 (Tier 1 H.264 3-quality)!
+  const ep6Bundles = ReleaseFilter.selectTopCandidateBundles(feed, 6, "sub", {
+    knownTitles: YOZAKURA_TITLES,
+    totalExpectedEps: null,
+    episodeOffset: detEp7.offset,
+    strictEpisodeOffset: detEp7.strict,
+  });
+  assert.equal(ep6Bundles[0]?.group, "Erai-raws");
+  assert.equal(ep6Bundles[0]?.selectionTier, "h264_multi");
+  assert.equal(ep6Bundles[0]?.primaryEntry.effectiveEp, 18);
+  assert.deepEqual(Object.keys(ep6Bundles[0]?.qualities || {}).sort(), ["1080p", "480p", "720p"]);
+
+  // 5. Even with ZERO DB prequel context (episodeOffset=0, totalExpectedEps=null), both Ep 7 and Ep 6 still resolve cleanly!
+  const noDbEp7 = ReleaseFilter.selectTopCandidateBundles(feed, 7, "sub", {
+    knownTitles: YOZAKURA_TITLES,
+    totalExpectedEps: null,
+  });
+  assert.equal(noDbEp7[0]?.group, "Erai-raws");
+  assert.equal(noDbEp7[0]?.primaryEntry.effectiveEp, 7);
+  const noDbEp6 = ReleaseFilter.selectTopCandidateBundles(feed, 6, "sub", {
+    knownTitles: YOZAKURA_TITLES,
+    totalExpectedEps: null,
+  });
+  assert.equal(noDbEp6[0]?.group, "Erai-raws");
+  assert.equal(noDbEp6[0]?.primaryEntry.effectiveEp, 18);
+});

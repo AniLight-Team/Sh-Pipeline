@@ -1612,15 +1612,19 @@ export class PipelineEngineService {
             totalExpectedEps,
             context: prequelOffsetContext,
           });
-          if (detected.offset > 0 && detected.strict) {
-            if (resolvedEpisodeOffset !== detected.offset) {
+          if (detected.offset > 0) {
+            if (resolvedEpisodeOffset !== detected.offset || strictEpisodeOffset !== detected.strict) {
               log.info(
                 "PipelineEngine",
-                `[Job #${job.id}] Verified cumulative episode offset +${detected.offset} (${detected.reason}: Ep ${job.episodeNumber} -> Torrent Ep ${job.episodeNumber + detected.offset})`,
+                `[Job #${job.id}] Verified cumulative episode offset +${detected.offset} (${detected.reason}, strict=${detected.strict}: Ep ${job.episodeNumber} -> Torrent Ep ${job.episodeNumber + detected.offset})`,
               );
             }
             resolvedEpisodeOffset = detected.offset;
-            strictEpisodeOffset = true;
+            strictEpisodeOffset = detected.strict;
+            episodeOffsetReason = detected.reason;
+          } else {
+            resolvedEpisodeOffset = 0;
+            strictEpisodeOffset = false;
             episodeOffsetReason = detected.reason;
           }
         }
@@ -2345,6 +2349,11 @@ export class PipelineEngineService {
         effectiveSelectionTier = "h264_single_1080p";
       }
 
+      const selectedEffectiveEp = Number(selectedBundle.primaryEntry.effectiveEp);
+      const appliedEpisodeOffset =
+        Number.isSafeInteger(selectedEffectiveEp) && selectedEffectiveEp > job.episodeNumber
+          ? selectedEffectiveEp - job.episodeNumber
+          : 0;
       const updatedMetadata = {
         ...(job.metadata || {}),
         processingMode,
@@ -2354,11 +2363,11 @@ export class PipelineEngineService {
         isBatchTorrent: isBatchExtracted,
         stagedQualities,
         availableQualities: stagedQualityList,
-        ...(resolvedEpisodeOffset > 0
+        ...(appliedEpisodeOffset > 0
           ? {
-              episodeOffset: resolvedEpisodeOffset,
+              episodeOffset: appliedEpisodeOffset,
               episodeOffsetReason,
-              effectiveEpisodeNumber: job.episodeNumber + resolvedEpisodeOffset,
+              effectiveEpisodeNumber: selectedEffectiveEp,
             }
           : {}),
       };
