@@ -166,6 +166,19 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
     };
   });
 
+  app.post("/storage/cleanup-kaggle", async () => {
+    const res = await PipelineEngineService.cleanupOrphanedKaggleResources({
+      maxDeletesPerAccount: 200,
+      minAgeMinutes: 10,
+    });
+    const freedGb = (res.freedBytes / (1024 ** 3)).toFixed(2);
+    return {
+      ok: true,
+      ...res,
+      message: `Deleted ${res.deletedDatasets} Kaggle dataset(s) (${freedGb} GiB freed) and ${res.deletedKernels} notebook(s)${res.skippedLiveRunning > 0 ? `, protected ${res.skippedLiveRunning} active item(s)` : ""}${res.failedDeletes > 0 ? ` (${res.failedDeletes} failed)` : ""}.`,
+    };
+  });
+
 
   // Resolve AniList ID to AniDB ID, Tsukihime ID, internal anime ID, title variations, and cover art
   app.get("/anime/resolve", async (req, reply) => {
@@ -882,6 +895,8 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
             .set({
               status: "created",
               lastError: null,
+              datasetSlug: PipelineEngineService.isBatchVmRemux(batch) ? "vm-direct-remux" : null,
+              kernelSlug: PipelineEngineService.isBatchVmRemux(batch) ? "ffmpeg-copy-remux" : null,
               attempt: batch.attempt + 1,
               heartbeatAt: new Date(),
               updatedAt: new Date(),
@@ -920,6 +935,10 @@ export const apiRoutes: FastifyPluginAsync = async (app: FastifyInstance) => {
             })
             .where(eq(schema.pipelineJob.id, j.id));
         }
+      }
+
+      for (const batch of selectedBatches) {
+        await PipelineEngineService.cleanupBatchKaggleResourcesByRecord(batch);
       }
 
       await db.delete(schema.pipelineBatch).where(inArray(schema.pipelineBatch.id, batchIds));

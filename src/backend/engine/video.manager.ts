@@ -57,7 +57,14 @@ export class VideoEncodingManager {
   private static kagglePacerChain: Promise<void> = Promise.resolve();
   private static lastKaggleRequestAt = 0;
   private static kaggleRateLimitCooldownUntil = 0;
-  private static readonly MIN_KAGGLE_REQUEST_INTERVAL_MS = 1800;
+  private static readonly MIN_KAGGLE_REQUEST_INTERVAL_MS = (() => {
+    const raw = process.env.KIRA_KAGGLE_MIN_INTERVAL_MS;
+    if (raw !== undefined && raw.trim() !== "") {
+      const parsed = Number.parseInt(raw, 10);
+      if (!Number.isNaN(parsed) && parsed >= 0) return parsed;
+    }
+    return 1800;
+  })();
 
   /**
    * Serializes and paces all Kaggle REST API requests across the entire process
@@ -132,6 +139,7 @@ export class VideoEncodingManager {
         throw netErr;
       }
 
+      const isBearerKey = VideoEncodingManager.isBearerToken(key);
       if (
         (res.status === 401 || res.status === 403) &&
         !headers.Authorization.startsWith("Bearer")
@@ -140,7 +148,8 @@ export class VideoEncodingManager {
         await VideoEncodingManager.acquireKaggleRequestSlot();
         res = await fetch(url, { method, headers, body });
       } else if (
-        (res.status === 401 || res.status === 403) &&
+        res.status === 401 &&
+        !isBearerKey &&
         headers.Authorization.startsWith("Bearer")
       ) {
         headers.Authorization =
@@ -616,8 +625,24 @@ export class VideoEncodingManager {
     return token;
   }
 
+  private isDatasetTitleConflictError(message: string): boolean {
+    return /already in use|duplicate|title.*exists|slug.*exists/i.test(message);
+  }
+
+  private buildCollisionFallbackSlug(baseSlug: string): string {
+    const cleaned = (baseSlug || "kira-batch")
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    const stripped = cleaned.replace(/-[a-f0-9]{6,12}$/i, "") || "kira-batch";
+    const prefix = stripped.slice(0, 38).replace(/-+$/, "");
+    const suffix = crypto.randomUUID().replace(/-/g, "").slice(0, 8);
+    return `${prefix}-${suffix}`;
+  }
+
   /**
    * Uploads multiple episode video files into ONE single Kaggle Dataset.
+   * Returns the registered dataset slug (automatically rotating to a fresh slug if Kaggle reports a title collision).
    */
   public async uploadBatchDatasetRest(
     items: KiraBatchUploadItem[],
@@ -625,13 +650,10 @@ export class VideoEncodingManager {
     username: string,
     key: string,
     onProgress?: () => Promise<void>,
-  ): Promise<boolean> {
+  ): Promise<string> {
     if (items.length === 0) {
       throw new Error("Cannot upload empty batch dataset to Kaggle");
     }
-
-    // Ensure any stale dataset with the same slug is removed before creating a fresh one
-    await this.deleteKaggleDataset(datasetSlug, username, key).catch(() => {});
 
     const totalGb = (
       items.reduce((acc, i) => acc + i.sizeBytes, 0) /
@@ -669,51 +691,78 @@ export class VideoEncodingManager {
 
     const createUrls = [
       "https://www.kaggle.com/api/v1/datasets/create/new",
-      "https://api.kaggle.com/v1/datasets/create/new",
       "https://api.kaggle.com/v1/datasets.DatasetApiService/CreateDataset",
+      "https://api.kaggle.com/v1/datasets/create/new",
     ];
 
-    let createRes: any = null;
-    let lastCreateErr: any = null;
+    let activeSlug = datasetSlug;
 
-    for (const cUrl of createUrls) {
-      try {
-        createRes = await this.makeKaggleRequest(cUrl, username, key, {
-          method: "POST",
-          payload: {
-            title: datasetSlug,
-            slug: datasetSlug,
-            ownerSlug: username,
-            licenseName: "CC0-1.0",
-            isPrivate: true,
-            files: tokens,
-          },
-        });
-        const statusStr = String(createRes?.status || "").toLowerCase();
-        if (!statusStr.includes("error") && !createRes?.error) {
-          lastCreateErr = null;
-          break;
+    for (let slugAttempt = 0; slugAttempt < 3; slugAttempt++) {
+      let createRes: any = null;
+      let lastCreateErr: any = null;
+      let titleConflict = false;
+
+      for (const cUrl of createUrls) {
+        try {
+          createRes = await this.makeKaggleRequest(cUrl, username, key, {
+            method: "POST",
+            payload: {
+              title: activeSlug,
+              slug: activeSlug,
+              ownerSlug: username,
+              licenseName: "CC0-1.0",
+              isPrivate: true,
+              files: tokens,
+            },
+          });
+          const statusStr = String(createRes?.status || "").toLowerCase();
+          const errText = String(createRes?.error || "");
+          if (!statusStr.includes("error") && !errText) {
+            log.success(
+              "Kaggle:Dataset",
+              `Dataset '${username}/${activeSlug}' registered on Kaggle; awaiting indexing...`,
+            );
+            return activeSlug;
+          }
+          if (this.isDatasetTitleConflictError(errText)) {
+            titleConflict = true;
+            break;
+          }
+          if (/quota|storage|limit|exceeded|too large|invalid/i.test(errText)) {
+            break;
+          }
+        } catch (err: any) {
+          lastCreateErr = err;
+          const msg = String(err?.message || err);
+          if (this.isDatasetTitleConflictError(msg)) {
+            titleConflict = true;
+            break;
+          }
         }
-      } catch (err: any) {
-        lastCreateErr = err;
       }
-    }
 
-    if (lastCreateErr && !createRes) {
-      throw new Error(
-        `Kaggle dataset creation failed: ${lastCreateErr?.message || lastCreateErr}`,
-      );
-    }
+      if (titleConflict && slugAttempt < 2) {
+        const nextSlug = this.buildCollisionFallbackSlug(datasetSlug);
+        log.warn(
+          "Kaggle:Dataset",
+          `Dataset title '${activeSlug}' is already in use on @${username}; retrying registration with fresh slug '${nextSlug}' (reusing uploaded GCS blobs)...`,
+        );
+        activeSlug = nextSlug;
+        continue;
+      }
 
-    const statusStr = String(createRes?.status || "").toLowerCase();
-    if (statusStr.includes("error") || createRes?.error) {
+      if (lastCreateErr && !createRes) {
+        throw new Error(
+          `Kaggle dataset creation failed: ${lastCreateErr?.message || lastCreateErr}`,
+        );
+      }
+
       throw new Error(
         `Kaggle dataset creation returned error: ${JSON.stringify(createRes)}`,
       );
     }
 
-    log.success("Kaggle:Dataset", `Dataset '${username}/${datasetSlug}' registered on Kaggle; awaiting indexing...`);
-    return true;
+    throw new Error(`Kaggle dataset creation exhausted slug retries for '${username}/${datasetSlug}'`);
   }
 
   public extractCleanStatus(rawStatus: any): string {
@@ -887,33 +936,172 @@ export class VideoEncodingManager {
     );
   }
 
+  private normalizeResourceSlug(slug: string, username: string): string {
+    const trimmed = (slug || "").trim().replace(/^\/+|\/+$/g, "");
+    if (!trimmed) return "";
+    const prefix = `${username.toLowerCase()}/`;
+    if (trimmed.toLowerCase().startsWith(prefix)) {
+      return trimmed.slice(prefix.length);
+    }
+    if (trimmed.includes("/")) {
+      return trimmed.split("/").pop() || "";
+    }
+    return trimmed;
+  }
+
+  private async doesKaggleDatasetExist(
+    datasetSlug: string,
+    username: string,
+    key: string,
+  ): Promise<boolean> {
+    try {
+      const viewData = await this.makeKaggleRequest(
+        `https://www.kaggle.com/api/v1/datasets/view/${encodeURIComponent(username)}/${encodeURIComponent(datasetSlug)}`,
+        username,
+        key,
+        { method: "GET", quietCodes: [400, 403, 404], maxRetries: 2 },
+      );
+      return Boolean(
+        viewData &&
+          (viewData.id ||
+            viewData.ref ||
+            viewData.titleNullable ||
+            viewData.title),
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private async doesKaggleKernelExist(
+    kernelSlug: string,
+    username: string,
+    key: string,
+  ): Promise<boolean> {
+    try {
+      const statusData = await this.makeKaggleRequest(
+        `https://www.kaggle.com/api/v1/kernels/status?userName=${encodeURIComponent(username)}&kernelSlug=${encodeURIComponent(kernelSlug)}`,
+        username,
+        key,
+        { method: "GET", quietCodes: [400, 403, 404], maxRetries: 2 },
+      );
+      return Boolean(
+        statusData && (statusData.status || statusData.state || statusData.raw),
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Permanently deletes a Kaggle Dataset via the official kagglesdk RPC endpoint
+   * (POST https://api.kaggle.com/v1/datasets.DatasetApiService/DeleteDataset) to free the 200 GB private quota.
+   */
   public async deleteKaggleDataset(
     datasetSlug: string,
     username: string,
     key: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    const cleanSlug = this.normalizeResourceSlug(datasetSlug, username);
+    if (!cleanSlug) return true;
+
     try {
-      await this.makeKaggleRequest(
-        "https://www.kaggle.com/api/v1/datasets/delete",
+      const res = await this.makeKaggleRequest(
+        "https://api.kaggle.com/v1/datasets.DatasetApiService/DeleteDataset",
         username,
         key,
         {
           method: "POST",
-          payload: { ownerSlug: username, datasetSlug },
-          quietCodes: [400, 403, 404],
+          payload: { ownerSlug: username, datasetSlug: cleanSlug },
+          quietCodes: [403, 404],
+          maxRetries: 4,
         },
       );
-      log.info("Kaggle:Cleanup", `Cleaned up Kaggle Dataset '${datasetSlug}'.`);
-    } catch {}
+      if (res?.error) {
+        log.warn(
+          "Kaggle:Cleanup",
+          `Failed to delete Kaggle Dataset '${username}/${cleanSlug}': ${res.error}`,
+        );
+        return false;
+      }
+      log.success(
+        "Kaggle:Cleanup",
+        `Deleted Kaggle Dataset '${username}/${cleanSlug}'.`,
+      );
+      return true;
+    } catch (err: any) {
+      const msg = String(err?.message || err);
+      if (msg.includes("HTTP 404")) {
+        return true;
+      }
+      if (msg.includes("HTTP 403")) {
+        const stillExists = await this.doesKaggleDatasetExist(
+          cleanSlug,
+          username,
+          key,
+        );
+        if (!stillExists) {
+          log.info(
+            "Kaggle:Cleanup",
+            `Kaggle Dataset '${username}/${cleanSlug}' is already absent on Kaggle.`,
+          );
+          return true;
+        }
+      }
+      log.warn(
+        "Kaggle:Cleanup",
+        `Could not delete Kaggle Dataset '${username}/${cleanSlug}': ${msg}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * Lists the authenticated user's own Kaggle datasets (including private datasets).
+   */
+  public async listUserDatasets(
+    username: string,
+    key: string,
+    maxPages = 15,
+  ): Promise<{ slug: string; ref: string; totalBytes: number; lastUpdated: string }[]> {
+    const results: { slug: string; ref: string; totalBytes: number; lastUpdated: string }[] = [];
+    for (let page = 1; page <= maxPages; page++) {
+      try {
+        const listUrl = `https://www.kaggle.com/api/v1/datasets/list?group=my&page=${page}&sortBy=updated`;
+        const res = await this.makeKaggleRequest(listUrl, username, key, {
+          method: "GET",
+          quietCodes: [400, 401, 403, 404],
+          maxRetries: 3,
+        });
+        if (!Array.isArray(res) || res.length === 0) break;
+        for (const item of res) {
+          const ref = String(item?.ref || "");
+          const slug = this.normalizeResourceSlug(ref || String(item?.slug || item?.titleNullable || item?.title || ""), username);
+          if (!slug) continue;
+          results.push({
+            slug,
+            ref: ref || `${username}/${slug}`,
+            totalBytes: Number(item?.totalBytesNullable ?? item?.totalBytes ?? 0),
+            lastUpdated: String(item?.lastUpdated || ""),
+          });
+        }
+        if (res.length < 20) break;
+      } catch {
+        break;
+      }
+    }
+    return results;
   }
 
   public async listUserKernels(
     username: string,
     key: string,
     pageSize = 20,
+    page = 1,
   ): Promise<any[]> {
     try {
-      const listUrl = `https://www.kaggle.com/api/v1/kernels/list?user=${encodeURIComponent(username)}&pageSize=${pageSize}&sortBy=dateRun`;
+      const pageParam = page > 1 ? `&page=${page}` : "";
+      const listUrl = `https://www.kaggle.com/api/v1/kernels/list?user=${encodeURIComponent(username)}&pageSize=${pageSize}${pageParam}&sortBy=dateRun`;
       const res = await this.makeKaggleRequest(listUrl, username, key, {
         method: "GET",
         quietCodes: [400, 401, 403, 404],
@@ -928,37 +1116,72 @@ export class VideoEncodingManager {
     kernelSlug: string,
     username: string,
     key: string,
-  ): Promise<void> {
-    try {
-      await this.makeKaggleRequest(
-        `https://www.kaggle.com/api/v1/kernels/cancel?userName=${encodeURIComponent(username)}&kernelSlug=${encodeURIComponent(kernelSlug)}`,
-        username,
-        key,
-        {
-          method: "POST",
-          quietCodes: [400, 403, 404],
-        },
-      );
-    } catch {}
-    await this.deleteKaggleKernel(kernelSlug, username, key).catch(() => {});
+  ): Promise<boolean> {
+    return await this.deleteKaggleKernel(kernelSlug, username, key);
   }
 
+  /**
+   * Permanently deletes a Kaggle Notebook/Kernel via the official kagglesdk RPC endpoint
+   * (POST https://api.kaggle.com/v1/kernels.KernelsApiService/DeleteKernel), also terminating queued/running runs.
+   */
   public async deleteKaggleKernel(
     kernelSlug: string,
     username: string,
     key: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    const cleanSlug = this.normalizeResourceSlug(kernelSlug, username);
+    if (!cleanSlug) return true;
+
     try {
-      await this.makeKaggleRequest(
-        `https://www.kaggle.com/api/v1/kernels/delete?userName=${encodeURIComponent(username)}&kernelSlug=${encodeURIComponent(kernelSlug)}`,
+      const res = await this.makeKaggleRequest(
+        "https://api.kaggle.com/v1/kernels.KernelsApiService/DeleteKernel",
         username,
         key,
         {
-          method: "DELETE",
-          quietCodes: [400, 403, 404],
+          method: "POST",
+          payload: { userName: username, kernelSlug: cleanSlug },
+          quietCodes: [403, 404],
+          maxRetries: 4,
         },
       );
-    } catch {}
+      const errMsg = res?.errorMessage || res?.error;
+      if (errMsg) {
+        log.warn(
+          "Kaggle:Cleanup",
+          `Failed to delete Kaggle Notebook '${username}/${cleanSlug}': ${errMsg}`,
+        );
+        return false;
+      }
+      log.success(
+        "Kaggle:Cleanup",
+        `Deleted Kaggle Notebook '${username}/${cleanSlug}'.`,
+      );
+      return true;
+    } catch (err: any) {
+      const msg = String(err?.message || err);
+      if (msg.includes("HTTP 404")) {
+        return true;
+      }
+      if (msg.includes("HTTP 403")) {
+        const stillExists = await this.doesKaggleKernelExist(
+          cleanSlug,
+          username,
+          key,
+        );
+        if (!stillExists) {
+          log.info(
+            "Kaggle:Cleanup",
+            `Kaggle Notebook '${username}/${cleanSlug}' is already absent on Kaggle.`,
+          );
+          return true;
+        }
+      }
+      log.warn(
+        "Kaggle:Cleanup",
+        `Could not delete Kaggle Notebook '${username}/${cleanSlug}': ${msg}`,
+      );
+      return false;
+    }
   }
 
   /**
@@ -1750,6 +1973,7 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
     manifestItems: KiraBatchManifestItem[],
     username: string,
     key: string,
+    onHeartbeat?: () => Promise<void>,
   ): Promise<void> {
     const acceleratorShape = "NvidiaTeslaT4";
     const kernelCode = this.generateBatchGpuKernelScript(manifestItems);
@@ -1763,6 +1987,9 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
     let lastErr: any = null;
 
     for (let pushAttempt = 1; pushAttempt <= 6; pushAttempt++) {
+      if (onHeartbeat) {
+        await onHeartbeat().catch(() => {});
+      }
       try {
         const pushRes = await this.makeKaggleRequest(
           "https://www.kaggle.com/api/v1/kernels/push",
@@ -1802,10 +2029,17 @@ print("KAGGLE_JOB_COMPLETE", flush=True)
           "Kaggle:Kernel",
           `Push attempt ${pushAttempt}/6 failed: ${errMsg}`,
         );
+        if (onHeartbeat) {
+          await onHeartbeat().catch(() => {});
+        }
         if (pushAttempt < 6) {
           // If dataset was still propagating on Kaggle IAM, wait for it before next push attempt
-          if (errMsg.toLowerCase().includes("dataset") || errMsg.includes("404") || errMsg.includes("400")) {
-            await this.waitForDatasetReady(datasetSlug, username, key, 150).catch(() => {});
+          if (
+            errMsg.toLowerCase().includes("dataset") ||
+            errMsg.includes("404") ||
+            errMsg.toLowerCase().includes("not found")
+          ) {
+            await this.waitForDatasetReady(datasetSlug, username, key, 150, onHeartbeat).catch(() => {});
           }
           await new Promise((r) => setTimeout(r, 14_000 * pushAttempt));
         }

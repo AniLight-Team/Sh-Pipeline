@@ -8,6 +8,7 @@ try {
   const result = spawnSync(process.execPath, [
     "--import", "tsx", "--test",
     "src/backend/engine/pipeline.test.ts",
+    "src/backend/engine/kaggle-cleanup.test.ts",
     "src/backend/engine/hf-upload.test.ts",
     "src/backend/engine/animetosho.client.test.ts",
     "src/backend/engine/discovery-titles.test.ts",
@@ -22,6 +23,7 @@ try {
     stdio: "inherit",
     env: { ...process.env, DATABASE_URL: "", DEFAULT_DOWNLOAD_DIR: temp, KIRA_STAGING_DIR: path.join(temp, "staging"),
       DOTENV_CONFIG_QUIET: "true", KIRA_MAX_STAGING_GB: "56", KIRA_BATCH_MAX_GB: "10",
+      KIRA_KAGGLE_MIN_INTERVAL_MS: "0",
       KIRA_DISCOVERY_CONCURRENCY: "16", KIRA_DISCOVERY_PER_ANIME_CONCURRENCY: "8", KIRA_VM_MAX_CONCURRENT_BATCHES: "2", KIRA_VM_FFMPEG_THREADS: "2" },
   });
   process.exitCode = result.status ?? 1;

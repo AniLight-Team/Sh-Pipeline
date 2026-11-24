@@ -65,6 +65,7 @@ import type {
   CandidateSelectionTier,
   EnqueueRequest,
   EnqueueResponse,
+  KaggleAccount,
   PipelineEpisodeResult,
   PipelineExecutionPolicy,
   PipelineExecutionType,
@@ -83,6 +84,11 @@ import { log } from "../utils/logger.js";
 let tablesInitialized = false;
 let lastWatchdogTimestamp: string | null = new Date().toISOString();
 let lastQuickReconcileAt = 0;
+let lastKaggleCleanupSweepAt = Date.now();
+let lastStagedCleanupSweepAt = Date.now();
+
+const KIRA_DATASET_SLUG_RE = /^kira-batch-(\d+)-[a-z0-9]{6,}$/i;
+const KIRA_KERNEL_SLUG_RE = /^enc-batch-(\d+)-[a-z0-9]{6,}$/i;
 
 type PipelineJob = typeof schema.pipelineJob.$inferSelect;
 type DiscoveryResult = {
@@ -135,6 +141,8 @@ export class PipelineEngineService {
   private static storedSourceDownload: { jobId: number; sizeBytes: number } | null = null;
   private static isDrainingVmRemux = false;
   private static isReconcilingEncoding = false;
+  private static isCleaningKaggleOrphans = false;
+  private static isCleaningStagedOrphans = false;
 
   public static getExecutionPolicy(): PipelineExecutionPolicy {
     return currentExecutionPolicy;
@@ -3677,6 +3685,69 @@ export class PipelineEngineService {
     return candidates[0];
   }
 
+  private static generateBatchDatasetSlug(batchId: number): string {
+    return `kira-batch-${batchId}-${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
+  }
+
+  private static generateBatchKernelSlug(batchId: number): string {
+    return `enc-batch-${batchId}-${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
+  }
+
+  /**
+   * Deletes the Kaggle notebook FIRST (cancelling any queued/running session and removing dataset references),
+   * then deletes the Kaggle dataset (freeing the 200 GB private storage quota).
+   */
+  public static async cleanupKaggleBatchResources(
+    videoManager: VideoEncodingManager,
+    account: KaggleAccount,
+    resources: { datasetSlug?: string | null; kernelSlug?: string | null },
+    reason: string,
+  ): Promise<{ kernelDeleted: boolean; datasetDeleted: boolean }> {
+    let kernelDeleted = true;
+    let datasetDeleted = true;
+
+    if (resources.kernelSlug) {
+      kernelDeleted = await videoManager
+        .deleteKaggleKernel(resources.kernelSlug, account.username, account.key)
+        .catch(() => false);
+    }
+    if (resources.datasetSlug) {
+      datasetDeleted = await videoManager
+        .deleteKaggleDataset(resources.datasetSlug, account.username, account.key)
+        .catch(() => false);
+    }
+
+    if (!kernelDeleted || !datasetDeleted) {
+      log.warn(
+        "PipelineEngine",
+        `Incomplete Kaggle cleanup (${reason}) on @${account.username}: kernel=${resources.kernelSlug || "none"} (ok=${kernelDeleted}), dataset=${resources.datasetSlug || "none"} (ok=${datasetDeleted})`,
+      );
+    }
+    return { kernelDeleted, datasetDeleted };
+  }
+
+  public static async cleanupBatchKaggleResourcesByRecord(batch: {
+    id: number;
+    pipelineType?: string | null;
+    kaggleUsername?: string | null;
+    triggerReason?: string | null;
+    datasetSlug?: string | null;
+    kernelSlug?: string | null;
+  }): Promise<void> {
+    if (this.isBatchVmRemux(batch)) return;
+    if (!batch.datasetSlug && !batch.kernelSlug) return;
+    try {
+      const account = this.resolveBatchKaggleAccount(batch.kaggleUsername || null);
+      const videoManager = new VideoEncodingManager();
+      await this.cleanupKaggleBatchResources(
+        videoManager,
+        account,
+        { kernelSlug: batch.kernelSlug, datasetSlug: batch.datasetSlug },
+        `batch #${batch.id} deleted`,
+      );
+    } catch {}
+  }
+
   public static async prepareAndUploadBatchDataset(batchId: number): Promise<{
     skipped: boolean;
     empty: boolean;
@@ -3696,17 +3767,19 @@ export class PipelineEngineService {
       }
 
       let account = this.resolveBatchKaggleAccount(batch.kaggleUsername);
-      const datasetSlug = batch.datasetSlug || `kira-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
-      const kernelSlug = batch.kernelSlug || `enc-batch-${batchId}-${crypto.randomUUID().slice(0, 6)}`;
 
       if (batch.status === "completed") {
         return {
           skipped: true,
           empty: false,
-          datasetSlug,
-          kernelSlug,
+          datasetSlug: batch.datasetSlug || "",
+          kernelSlug: batch.kernelSlug || "",
           kaggleUsername: account.username,
         };
+      }
+
+      if (batch.status === "failed") {
+        throw new Error(batch.lastError || `Batch #${batchId} is already marked failed`);
       }
 
       const videoManager = new VideoEncodingManager();
@@ -3720,16 +3793,20 @@ export class PipelineEngineService {
           account.username,
           account.key,
         );
-        if (dsStatus.state === "ready" || batch.status === "kernel_running") {
+        if (
+          dsStatus.state === "ready" ||
+          dsStatus.state === "indexing" ||
+          batch.status === "kernel_running"
+        ) {
           log.info(
             "PipelineEngine",
-            `Batch #${batchId} resuming existing dataset '${account.username}/${batch.datasetSlug}' (status=${batch.status})`,
+            `Batch #${batchId} resuming existing dataset '${account.username}/${batch.datasetSlug}' (status=${batch.status}, ds=${dsStatus.state})`,
           );
           return {
             skipped: true,
             empty: false,
             datasetSlug: batch.datasetSlug,
-            kernelSlug,
+            kernelSlug: batch.kernelSlug || this.generateBatchKernelSlug(batchId),
             kaggleUsername: account.username,
           };
         }
@@ -3744,11 +3821,32 @@ export class PipelineEngineService {
         return {
           skipped: true,
           empty: true,
-          datasetSlug,
-          kernelSlug,
+          datasetSlug: batch.datasetSlug || "",
+          kernelSlug: batch.kernelSlug || "",
           kaggleUsername: account.username,
         };
       }
+
+      // If this batch previously created a dataset/kernel on Kaggle before failing or stalling, delete them first
+      // and ALWAYS mint fresh unique slugs so we never collide with a reserved or existing Kaggle title.
+      if (batch.datasetSlug || batch.kernelSlug) {
+        await this.cleanupKaggleBatchResources(
+          videoManager,
+          account,
+          { kernelSlug: batch.kernelSlug, datasetSlug: batch.datasetSlug },
+          `batch #${batchId} fresh re-upload`,
+        );
+      }
+
+      let activeDatasetSlug = this.generateBatchDatasetSlug(batchId);
+      let activeKernelSlug = this.generateBatchKernelSlug(batchId);
+
+      const touchHeartbeat = async () => {
+        await db
+          .update(schema.pipelineBatch)
+          .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+          .where(eq(schema.pipelineBatch.id, batchId));
+      };
 
       await db
         .update(schema.pipelineBatch)
@@ -3756,8 +3854,8 @@ export class PipelineEngineService {
           pipelineType: "kaggle_gpu",
           status: "uploading",
           kaggleUsername: account.username,
-          datasetSlug,
-          kernelSlug,
+          datasetSlug: activeDatasetSlug,
+          kernelSlug: activeKernelSlug,
           startedAt: batch.startedAt || new Date(),
           heartbeatAt: new Date(),
           updatedAt: new Date(),
@@ -3766,53 +3864,80 @@ export class PipelineEngineService {
 
       log.info(
         "PipelineEngine",
-        `[Pipeline 2: Kaggle GPU] Batch #${batchId}: Uploading ${uploadItems.length} staged MKV(s) to Kaggle Dataset '${account.username}/${datasetSlug}'...`,
+        `[Pipeline 2: Kaggle GPU] Batch #${batchId}: Uploading ${uploadItems.length} staged file(s) to Kaggle Dataset '${account.username}/${activeDatasetSlug}'...`,
       );
 
       try {
-        await videoManager.uploadBatchDatasetRest(
+        activeDatasetSlug = await videoManager.uploadBatchDatasetRest(
           uploadItems,
-          datasetSlug,
+          activeDatasetSlug,
           account.username,
           account.key,
-          async () => {
-            await db
-              .update(schema.pipelineBatch)
-              .set({ heartbeatAt: new Date(), updatedAt: new Date() })
-              .where(eq(schema.pipelineBatch.id, batchId));
-          },
+          touchHeartbeat,
         );
       } catch (uploadErr: any) {
-        const altAccount = await this.selectAlternateKaggleAccount(account.username);
+        const prevAccount = account;
+        const prevDatasetSlug = activeDatasetSlug;
+        await this.cleanupKaggleBatchResources(
+          videoManager,
+          prevAccount,
+          { datasetSlug: prevDatasetSlug },
+          `batch #${batchId} upload failure on @${prevAccount.username}`,
+        );
+
+        const altAccount = await this.selectAlternateKaggleAccount(prevAccount.username);
         if (!altAccount) {
+          await db
+            .update(schema.pipelineBatch)
+            .set({ datasetSlug: null, kernelSlug: null, heartbeatAt: new Date(), updatedAt: new Date() })
+            .where(eq(schema.pipelineBatch.id, batchId));
           throw uploadErr;
         }
+
+        const altDatasetSlug = this.generateBatchDatasetSlug(batchId);
+        const altKernelSlug = this.generateBatchKernelSlug(batchId);
         log.warn(
           "PipelineEngine",
-          `Batch #${batchId}: Dataset upload failed on @${account.username} (${uploadErr?.message || uploadErr}). Rotating to alternate Kaggle account @${altAccount.username}...`,
+          `Batch #${batchId}: Dataset upload failed on @${prevAccount.username} (${uploadErr?.message || uploadErr}). Rotating to alternate Kaggle account @${altAccount.username} with fresh slug '${altDatasetSlug}'...`,
         );
         account = altAccount;
+        activeDatasetSlug = altDatasetSlug;
+        activeKernelSlug = altKernelSlug;
+
         await db
           .update(schema.pipelineBatch)
           .set({
             kaggleUsername: account.username,
+            datasetSlug: activeDatasetSlug,
+            kernelSlug: activeKernelSlug,
             heartbeatAt: new Date(),
             updatedAt: new Date(),
           })
           .where(eq(schema.pipelineBatch.id, batchId));
 
-        await videoManager.uploadBatchDatasetRest(
-          uploadItems,
-          datasetSlug,
-          account.username,
-          account.key,
-          async () => {
-            await db
-              .update(schema.pipelineBatch)
-              .set({ heartbeatAt: new Date(), updatedAt: new Date() })
-              .where(eq(schema.pipelineBatch.id, batchId));
-          },
-        );
+        try {
+          activeDatasetSlug = await videoManager.uploadBatchDatasetRest(
+            uploadItems,
+            activeDatasetSlug,
+            account.username,
+            account.key,
+            touchHeartbeat,
+          );
+        } catch (altUploadErr: any) {
+          await this.cleanupKaggleBatchResources(
+            videoManager,
+            account,
+            { datasetSlug: activeDatasetSlug },
+            `batch #${batchId} fallback upload failure on @${account.username}`,
+          );
+          await db
+            .update(schema.pipelineBatch)
+            .set({ datasetSlug: null, kernelSlug: null, heartbeatAt: new Date(), updatedAt: new Date() })
+            .where(eq(schema.pipelineBatch.id, batchId));
+          throw new Error(
+            `Dataset upload failed on @${prevAccount.username} (${uploadErr?.message || uploadErr}) and fallback @${account.username} (${altUploadErr?.message || altUploadErr})`,
+          );
+        }
       }
 
       await db
@@ -3820,6 +3945,8 @@ export class PipelineEngineService {
         .set({
           status: "waiting_dataset",
           kaggleUsername: account.username,
+          datasetSlug: activeDatasetSlug,
+          kernelSlug: activeKernelSlug,
           heartbeatAt: new Date(),
           updatedAt: new Date(),
         })
@@ -3828,8 +3955,8 @@ export class PipelineEngineService {
       return {
         skipped: false,
         empty: false,
-        datasetSlug,
-        kernelSlug,
+        datasetSlug: activeDatasetSlug,
+        kernelSlug: activeKernelSlug,
         kaggleUsername: account.username,
       };
     } finally {
@@ -3847,6 +3974,9 @@ export class PipelineEngineService {
       });
       if (!batch || batch.status === "completed" || batch.status === "kernel_running") {
         return;
+      }
+      if (batch.status === "failed") {
+        throw new Error(batch.lastError || `Batch #${batchId} is already marked failed`);
       }
 
       const account = this.resolveBatchKaggleAccount(batch.kaggleUsername);
@@ -3884,26 +4014,26 @@ export class PipelineEngineService {
       if (!batch || batch.status === "completed") {
         return;
       }
+      if (batch.status === "failed") {
+        throw new Error(batch.lastError || `Batch #${batchId} is already marked failed`);
+      }
 
       let account = this.resolveBatchKaggleAccount(batch.kaggleUsername);
-      const datasetSlug = batch.datasetSlug;
-      const kernelSlug = batch.kernelSlug;
-      if (!datasetSlug || !kernelSlug) {
-        throw new Error(`Batch #${batchId} missing datasetSlug or kernelSlug`);
-      }
+      let activeDatasetSlug = batch.datasetSlug || "";
+      let activeKernelSlug = batch.kernelSlug || this.generateBatchKernelSlug(batchId);
 
       const videoManager = new VideoEncodingManager();
 
-      if (batch.status === "kernel_running") {
+      if (batch.status === "kernel_running" && batch.kernelSlug) {
         const existingStatus = await videoManager.checkKernelStatusOnce(
-          kernelSlug,
+          batch.kernelSlug,
           account.username,
           account.key,
         );
         if (existingStatus.state === "running" || existingStatus.state === "completed") {
           log.info(
             "PipelineEngine",
-            `Batch #${batchId}: Re-attached to existing Kaggle kernel '${account.username}/${kernelSlug}' (state=${existingStatus.state})`,
+            `Batch #${batchId}: Re-attached to existing Kaggle kernel '${account.username}/${batch.kernelSlug}' (state=${existingStatus.state})`,
           );
           await db
             .update(schema.pipelineBatch)
@@ -3918,67 +4048,178 @@ export class PipelineEngineService {
         throw new Error(`Batch #${batchId} has 0 valid manifest items to push`);
       }
 
-      try {
-        await videoManager.pushBatchGpuKernel(
-          datasetSlug,
-          kernelSlug,
-          manifestItems,
-          account.username,
-          account.key,
-        );
-      } catch (pushErr: any) {
-        const altAccount = await this.selectAlternateKaggleAccount(account.username);
-        if (!altAccount || uploadItems.length === 0) {
-          throw pushErr;
-        }
-        log.warn(
-          "PipelineEngine",
-          `Batch #${batchId}: Kernel push failed on @${account.username} (${pushErr?.message || pushErr}). Rotating to alternate Kaggle account @${altAccount.username}...`,
-        );
-        account = altAccount;
+      const touchHeartbeat = async () => {
+        await db
+          .update(schema.pipelineBatch)
+          .set({ heartbeatAt: new Date(), updatedAt: new Date() })
+          .where(eq(schema.pipelineBatch.id, batchId));
+      };
+
+      // If a prior retry cleaned up its Kaggle dataset after a push failure, upload a fresh dataset before pushing
+      if (!activeDatasetSlug) {
+        activeDatasetSlug = this.generateBatchDatasetSlug(batchId);
+        activeKernelSlug = this.generateBatchKernelSlug(batchId);
         await db
           .update(schema.pipelineBatch)
           .set({
+            status: "uploading",
             kaggleUsername: account.username,
+            datasetSlug: activeDatasetSlug,
+            kernelSlug: activeKernelSlug,
+            heartbeatAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.pipelineBatch.id, batchId));
+
+        activeDatasetSlug = await videoManager.uploadBatchDatasetRest(
+          uploadItems,
+          activeDatasetSlug,
+          account.username,
+          account.key,
+          touchHeartbeat,
+        );
+        await db
+          .update(schema.pipelineBatch)
+          .set({
+            status: "waiting_dataset",
+            datasetSlug: activeDatasetSlug,
+            heartbeatAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(schema.pipelineBatch.id, batchId));
+        await videoManager.waitForDatasetReady(
+          activeDatasetSlug,
+          account.username,
+          account.key,
+          720,
+          touchHeartbeat,
+        );
+      } else if (!batch.kernelSlug) {
+        await db
+          .update(schema.pipelineBatch)
+          .set({ kernelSlug: activeKernelSlug, heartbeatAt: new Date(), updatedAt: new Date() })
+          .where(eq(schema.pipelineBatch.id, batchId));
+      }
+
+      try {
+        await videoManager.pushBatchGpuKernel(
+          activeDatasetSlug,
+          activeKernelSlug,
+          manifestItems,
+          account.username,
+          account.key,
+          touchHeartbeat,
+        );
+      } catch (pushErr: any) {
+        const prevAccount = account;
+        const prevDatasetSlug = activeDatasetSlug;
+        const prevKernelSlug = activeKernelSlug;
+
+        // Immediately delete BOTH the failed/draft notebook and its dataset on the previous account
+        // so we never leak 200 GB storage or duplicate datasets across account rotations!
+        await this.cleanupKaggleBatchResources(
+          videoManager,
+          prevAccount,
+          { kernelSlug: prevKernelSlug, datasetSlug: prevDatasetSlug },
+          `batch #${batchId} kernel push failed on @${prevAccount.username}`,
+        );
+
+        const altAccount = await this.selectAlternateKaggleAccount(prevAccount.username);
+        if (!altAccount || uploadItems.length === 0) {
+          await db
+            .update(schema.pipelineBatch)
+            .set({
+              status: "waiting_dataset",
+              datasetSlug: null,
+              kernelSlug: null,
+              heartbeatAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.pipelineBatch.id, batchId));
+          throw pushErr;
+        }
+
+        const altDatasetSlug = this.generateBatchDatasetSlug(batchId);
+        const altKernelSlug = this.generateBatchKernelSlug(batchId);
+        log.warn(
+          "PipelineEngine",
+          `Batch #${batchId}: Kernel push failed on @${prevAccount.username} (${pushErr?.message || pushErr}). Cleaned up old dataset/notebook and rotating to @${altAccount.username} with fresh slug '${altDatasetSlug}'...`,
+        );
+
+        let registeredAltSlug = altDatasetSlug;
+        await db
+          .update(schema.pipelineBatch)
+          .set({
+            kaggleUsername: altAccount.username,
+            datasetSlug: altDatasetSlug,
+            kernelSlug: altKernelSlug,
             status: "uploading",
             heartbeatAt: new Date(),
             updatedAt: new Date(),
           })
           .where(eq(schema.pipelineBatch.id, batchId));
 
-        await videoManager.uploadBatchDatasetRest(
-          uploadItems,
-          datasetSlug,
-          account.username,
-          account.key,
-          async () => {
-            await db
-              .update(schema.pipelineBatch)
-              .set({ heartbeatAt: new Date(), updatedAt: new Date() })
-              .where(eq(schema.pipelineBatch.id, batchId));
-          },
-        );
+        try {
+          registeredAltSlug = await videoManager.uploadBatchDatasetRest(
+            uploadItems,
+            altDatasetSlug,
+            altAccount.username,
+            altAccount.key,
+            touchHeartbeat,
+          );
+          await db
+            .update(schema.pipelineBatch)
+            .set({
+              status: "waiting_dataset",
+              datasetSlug: registeredAltSlug,
+              heartbeatAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.pipelineBatch.id, batchId));
 
-        await videoManager.waitForDatasetReady(
-          datasetSlug,
-          account.username,
-          account.key,
-          720,
-          async () => {
-            await db
-              .update(schema.pipelineBatch)
-              .set({ heartbeatAt: new Date(), updatedAt: new Date() })
-              .where(eq(schema.pipelineBatch.id, batchId));
-          },
-        );
+          await videoManager.waitForDatasetReady(
+            registeredAltSlug,
+            altAccount.username,
+            altAccount.key,
+            720,
+            touchHeartbeat,
+          );
 
-        await videoManager.pushBatchGpuKernel(
-          datasetSlug,
-          kernelSlug,
-          manifestItems,
-          account.username,
-          account.key,
-        );
+          await videoManager.pushBatchGpuKernel(
+            registeredAltSlug,
+            altKernelSlug,
+            manifestItems,
+            altAccount.username,
+            altAccount.key,
+            touchHeartbeat,
+          );
+
+          account = altAccount;
+          activeDatasetSlug = registeredAltSlug;
+          activeKernelSlug = altKernelSlug;
+        } catch (altErr: any) {
+          // Clean up the fallback account's dataset & notebook too so retries start completely clean!
+          await this.cleanupKaggleBatchResources(
+            videoManager,
+            altAccount,
+            { kernelSlug: altKernelSlug, datasetSlug: registeredAltSlug },
+            `batch #${batchId} fallback kernel push failed on @${altAccount.username}`,
+          );
+          await db
+            .update(schema.pipelineBatch)
+            .set({
+              status: "waiting_dataset",
+              datasetSlug: null,
+              kernelSlug: null,
+              heartbeatAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.pipelineBatch.id, batchId));
+
+          throw new Error(
+            `Kernel push failed on @${prevAccount.username} (${pushErr?.message || pushErr}) and fallback @${altAccount.username} (${altErr?.message || altErr})`,
+          );
+        }
       }
 
       await db
@@ -3986,6 +4227,8 @@ export class PipelineEngineService {
         .set({
           status: "kernel_running",
           kaggleUsername: account.username,
+          datasetSlug: activeDatasetSlug,
+          kernelSlug: activeKernelSlug,
           heartbeatAt: new Date(),
           updatedAt: new Date(),
         })
@@ -4192,12 +4435,13 @@ export class PipelineEngineService {
       await this.persistAndDeliverJobCompletion(job, jobOutputs);
     }
 
-    if (datasetSlug) {
-      await videoManager.deleteKaggleDataset(datasetSlug, account.username, account.key).catch(() => {});
-    }
-    if (kernelSlug) {
-      await videoManager.deleteKaggleKernel(kernelSlug, account.username, account.key).catch(() => {});
-    }
+    // Delete the Kaggle notebook FIRST (releases dataset references), then delete the dataset (frees 200 GB quota)
+    await this.cleanupKaggleBatchResources(
+      videoManager,
+      account,
+      { kernelSlug, datasetSlug },
+      `batch #${batchId} completed`,
+    );
 
     await db
       .update(schema.pipelineBatch)
@@ -4222,7 +4466,7 @@ export class PipelineEngineService {
     const batch = await db.query.pipelineBatch.findFirst({
       where: eq(schema.pipelineBatch.id, batchId),
     });
-    if (!batch || batch.status === "completed") return;
+    if (!batch || batch.status === "completed" || batch.status === "failed") return;
 
     log.error("PipelineEngine", `Batch #${batchId} failed: ${errorMsg}`);
 
@@ -4230,12 +4474,12 @@ export class PipelineEngineService {
       const videoManager = new VideoEncodingManager();
       try {
         const account = this.resolveBatchKaggleAccount(batch.kaggleUsername);
-        if (batch.datasetSlug) {
-          await videoManager.deleteKaggleDataset(batch.datasetSlug, account.username, account.key).catch(() => {});
-        }
-        if (batch.kernelSlug) {
-          await videoManager.deleteKaggleKernel(batch.kernelSlug, account.username, account.key).catch(() => {});
-        }
+        await this.cleanupKaggleBatchResources(
+          videoManager,
+          account,
+          { kernelSlug: batch.kernelSlug, datasetSlug: batch.datasetSlug },
+          `batch #${batchId} failed`,
+        );
       } catch {}
     }
 
@@ -4476,6 +4720,7 @@ export class PipelineEngineService {
 
       const twoMinsAgo = new Date(Date.now() - 2 * 60 * 1000);
       const fourMinsAgo = new Date(Date.now() - 4 * 60 * 1000);
+      const tenMinsAgo = new Date(Date.now() - 10 * 60 * 1000);
       const videoManager = new VideoEncodingManager();
 
       for (const batch of activeBatches) {
@@ -4549,7 +4794,8 @@ export class PipelineEngineService {
         } else if (
           (batch.status === "uploading" || batch.status === "created") &&
           !this.activeExecutingBatchIds.has(batch.id) &&
-          (!batch.heartbeatAt || batch.heartbeatAt < fourMinsAgo)
+          (!batch.heartbeatAt ||
+            batch.heartbeatAt < (batch.status === "uploading" ? tenMinsAgo : fourMinsAgo))
         ) {
           if (batch.status === "uploading") {
             await this.handleBatchFailure(
@@ -4650,6 +4896,48 @@ export class PipelineEngineService {
   }
 
   /**
+   * Recursively measures a staging file or folder's total size and its NEWEST mtime across all nested files/subdirs.
+   * This guarantees an actively-written subfolder (e.g. FFmpeg writing inside vm_remux_<id>_*) never appears stale.
+   */
+  private static inspectPathStatsRecursive(targetPath: string): {
+    sizeBytes: number;
+    latestMtimeMs: number;
+  } {
+    const stat = fs.statSync(targetPath);
+    let sizeBytes = stat.isFile() ? stat.size : 0;
+    let latestMtimeMs = stat.mtimeMs;
+
+    if (stat.isDirectory()) {
+      const stack = [targetPath];
+      while (stack.length > 0) {
+        const currentDir = stack.pop()!;
+        let entries: fs.Dirent[] = [];
+        try {
+          entries = fs.readdirSync(currentDir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const sub of entries) {
+          const childPath = path.join(currentDir, sub.name);
+          try {
+            const subStat = fs.statSync(childPath);
+            if (subStat.mtimeMs > latestMtimeMs) {
+              latestMtimeMs = subStat.mtimeMs;
+            }
+            if (sub.isFile()) {
+              sizeBytes += subStat.size;
+            } else if (sub.isDirectory()) {
+              stack.push(childPath);
+            }
+          } catch {}
+        }
+      }
+    }
+
+    return { sizeBytes, latestMtimeMs };
+  }
+
+  /**
    * Inspects the local SSD staging folder (`getKiraStagingDir()`) and cross-references every file on disk
    * with the jobs in `pipeline_encoding_job` so the operator can see exactly where staged files are stored,
    * which job/episode/quality owns each file, and whether any orphaned files exist on disk.
@@ -4679,9 +4967,11 @@ export class PipelineEngineService {
         quality: VideoResolutionQuality | null;
         pipelineType: PipelineExecutionType;
         jobStatus: string;
+        batchId: number | null;
       }
     >();
     const jobIdsWithKnownPaths = new Set<number>();
+    const activeBatchIds = new Set<number>(this.activeExecutingBatchIds);
     const jobById = new Map<
       number,
       {
@@ -4691,24 +4981,43 @@ export class PipelineEngineService {
         episodeNumber: number;
         pipelineType: PipelineExecutionType;
         jobStatus: string;
+        batchId: number | null;
       }
     >();
 
     if (DATABASE_URL) {
       try {
         await this.ensureTables();
-        const allJobs = await db
-          .select({
-            id: schema.pipelineJob.id,
-            anilistId: schema.pipelineJob.anilistId,
-            episodeNumber: schema.pipelineJob.episodeNumber,
-            status: schema.pipelineJob.status,
-            pipelineType: schema.pipelineJob.pipelineType,
-            stagedFilePath: schema.pipelineJob.stagedFilePath,
-            stagedQualities: schema.pipelineJob.stagedQualities,
-            metadata: schema.pipelineJob.metadata,
-          })
-          .from(schema.pipelineJob);
+        const [allJobs, activeBatchRows] = await Promise.all([
+          db
+            .select({
+              id: schema.pipelineJob.id,
+              anilistId: schema.pipelineJob.anilistId,
+              episodeNumber: schema.pipelineJob.episodeNumber,
+              status: schema.pipelineJob.status,
+              pipelineType: schema.pipelineJob.pipelineType,
+              batchId: schema.pipelineJob.batchId,
+              stagedFilePath: schema.pipelineJob.stagedFilePath,
+              stagedQualities: schema.pipelineJob.stagedQualities,
+              metadata: schema.pipelineJob.metadata,
+            })
+            .from(schema.pipelineJob),
+          db
+            .select({ id: schema.pipelineBatch.id })
+            .from(schema.pipelineBatch)
+            .where(
+              inArray(schema.pipelineBatch.status, [
+                "created",
+                "uploading",
+                "waiting_dataset",
+                "kernel_running",
+              ]),
+            ),
+        ]);
+
+        for (const ab of activeBatchRows) {
+          activeBatchIds.add(ab.id);
+        }
 
         for (const j of allJobs) {
           const pType: PipelineExecutionType = this.isJobVmRemux(j) ? "vm_remux" : "kaggle_gpu";
@@ -4720,6 +5029,7 @@ export class PipelineEngineService {
             episodeNumber: j.episodeNumber,
             pipelineType: pType,
             jobStatus: j.status,
+            batchId: j.batchId ?? null,
           });
 
           if (j.stagedFilePath) {
@@ -4732,6 +5042,7 @@ export class PipelineEngineService {
               quality: "1080p",
               pipelineType: pType,
               jobStatus: j.status,
+              batchId: j.batchId ?? null,
             });
           }
 
@@ -4750,6 +5061,7 @@ export class PipelineEngineService {
                   quality: qKey as VideoResolutionQuality,
                   pipelineType: pType,
                   jobStatus: j.status,
+                  batchId: j.batchId ?? null,
                 });
               }
             }
@@ -4764,21 +5076,10 @@ export class PipelineEngineService {
       if (fs.existsSync(stagingDir)) {
         const entries = fs.readdirSync(stagingDir, { withFileTypes: true });
         for (const entry of entries) {
-          if (entry.name === ".pipeline-policy.json") continue;
+          if (entry.name.startsWith(".")) continue;
           const fullPath = path.resolve(stagingDir, entry.name);
           try {
-            let sizeBytes = 0;
-            const stat = fs.statSync(fullPath);
-            if (entry.isFile()) {
-              sizeBytes = stat.size;
-            } else if (entry.isDirectory()) {
-              const subEntries = fs.readdirSync(fullPath, { withFileTypes: true });
-              for (const sub of subEntries) {
-                if (sub.isFile()) {
-                  sizeBytes += fs.statSync(path.join(fullPath, sub.name)).size;
-                }
-              }
-            }
+            const { sizeBytes, latestMtimeMs } = this.inspectPathStatsRecursive(fullPath);
 
             totalDiskBytes += sizeBytes;
 
@@ -4786,6 +5087,7 @@ export class PipelineEngineService {
             let matched = exactPathMatched;
             let inferredQuality: VideoResolutionQuality | null = matched?.quality || null;
             let isActiveTempWorkDir = false;
+            let parsedJobIdFromName: number | null = matched?.jobId ?? null;
 
             if (!matched) {
               // Try inferring Job ID from filename/dir pattern: job_123_ep1_1080p_..., staged_123_1080p_..., vm_remux_123_..., vm_remux_job_123_...
@@ -4794,6 +5096,7 @@ export class PipelineEngineService {
               );
               if (m) {
                 const parsedJobId = parseInt(m[1], 10);
+                parsedJobIdFromName = parsedJobId;
                 if (m[3]) {
                   inferredQuality = m[3].toLowerCase() as VideoResolutionQuality;
                 }
@@ -4804,30 +5107,46 @@ export class PipelineEngineService {
                     quality: inferredQuality,
                   };
                 }
+                const inProcessForJob =
+                  this.activeVmRemuxJobIds.has(parsedJobId) ||
+                  this.activeDiscoveringJobIds.has(parsedJobId) ||
+                  this.storedSourceDownload?.jobId === parsedJobId;
                 if (
-                  entry.isDirectory() &&
-                  /^vm_remux_/i.test(entry.name) &&
-                  (this.activeVmRemuxJobIds.has(parsedJobId) ||
-                    ["encoding", "staged", "failed"].includes(jInfo?.jobStatus || ""))
+                  inProcessForJob ||
+                  (entry.isDirectory() &&
+                    /^vm_remux_/i.test(entry.name) &&
+                    ["downloading", "encoding", "staged", "failed"].includes(jInfo?.jobStatus || ""))
                 ) {
                   isActiveTempWorkDir = true;
                 }
-              } else if (entry.isDirectory() && /^subs_[a-f0-9]+$/i.test(entry.name)) {
-                // Keep in-flight subtitle extraction temp directories for 15 minutes
-                const ageMs = Date.now() - stat.mtime.getTime();
+              } else if (entry.isDirectory() && /^subs_[a-f0-9-]+$/i.test(entry.name)) {
+                // Keep in-flight subtitle extraction temp directories for 15 minutes or while any discovery runs
+                const ageMs = Date.now() - latestMtimeMs;
                 if (ageMs < 15 * 60 * 1000 || this.activeDiscoveringJobIds.size > 0) {
                   isActiveTempWorkDir = true;
                 }
               }
             }
 
-            // A file is active (not orphan) ONLY if:
-            // - It is an active temp workDir (vm_remux_<id>_* for an active encoding job, or recent subs_*), OR
-            // - Its exact path is currently linked in DB to a downloading/staged/encoding job, OR
-            // - DB wasn't queried and its filename belongs to an active job.
-            // Any superseded duplicate file (same jobId, not in pathToJobInfo) IS marked orphan so cleanup frees it.
+            const inProcessOwner = Boolean(
+              parsedJobIdFromName != null &&
+                (this.activeVmRemuxJobIds.has(parsedJobIdFromName) ||
+                  this.activeDiscoveringJobIds.has(parsedJobIdFromName) ||
+                  this.storedSourceDownload?.jobId === parsedJobIdFromName),
+            );
+            const belongsToActiveBatch = Boolean(
+              matched?.batchId != null && activeBatchIds.has(matched.batchId),
+            );
+
+            // A file/folder is active (not orphan) if:
+            // - It is owned by an in-process worker or active batch, OR
+            // - It is an active temp workDir (vm_remux_<id>_* for an active/retained job, or recent subs_*), OR
+            // - Its exact path is currently linked in DB to a queued/downloading/staged/encoding/failed job, OR
+            // - Its job is active in DB and this entry is not a superseded duplicate file.
             const hasActiveDbStatus = Boolean(
-              matched && ["downloading", "staged", "encoding", "failed"].includes(matched.jobStatus),
+              matched &&
+                (["downloading", "staged", "encoding", "failed"].includes(matched.jobStatus) ||
+                  (exactPathMatched && matched.jobStatus === "queued")),
             );
             const isSupersededDuplicate =
               !exactPathMatched &&
@@ -4836,7 +5155,10 @@ export class PipelineEngineService {
               jobIdsWithKnownPaths.has(matched!.jobId);
 
             const isActiveOwner =
-              isActiveTempWorkDir || (hasActiveDbStatus && !isSupersededDuplicate);
+              inProcessOwner ||
+              belongsToActiveBatch ||
+              isActiveTempWorkDir ||
+              (hasActiveDbStatus && !isSupersededDuplicate);
             const isOrphan = !isActiveOwner;
 
             if (isOrphan) {
@@ -4848,9 +5170,9 @@ export class PipelineEngineService {
               filename: entry.name,
               fullPath,
               sizeBytes,
-              modifiedAt: stat.mtime.toISOString(),
+              modifiedAt: new Date(latestMtimeMs).toISOString(),
               isDirectory: entry.isDirectory(),
-              jobId: matched?.jobId ?? null,
+              jobId: matched?.jobId ?? parsedJobIdFromName,
               anilistId: matched?.anilistId ?? null,
               animeTitle: matched?.animeTitle ?? null,
               episodeNumber: matched?.episodeNumber ?? null,
@@ -4881,62 +5203,412 @@ export class PipelineEngineService {
 
   /**
    * Deletes all orphaned files and temporary folders in `getKiraStagingDir()` that do not belong
-   * to any currently active (`downloading`, `staged`, or `encoding`) job.
+   * to any currently active (`downloading`, `staged`, `encoding`, `failed`, or in-process) job.
    */
-  public static async cleanupOrphanedStagedFiles(): Promise<{
+  public static async cleanupOrphanedStagedFiles(options: {
+    minAgeMinutes?: number;
+  } = {}): Promise<{
     deletedCount: number;
     freedBytes: number;
     requeuedMissingJobs: number;
   }> {
     if (!DATABASE_URL) throw new Error("Database connection is required before orphan cleanup.");
-    const report = await this.inspectStagedFilesOnDisk();
-    let deletedCount = 0;
-    let freedBytes = 0;
-    let requeuedMissingJobs = 0;
+    if (this.isCleaningStagedOrphans) {
+      return { deletedCount: 0, freedBytes: 0, requeuedMissingJobs: 0 };
+    }
+    this.isCleaningStagedOrphans = true;
 
-    for (const file of report.files) {
-      if (file.isOrphan && Date.now() - new Date(file.modifiedAt).getTime() > 10 * 60_000) {
+    try {
+      const minAgeMs = Math.max(10, options.minAgeMinutes ?? 10) * 60_000;
+      const report = await this.inspectStagedFilesOnDisk();
+      let deletedCount = 0;
+      let freedBytes = 0;
+      let requeuedMissingJobs = 0;
+
+      for (const file of report.files) {
+        if (!file.isOrphan) continue;
+        if (
+          file.jobId != null &&
+          (this.activeVmRemuxJobIds.has(file.jobId) ||
+            this.activeDiscoveringJobIds.has(file.jobId) ||
+            this.storedSourceDownload?.jobId === file.jobId)
+        ) {
+          continue;
+        }
         try {
+          // Re-check freshest recursive mtime right before deletion so actively-written folders are never touched
+          const fresh = this.inspectPathStatsRecursive(file.fullPath);
+          if (Date.now() - fresh.latestMtimeMs <= minAgeMs) {
+            continue;
+          }
           await fs.promises.rm(file.fullPath, { recursive: true, force: true });
           deletedCount++;
-          freedBytes += file.sizeBytes;
+          freedBytes += fresh.sizeBytes;
         } catch {}
+      }
+
+      if (DATABASE_URL) {
+        try {
+          await this.ensureTables();
+          const stagedJobs = await db
+            .select()
+            .from(schema.pipelineJob)
+            .where(eq(schema.pipelineJob.status, "staged"));
+
+          for (const j of stagedJobs) {
+            if (
+              this.activeDiscoveringJobIds.has(j.id) ||
+              this.activeVmRemuxJobIds.has(j.id) ||
+              this.storedSourceDownload?.jobId === j.id
+            ) {
+              continue;
+            }
+            if (!this.hasValidStagedFiles(j)) {
+              await db
+                .update(schema.pipelineJob)
+                .set({
+                  status: "queued",
+                  batchId: null,
+                  stagedFilePath: null,
+                  lastError: "Staged file missing on disk; re-queued for torrent discovery",
+                  updatedAt: new Date(),
+                })
+                .where(eq(schema.pipelineJob.id, j.id));
+              requeuedMissingJobs++;
+            }
+          }
+        } catch {}
+      }
+
+      if (deletedCount > 0) {
+        log.info(
+          "Storage:Cleanup",
+          `Cleaned ${deletedCount} orphaned staging item(s) (${(freedBytes / (1024 * 1024)).toFixed(1)} MB freed).`,
+        );
+        setImmediate(() => {
+          this.onStagingSpaceFreed().catch(() => {});
+        });
+      }
+
+      return { deletedCount, freedBytes, requeuedMissingJobs };
+    } finally {
+      this.isCleaningStagedOrphans = false;
+    }
+  }
+
+  public static async cleanupOrphanedStagedFilesIfDue(options: {
+    force?: boolean;
+    minAgeMinutes?: number;
+  } = {}): Promise<{
+    deletedCount: number;
+    freedBytes: number;
+    requeuedMissingJobs: number;
+  }> {
+    if (!DATABASE_URL || this.isCleaningStagedOrphans) {
+      return { deletedCount: 0, freedBytes: 0, requeuedMissingJobs: 0 };
+    }
+    const now = Date.now();
+    if (!options.force && now - lastStagedCleanupSweepAt < 15 * 60 * 1000) {
+      return { deletedCount: 0, freedBytes: 0, requeuedMissingJobs: 0 };
+    }
+    lastStagedCleanupSweepAt = now;
+    try {
+      return await this.cleanupOrphanedStagedFiles({
+        minAgeMinutes: options.minAgeMinutes ?? 20,
+      });
+    } catch (err: any) {
+      log.warn("Storage:Cleanup", `Scheduled staging orphan sweep warning: ${err?.message || err}`);
+      return { deletedCount: 0, freedBytes: 0, requeuedMissingJobs: 0 };
+    }
+  }
+
+  /**
+   * Pure safety filter that selects only SH Pipeline temporary Kaggle datasets (`kira-batch-*`) and
+   * notebooks (`enc-batch-*`) that do NOT belong to any active batch and are older than `minAgeMs`.
+   * Never matches personal/non-pipeline datasets or notebooks, and also protects any batch whose
+   * corresponding notebook is still fresh (< minAgeMs).
+   */
+  public static selectOrphanedKaggleResources(params: {
+    datasets: { slug: string; totalBytes: number; lastUpdated: string }[];
+    kernels: { slug: string; lastRunTime: string }[];
+    activeBatchIds: Set<number>;
+    activeDatasetSlugs: Set<string>;
+    activeKernelSlugs: Set<string>;
+    nowMs?: number;
+    minAgeMs?: number;
+    maxDeletes?: number;
+  }): {
+    datasetsToDelete: { slug: string; batchId: number; totalBytes: number }[];
+    kernelsToDelete: { slug: string; batchId: number }[];
+  } {
+    const nowMs = params.nowMs ?? Date.now();
+    const minAgeMs = params.minAgeMs ?? 20 * 60 * 1000;
+    const maxDeletes = Math.max(1, params.maxDeletes ?? 25);
+
+    const isOldEnough = (iso: string): boolean => {
+      if (!iso) return false;
+      const parsed = Date.parse(iso);
+      if (Number.isNaN(parsed)) return false;
+      return nowMs - parsed >= minAgeMs;
+    };
+
+    const protectedBatchIds = new Set<number>(params.activeBatchIds);
+    const kernelsToDelete: { slug: string; batchId: number }[] = [];
+
+    for (const k of params.kernels) {
+      const slug = (k.slug || "").trim();
+      const match = slug.match(KIRA_KERNEL_SLUG_RE);
+      if (!match) continue;
+      const batchId = Number(match[1]);
+      if (params.activeBatchIds.has(batchId) || params.activeKernelSlugs.has(slug)) {
+        protectedBatchIds.add(batchId);
+        continue;
+      }
+      if (!isOldEnough(k.lastRunTime)) {
+        // Protect this batch's dataset as well if its notebook ran recently
+        protectedBatchIds.add(batchId);
+        continue;
+      }
+      if (kernelsToDelete.length < maxDeletes) {
+        kernelsToDelete.push({ slug, batchId });
       }
     }
 
-    if (DATABASE_URL) {
-      try {
-        await this.ensureTables();
-        const stagedJobs = await db
-          .select()
+    const datasetsToDelete: { slug: string; batchId: number; totalBytes: number }[] = [];
+    for (const d of params.datasets) {
+      if (datasetsToDelete.length >= maxDeletes) break;
+      const slug = (d.slug || "").trim();
+      const match = slug.match(KIRA_DATASET_SLUG_RE);
+      if (!match) continue;
+      const batchId = Number(match[1]);
+      if (protectedBatchIds.has(batchId) || params.activeDatasetSlugs.has(slug)) continue;
+      if (!isOldEnough(d.lastUpdated)) continue;
+      datasetsToDelete.push({ slug, batchId, totalBytes: Number(d.totalBytes || 0) });
+    }
+
+    return { datasetsToDelete, kernelsToDelete };
+  }
+
+  /**
+   * Safely deletes orphaned `kira-batch-*` datasets and `enc-batch-*` notebooks on all configured Kaggle accounts
+   * so completed/failed/crashed batches never accumulate toward Kaggle's 200 GB private dataset storage cap.
+   * Multi-layer protection guarantees processing batches are NEVER deleted:
+   *  1. Requires verified DB connection.
+   *  2. Protects all active DB batches, all batches owning any 'encoding' job, and all in-process batches.
+   *  3. Checks live Kaggle status for each candidate notebook before deleting — if Kaggle reports it running/queued,
+   *     skips both the notebook AND its batch's dataset.
+   *  4. Only touches strict `kira-batch-<id>-<hex>` / `enc-batch-<id>-<hex>` slugs older than `minAgeMinutes`.
+   */
+  public static async cleanupOrphanedKaggleResources(options: {
+    maxDeletesPerAccount?: number;
+    minAgeMinutes?: number;
+    videoManager?: VideoEncodingManager;
+  } = {}): Promise<{
+    deletedDatasets: number;
+    deletedKernels: number;
+    freedBytes: number;
+    failedDeletes: number;
+    skippedLiveRunning: number;
+  }> {
+    if (!DATABASE_URL || this.isCleaningKaggleOrphans) {
+      return { deletedDatasets: 0, deletedKernels: 0, freedBytes: 0, failedDeletes: 0, skippedLiveRunning: 0 };
+    }
+    this.isCleaningKaggleOrphans = true;
+
+    try {
+      await this.ensureTables();
+
+      const videoManager = options.videoManager || new VideoEncodingManager();
+      const kaggleAccounts = videoManager.getKaggleAccounts();
+      if (kaggleAccounts.length === 0) {
+        return { deletedDatasets: 0, deletedKernels: 0, freedBytes: 0, failedDeletes: 0, skippedLiveRunning: 0 };
+      }
+
+      const [activeBatches, encodingJobs] = await Promise.all([
+        db
+          .select({
+            id: schema.pipelineBatch.id,
+            datasetSlug: schema.pipelineBatch.datasetSlug,
+            kernelSlug: schema.pipelineBatch.kernelSlug,
+          })
+          .from(schema.pipelineBatch)
+          .where(
+            inArray(schema.pipelineBatch.status, [
+              "created",
+              "uploading",
+              "waiting_dataset",
+              "kernel_running",
+            ]),
+          ),
+        db
+          .select({ batchId: schema.pipelineJob.batchId })
           .from(schema.pipelineJob)
-          .where(eq(schema.pipelineJob.status, "staged"));
+          .where(and(eq(schema.pipelineJob.status, "encoding"), isNotNull(schema.pipelineJob.batchId))),
+      ]);
 
-        for (const j of stagedJobs) {
-          if (!this.hasValidStagedFiles(j)) {
-            await db
-              .update(schema.pipelineJob)
-              .set({
-                status: "queued",
-                batchId: null,
-                stagedFilePath: null,
-                lastError: "Staged file missing on disk; re-queued for torrent discovery",
-                updatedAt: new Date(),
-              })
-              .where(eq(schema.pipelineJob.id, j.id));
-            requeuedMissingJobs++;
+      const activeBatchIds = new Set<number>([
+        ...this.activeExecutingBatchIds,
+        ...activeBatches.map((b) => b.id),
+        ...encodingJobs.map((j) => j.batchId).filter((id): id is number => id != null),
+      ]);
+      const activeDatasetSlugs = new Set<string>(
+        activeBatches.map((b) => b.datasetSlug).filter((s): s is string => Boolean(s)),
+      );
+      const activeKernelSlugs = new Set<string>(
+        activeBatches.map((b) => b.kernelSlug).filter((s): s is string => Boolean(s)),
+      );
+
+      const maxDeletesPerAccount = Math.max(1, options.maxDeletesPerAccount ?? 25);
+      const minAgeMs = Math.max(5, options.minAgeMinutes ?? 20) * 60 * 1000;
+
+      let deletedDatasets = 0;
+      let deletedKernels = 0;
+      let freedBytes = 0;
+      let failedDeletes = 0;
+      let skippedLiveRunning = 0;
+
+      for (const acc of kaggleAccounts) {
+        const datasets = await videoManager.listUserDatasets(acc.username, acc.key, 15);
+        const kernelsRaw: { slug: string; lastRunTime: string }[] = [];
+        for (let page = 1; page <= 5; page++) {
+          const pageItems = await videoManager.listUserKernels(acc.username, acc.key, 50, page);
+          if (!pageItems.length) break;
+          for (const item of pageItems) {
+            const ref = String(item?.ref || "").trim();
+            const slug = ref.includes("/") ? ref.split("/").pop() || "" : String(item?.slug || "").trim();
+            if (!slug) continue;
+            kernelsRaw.push({ slug, lastRunTime: String(item?.lastRunTime || "") });
           }
+          if (pageItems.length < 50) break;
         }
-      } catch {}
+
+        const plan = this.selectOrphanedKaggleResources({
+          datasets,
+          kernels: kernelsRaw,
+          activeBatchIds,
+          activeDatasetSlugs,
+          activeKernelSlugs,
+          minAgeMs,
+          maxDeletes: maxDeletesPerAccount,
+        });
+
+        const accResult = await this.executeKaggleCleanupPlanForAccount(videoManager, acc, plan);
+        deletedDatasets += accResult.deletedDatasets;
+        deletedKernels += accResult.deletedKernels;
+        freedBytes += accResult.freedBytes;
+        failedDeletes += accResult.failedDeletes;
+        skippedLiveRunning += accResult.skippedLiveRunning;
+      }
+
+      if (deletedDatasets > 0 || deletedKernels > 0 || failedDeletes > 0 || skippedLiveRunning > 0) {
+        log.info(
+          "Kaggle:Cleanup",
+          `Orphan sweep complete: deleted ${deletedDatasets} dataset(s) (${(freedBytes / (1024 ** 3)).toFixed(2)} GiB freed) and ${deletedKernels} notebook(s)${skippedLiveRunning > 0 ? `, protected ${skippedLiveRunning} live/active item(s)` : ""}${failedDeletes > 0 ? ` (${failedDeletes} failed)` : ""}.`,
+        );
+      }
+
+      return { deletedDatasets, deletedKernels, freedBytes, failedDeletes, skippedLiveRunning };
+    } finally {
+      this.isCleaningKaggleOrphans = false;
+    }
+  }
+
+  /**
+   * Executes a planned Kaggle orphan cleanup for one account:
+   * - Re-checks live Kaggle status for each candidate notebook before deleting.
+   * - If Kaggle reports the notebook is still running/queued (or status check fails), protects BOTH the notebook
+   *   and its batch's dataset so an active run can never be interrupted.
+   * - Deletes confirmed non-running notebooks first, then datasets.
+   */
+  public static async executeKaggleCleanupPlanForAccount(
+    videoManager: VideoEncodingManager,
+    account: KaggleAccount,
+    plan: {
+      datasetsToDelete: { slug: string; batchId: number; totalBytes: number }[];
+      kernelsToDelete: { slug: string; batchId: number }[];
+    },
+  ): Promise<{
+    deletedDatasets: number;
+    deletedKernels: number;
+    freedBytes: number;
+    failedDeletes: number;
+    skippedLiveRunning: number;
+  }> {
+    let deletedDatasets = 0;
+    let deletedKernels = 0;
+    let freedBytes = 0;
+    let failedDeletes = 0;
+    let skippedLiveRunning = 0;
+    const liveRunningBatchIds = new Set<number>();
+
+    for (const k of plan.kernelsToDelete) {
+      if (this.activeExecutingBatchIds.has(k.batchId)) {
+        liveRunningBatchIds.add(k.batchId);
+        skippedLiveRunning++;
+        continue;
+      }
+      const liveStatus = await videoManager
+        .checkKernelStatusOnce(k.slug, account.username, account.key)
+        .catch(() => ({ state: "running" as const, rawStatus: "check_failed_keep_safe" }));
+      if (liveStatus.state === "running") {
+        liveRunningBatchIds.add(k.batchId);
+        skippedLiveRunning++;
+        log.info(
+          "Kaggle:Cleanup",
+          `Protecting live Kaggle notebook '${account.username}/${k.slug}' (state=${liveStatus.rawStatus}) and Batch #${k.batchId}'s dataset from orphan sweep.`,
+        );
+        continue;
+      }
+      const ok = await videoManager.deleteKaggleKernel(k.slug, account.username, account.key);
+      if (ok) deletedKernels++;
+      else failedDeletes++;
     }
 
-    if (deletedCount > 0) {
-      setImmediate(() => {
-        this.onStagingSpaceFreed().catch(() => {});
+    for (const d of plan.datasetsToDelete) {
+      if (liveRunningBatchIds.has(d.batchId) || this.activeExecutingBatchIds.has(d.batchId)) {
+        skippedLiveRunning++;
+        continue;
+      }
+      const ok = await videoManager.deleteKaggleDataset(d.slug, account.username, account.key);
+      if (ok) {
+        deletedDatasets++;
+        freedBytes += d.totalBytes;
+      } else {
+        failedDeletes++;
+      }
+    }
+
+    return { deletedDatasets, deletedKernels, freedBytes, failedDeletes, skippedLiveRunning };
+  }
+
+  public static async cleanupOrphanedKaggleResourcesIfDue(options: {
+    force?: boolean;
+    maxDeletesPerAccount?: number;
+    minAgeMinutes?: number;
+  } = {}): Promise<{
+    deletedDatasets: number;
+    deletedKernels: number;
+    freedBytes: number;
+    failedDeletes: number;
+    skippedLiveRunning: number;
+  }> {
+    if (!DATABASE_URL || this.isCleaningKaggleOrphans) {
+      return { deletedDatasets: 0, deletedKernels: 0, freedBytes: 0, failedDeletes: 0, skippedLiveRunning: 0 };
+    }
+    const now = Date.now();
+    if (!options.force && now - lastKaggleCleanupSweepAt < 15 * 60 * 1000) {
+      return { deletedDatasets: 0, deletedKernels: 0, freedBytes: 0, failedDeletes: 0, skippedLiveRunning: 0 };
+    }
+    lastKaggleCleanupSweepAt = now;
+    try {
+      return await this.cleanupOrphanedKaggleResources({
+        maxDeletesPerAccount: options.maxDeletesPerAccount ?? 25,
+        minAgeMinutes: options.minAgeMinutes ?? 20,
       });
+    } catch (err: any) {
+      log.warn("Kaggle:Cleanup", `Scheduled Kaggle orphan sweep warning: ${err?.message || err}`);
+      return { deletedDatasets: 0, deletedKernels: 0, freedBytes: 0, failedDeletes: 0, skippedLiveRunning: 0 };
     }
-
-    return { deletedCount, freedBytes, requeuedMissingJobs };
   }
 
   public static async executeBatch(batchId: number): Promise<void> {
@@ -4947,7 +5619,7 @@ export class PipelineEngineService {
     const batch = await db.query.pipelineBatch.findFirst({
       where: eq(schema.pipelineBatch.id, batchId),
     });
-    if (!batch || batch.status === "completed") return;
+    if (!batch || batch.status === "completed" || batch.status === "failed") return;
 
     if (this.isBatchVmRemux(batch)) {
       try {

@@ -234,12 +234,21 @@ async function runAutonomousReconciliationTick() {
           });
       }
     }
+    // 5. Periodic background cleanup of orphaned local staging folders/files & Kaggle datasets/notebooks (every 15m, non-blocking)
+    setImmediate(() => {
+      PipelineEngineService.cleanupOrphanedStagedFilesIfDue({ minAgeMinutes: 20 }).catch(() => {});
+      PipelineEngineService.cleanupOrphanedKaggleResourcesIfDue({
+        maxDeletesPerAccount: 25,
+        minAgeMinutes: 20,
+      }).catch(() => {});
+    });
   } catch (err: any) {
     log.warn("Server", `Autonomous background heartbeat warning: ${err?.message || err}`);
   }
 }
 
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let startupCleanupTimer: ReturnType<typeof setTimeout> | null = null;
 
 const start = async () => {
   try {
@@ -255,6 +264,21 @@ const start = async () => {
       await runAutonomousReconciliationTick();
     }, 2000);
 
+    // Safe post-restart orphan sweep 25s after boot (runs AFTER active jobs/batches have settled/re-attached)
+    startupCleanupTimer = setTimeout(() => {
+      if (!DATABASE_URL) return;
+      log.info("Server", "Running post-restart safe cleanup of orphaned staging folders and Kaggle datasets/notebooks...");
+      PipelineEngineService.cleanupOrphanedStagedFilesIfDue({
+        force: true,
+        minAgeMinutes: 20,
+      }).catch(() => {});
+      PipelineEngineService.cleanupOrphanedKaggleResourcesIfDue({
+        force: true,
+        maxDeletesPerAccount: 25,
+        minAgeMinutes: 20,
+      }).catch(() => {});
+    }, 25 * 1000);
+
     // Autonomous Self-Healing Background Loop (Every 45s)
     heartbeatTimer = setInterval(runAutonomousReconciliationTick, 45 * 1000);
   } catch (err: any) {
@@ -266,6 +290,7 @@ const start = async () => {
 const gracefulShutdown = async (signal: string) => {
   log.info("Server", `Received ${signal}, shutting down gracefully...`);
   if (heartbeatTimer) clearInterval(heartbeatTimer);
+  if (startupCleanupTimer) clearTimeout(startupCleanupTimer);
   await app.close().catch(() => {});
   process.exit(0);
 };

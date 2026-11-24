@@ -1,3 +1,4 @@
+import { NonRetriableError } from "inngest";
 import { inngest } from "../client.js";
 import { db, schema } from "../../db/index.js";
 import { eq, asc } from "drizzle-orm";
@@ -50,7 +51,7 @@ export const batchExecuteFn = inngest.createFunction(
       };
     });
 
-    if (!batchInfo.exists || batchInfo.status === "completed") {
+    if (!batchInfo.exists || batchInfo.status === "completed" || batchInfo.status === "failed") {
       return { status: "already_completed_or_missing", batchId };
     }
 
@@ -102,7 +103,7 @@ export const batchExecuteFn = inngest.createFunction(
           await step.run(`cleanup-failed-batch-${pollIdx}`, async () => {
             await PipelineEngineService.handleBatchFailure(batchId, errMsg);
           });
-          throw new Error(errMsg);
+          throw new NonRetriableError(errMsg);
         }
       }
 
@@ -111,7 +112,7 @@ export const batchExecuteFn = inngest.createFunction(
         await step.run("cleanup-timeout-batch", async () => {
           await PipelineEngineService.handleBatchFailure(batchId, timeoutMsg);
         });
-        throw new Error(timeoutMsg);
+        throw new NonRetriableError(timeoutMsg);
       }
 
       // Phase 5: Fetch output, persist results, deliver Main Backend callbacks, and clean up Kaggle & local staging

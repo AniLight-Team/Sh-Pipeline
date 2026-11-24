@@ -150,6 +150,15 @@ export const recoveryWatchdogFn = inngest.createFunction(
       // 6. Retry any completed job callbacks that failed while Main Backend (localhost:4000) was restarting
       const redeliveredCallbacks = await PipelineEngineService.retryPendingCallbacks();
 
+      // 6b. Periodically sweep orphaned local staging folders/files & Kaggle kira-batch-* datasets / enc-batch-* notebooks
+      const stagedSweep = await PipelineEngineService.cleanupOrphanedStagedFilesIfDue({
+        minAgeMinutes: 20,
+      });
+      const kaggleSweep = await PipelineEngineService.cleanupOrphanedKaggleResourcesIfDue({
+        maxDeletesPerAccount: 25,
+        minAgeMinutes: 20,
+      });
+
       // 7. Only dispatch queued jobs if staging buffer is below the 56 GB limit and not already actively running in-process
       const cap = await PipelineEngineService.checkStorageCapacityForDownload();
       const jobsAllowedToDispatch = cap.allowed
@@ -168,6 +177,9 @@ export const recoveryWatchdogFn = inngest.createFunction(
         expiredBatchCount,
         dispatchedBatchIds: allBatchIdsToDispatch,
         redeliveredCallbacks,
+        stagedCleanedFiles: stagedSweep.deletedCount,
+        kaggleCleanedDatasets: kaggleSweep.deletedDatasets,
+        kaggleCleanedKernels: kaggleSweep.deletedKernels,
       };
     });
 
